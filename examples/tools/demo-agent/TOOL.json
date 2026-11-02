@@ -1,0 +1,66 @@
+{
+  "name": "demo_agent",
+  "version": "1.0.0",
+  "contractVersion": "1.0.0",
+  "description": "Demonstrate an agent-backed tool. Use when the user asks for a small code or file investigation that benefits from a persistent worker.",
+  "whenToUse": [
+    "需要一个小型、可复用的调查任务",
+    "希望复用 worker 的历史和记忆"
+  ],
+  "notFor": [
+    "需要直接执行确定性脚本的任务"
+  ],
+  "kind": "agent",
+  "input": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "description": "Task for the worker."
+      },
+      "context": {
+        "type": "string",
+        "description": "Optional context from the caller."
+      }
+    },
+    "required": ["task"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string" },
+      "result": { "type": "object" }
+    },
+    "required": ["summary"],
+    "additionalProperties": false
+  },
+  "agent": {
+    "instructions": "AGENT.md",
+    "workflow": "WORKFLOW.md",
+    "tools": ["read", "grep", "find", "ls"],
+    "maxTurns": 20,
+    "sessionScope": "project",
+    "memoryScope": "project",
+    "resolution": "user-first",
+    "createProjectIfMissing": true,
+    "requireProjectTrust": true,
+    "contractRange": "^1.0.0"
+  },
+  "permissions": {
+    "read": true,
+    "write": false,
+    "bash": false,
+    "network": false
+  },
+  "limits": {
+    "maxInputBytes": 1048576,
+    "maxResultBytes": 20000,
+    "jobTimeoutMs": 600000
+  },
+  "execution": {
+    "defaultMode": "start",
+    "notifyOnIdle": true,
+    "asyncByDefault": true
+  }
+}

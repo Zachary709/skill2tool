@@ -1,0 +1,43 @@
+{
+  "name": "@zachary709/pi-tool-runtime",
+  "version": "0.1.0",
+  "description": "Agent-backed and direct tools for Pi with persistent workers, async jobs, and normalized contracts.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agent",
+    "tools"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/tool-runtime.ts"
+    ]
+  },
+  "exports": {
+    ".": "./extensions/tool-runtime.ts"
+  },
+  "files": [
+    "extensions",
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

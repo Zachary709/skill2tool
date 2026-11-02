@@ -1,0 +1,55 @@
+{
+  "name": "word_count",
+  "version": "1.0.0",
+  "contractVersion": "1.0.0",
+  "description": "Count words in a text string. Use when the user asks for a deterministic word count.",
+  "whenToUse": [
+    "需要统计一段文本的词数"
+  ],
+  "notFor": [
+    "需要语义分析或摘要"
+  ],
+  "kind": "direct",
+  "directService": "count",
+  "input": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to count."
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "count": { "type": "number" }
+    },
+    "required": ["count"],
+    "additionalProperties": false
+  },
+  "services": {
+    "count": {
+      "type": "script",
+      "command": "node",
+      "args": ["scripts/count.mjs"],
+      "protocol": "json-stdin-stdout",
+      "timeoutMs": 10000
+    }
+  },
+  "permissions": {
+    "read": true,
+    "write": false,
+    "bash": false,
+    "network": false
+  },
+  "limits": {
+    "maxInputBytes": 1048576,
+    "maxResultBytes": 20000
+  },
+  "execution": {
+    "defaultMode": "sync"
+  }
+}
