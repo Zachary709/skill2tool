@@ -7,6 +7,7 @@ import { readManifestFile } from "../discovery/manifest.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import type { JobRecord, ToolEnvelope } from "../types.ts";
 import { appendJobEvent, atomicWrite, jobDir, readJobRecord, writeJobRecord, writeJobResult } from "./store.ts";
+import { acquireWorkerLock } from "./lock.ts";
 
 function jobRootFromPath(jobPath: string): string {
 	return path.dirname(path.dirname(jobPath));
@@ -68,7 +69,9 @@ async function main(): Promise<void> {
 
 	let envelope: ToolEnvelope;
 	let usage: Record<string, unknown> | undefined;
+	let releaseLock: (() => Promise<void>) | undefined;
 	try {
+		releaseLock = await acquireWorkerLock(record.cwd, manifest.name, controller.signal);
 		const resolution = await resolveAgent({
 			tool: manifest,
 			cwd: record.cwd,
@@ -135,6 +138,7 @@ async function main(): Promise<void> {
 		process.removeListener("SIGTERM", abort);
 		process.removeListener("SIGINT", abort);
 		await supervisor.close();
+		await releaseLock?.();
 	}
 
 	const state =
