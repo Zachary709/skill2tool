@@ -132,8 +132,52 @@ Daemon service:
 Daemon protocols:
 
 - `jsonl-stdio`: newline-delimited JSON over stdin/stdout.
-- `unix-jsonl`: newline-delimited JSON over a Unix socket. Set `socket`.
+- `unix-jsonl`: newline-delimited JSON over a Unix socket. Set `socket`; it defaults to `<state dir>/service.sock`.
 - `http-json`: JSON over HTTP. Set `url`, optional `method` and `headers`.
+
+### Service levels
+
+Every service declares `level`, which is `user` or `project`. When it is
+omitted, it follows the tool's discovery scope: a user tool gets user services
+and a project tool gets project services. A service can override that per
+entry.
+
+| | `user` | `project` |
+| --- | --- | --- |
+| default cwd | tool directory | project directory |
+| state directory | `~/.pi/agent/services/<tool>/<service>` | `<project>/.pi/services/<tool>/<service>` |
+| daemon key | `user:<tool>:<service>` | `project:<project>:<tool>:<service>` |
+| reuse | a reachable Unix socket or HTTP endpoint is attached instead of spawned | always spawned for the current project |
+
+Each spawn writes `state.json` with the level, process id, cwd, and start time
+under the state directory. The same directory receives `PI_SERVICE_STATE_DIR`,
+and the child environment carries `PI_TOOL_NAME`, `PI_SERVICE_NAME`, and
+`PI_SERVICE_LEVEL`.
+
+```json
+{
+  "type": "daemon",
+  "command": "node",
+  "args": ["services/server.mjs"],
+  "protocol": "unix-jsonl",
+  "level": "user"
+}
+```
+
+A worker uses the default model from pi settings (`defaultProvider` and
+`defaultModel`) and nothing else. Tool manifests and agent files no longer
+select a model. The job record keeps the resolved model as `provider/id`, so
+every job states which model its worker used. When settings set no default, the
+runtime default applies.
+
+Workers use the same two level names. `agent.sessionScope` is `project` by
+default and fixes the worker key to the project directory, so every project gets
+its own session. With `user`, the key drops the project path: one worker session
+is shared by every project, and its working directory is the tool directory.
+`agent.memoryScope` is `project` by default and keeps memory at
+`tool-workers/<key>/memory.md`; with `user`, memory is shared at
+`~/.pi/agent/tool-memory/<tool>.md`. The older value `global` is still accepted
+and reads as `user`, with a deprecation warning.
 
 Request and response shape:
 
@@ -143,6 +187,54 @@ Request and response shape:
 ```
 
 For `http-json`, the request body is `{"method":"ping","params":{}}` and the response body is `{"status":"ok","result":{...}}`.
+
+## Input and result contracts
+
+Both sides are closed by default.
+
+Input:
+
+- The facade rejects any key that the manifest does not declare, in addition
+  to JSON Schema validation. A caller can send only the declared fields.
+- `"additionalProperties": false` keeps the contract explicit; the loader
+  warns when it is missing.
+
+Result:
+
+- `submit_result` validates the payload against the declared output schema and
+  then applies shape limits:
+  - keys not declared in a typed object are rejected;
+  - a string field without `maxLength` is limited to 4000 characters;
+  - more than 8 newlines in a short string field is treated as a log dump;
+  - arrays are limited to 50 items unless `maxItems` says otherwise;
+  - `summary` is at most 300 characters and at most three lines.
+- On violation the worker receives the exact errors and must resubmit a
+  compressed result. Process narration, thinking, tool transcripts, commands,
+  and logs therefore cannot reach the caller through a result field.
+- An untyped object property is treated as a bag: its keys are not checked, but
+  its string values still pass the size and log limits. The loader warns about
+  any `type: "object"` output field without `properties`.
+
+The converter requires typed fields, `required`, and
+`"additionalProperties": false` on both sides, and rejects a catch-all
+`result`, `details`, `notes`, or `output` object in the plan it produces.
+
+## Worker progress
+
+The worker writes one compact JSON line per step to
+`<project>/.pi/jobs/<jobId>/progress.jsonl`: thinking, reply text, each tool
+call, and each tool result. The facade reads that file and shows it in a TUI
+widget while a job runs, so the steps stay out of the conversation context.
+
+- Three display channels, all fed from the same file:
+  - the running tool call streams the latest lines as partial output, so the
+    tool block itself shows what the worker is doing;
+  - an editor widget repeats the last lines above the editor and clears four
+    seconds after the job reaches a terminal state;
+  - `/tool-progress [jobId]` pins a snapshot; `/tool-progress off` clears it.
+- Partial output is replaced by the final tool result, so only the result
+  reaches the conversation. Nothing in the progress file is appended to the
+  main conversation or to the worker's own later turns.
 
 ## Jobs
 

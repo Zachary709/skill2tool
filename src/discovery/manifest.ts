@@ -88,6 +88,7 @@ export async function loadTools(sources: ToolSource[]): Promise<{
 				continue;
 			}
 			seen.set(manifest.name, manifestPath);
+			manifest.scope = source.scope;
 			tools.push({ manifest, dir, scope: source.scope });
 		}
 	}

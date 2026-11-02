@@ -15,6 +15,7 @@ interface DaemonHandle {
 	child?: ChildProcess;
 	closed: boolean;
 	stderr: string;
+	stateDir?: string;
 	request: (method: string | undefined, params: Record<string, unknown>, timeoutMs: number) => Promise<unknown>;
 	close: () => void;
 }
@@ -28,23 +29,72 @@ interface ServiceResult {
 	exitCode?: number | null;
 }
 
-function serviceKey(tool: ToolManifest, name: string): string {
-	return `${tool.name}:${name}`;
+export type ServiceLevel = "user" | "project";
+
+export interface ServicePlacement {
+	level: ServiceLevel;
+	cwd: string;
+	stateDir: string;
+	env: Record<string, string>;
+	key: string;
 }
 
-function resolveCwd(tool: ToolManifest, service: ServiceDefinition): string {
-	return service.cwd ? path.resolve(tool.dir ?? process.cwd(), service.cwd) : (tool.dir ?? process.cwd());
+export interface ServiceSupervisorOptions {
+	log?: (message: string) => void;
+	projectCwd?: string;
+	agentDir?: string;
+}
+
+function serviceLevel(tool: ToolManifest, service: ServiceDefinition): ServiceLevel {
+	return service.level ?? (tool.scope === "project" ? "project" : "user");
+}
+
+/**
+ * Resolve where a service runs. A `user` service is rooted at the user-level
+ * agent directory and keeps its state under `services/<tool>/<name>`. A
+ * `project` service is rooted at the project directory and keeps its state
+ * under `<project>/.pi/services/<tool>/<name>`. The daemon key carries the
+ * project path for project services, so two projects never share one handle.
+ */
+export function resolveServicePlacement(options: {
+	tool: ToolManifest;
+	name: string;
+	service: ServiceDefinition;
+	projectCwd: string;
+	agentDir: string;
+}): ServicePlacement {
+	const { tool, name, service, projectCwd, agentDir } = options;
+	const level = serviceLevel(tool, service);
+	const baseDir = level === "user" ? (tool.dir ?? agentDir) : projectCwd;
+	const cwd = service.cwd ? path.resolve(baseDir, service.cwd) : baseDir;
+	const stateDir =
+		level === "user"
+			? path.join(agentDir, "services", tool.name, name)
+			: path.join(projectCwd, ".pi", "services", tool.name, name);
+	return {
+		level,
+		cwd,
+		stateDir,
+		env: {
+			PI_TOOL_NAME: tool.name,
+			PI_SERVICE_NAME: name,
+			PI_SERVICE_LEVEL: level,
+			PI_SERVICE_STATE_DIR: stateDir,
+		},
+		key: level === "user" ? `user:${tool.name}:${name}` : `project:${projectCwd}:${tool.name}:${name}`,
+	};
 }
 
 function spawnDaemon(
 	service: ServiceDefinition,
 	cwd: string,
+	env: Record<string, string>,
 	log: (message: string) => void,
 ): ChildProcess {
 	if (!service.command) throw new Error("daemon service has no command");
 	const child = spawn(service.command, service.args ?? [], {
 		cwd,
-		env: { ...process.env, ...(service.env ?? {}) },
+		env: { ...process.env, ...env },
 		stdio: ["ignore", "ignore", "pipe"],
 	});
 	child.stderr?.on("data", (chunk) => log(chunk.toString()));
@@ -116,11 +166,17 @@ function makeJsonLineClient(options: {
 	return handle;
 }
 
-function createStdioClient(tool: ToolManifest, service: ServiceDefinition, key: string, log: (message: string) => void): DaemonHandle {
+function createStdioClient(
+	service: ServiceDefinition,
+	key: string,
+	cwd: string,
+	env: Record<string, string>,
+	log: (message: string) => void,
+): DaemonHandle {
 	if (!service.command) throw new Error(`daemon service "${key}" has no command`);
 	const child = spawn(service.command, service.args ?? [], {
-		cwd: resolveCwd(tool, service),
-		env: { ...process.env, ...(service.env ?? {}) },
+		cwd,
+		env: { ...process.env, ...env },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	const handle = makeJsonLineClient({
@@ -155,15 +211,67 @@ async function waitForSocket(socketPath: string, timeoutMs = 10_000): Promise<vo
 	throw new Error(`timed out waiting for socket: ${socketPath}`);
 }
 
-async function createUnixClient(
-	tool: ToolManifest,
-	service: ServiceDefinition,
-	key: string,
-	log: (message: string) => void,
-): Promise<DaemonHandle> {
-	const socketPath = service.socket;
-	if (!socketPath) throw new Error(`daemon service "${key}" has no socket`);
-	const child = service.command ? spawnDaemon(service, resolveCwd(tool, service), log) : undefined;
+async function canConnect(socketPath: string, timeoutMs = 500): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (value: boolean) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			resolve(value);
+		};
+		const socket = net.createConnection(socketPath);
+		socket.once("connect", () => finish(true));
+		socket.once("error", () => finish(false));
+		setTimeout(() => finish(false), timeoutMs);
+	});
+}
+
+async function httpReachable(url: string, timeoutMs = 2_000): Promise<boolean> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(url, { method: "GET", signal: controller.signal });
+		return response.status < 500;
+	} catch {
+		return false;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function writeServiceState(stateDir: string, payload: Record<string, unknown>): Promise<void> {
+	const file = path.join(stateDir, "state.json");
+	try {
+		await fs.mkdir(stateDir, { recursive: true });
+		let current: Record<string, unknown> = {};
+		try {
+			current = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+		} catch {
+			// a missing or unreadable state file starts from an empty object
+		}
+		await fs.writeFile(file, `${JSON.stringify({ ...current, ...payload }, null, 2)}\n`, "utf8");
+	} catch {
+		// state is advisory; a failed write must not break the service call
+	}
+}
+
+async function createUnixClient(options: {
+	service: ServiceDefinition;
+	key: string;
+	socketPath: string;
+	cwd: string;
+	env: Record<string, string>;
+	stateDir: string;
+	spawn: boolean;
+	log: (message: string) => void;
+}): Promise<DaemonHandle> {
+	const { service, key, socketPath, cwd, env, stateDir, log } = options;
+	let child: ChildProcess | undefined;
+	if (options.spawn) {
+		if (!service.command) throw new Error(`daemon service "${key}" has no command`);
+		child = spawnDaemon(service, cwd, env, log);
+	}
 	await waitForSocket(socketPath);
 	const socket = net.createConnection(socketPath);
 	await new Promise<void>((resolve, reject) => {
@@ -193,6 +301,7 @@ async function createUnixClient(
 		},
 		log,
 	});
+	handle.stateDir = stateDir;
 	socket.on("error", (error) => log(`[${key}] socket error: ${error.message}`));
 	socket.on("close", () => {
 		handle.closed = true;
@@ -214,14 +323,20 @@ async function waitForHttp(url: string, timeoutMs = 10_000): Promise<void> {
 	throw new Error(`timed out waiting for HTTP service: ${url}`);
 }
 
-async function createHttpClient(
-	tool: ToolManifest,
-	service: ServiceDefinition,
-	key: string,
-	log: (message: string) => void,
-): Promise<DaemonHandle> {
+async function createHttpClient(options: {
+	service: ServiceDefinition;
+	key: string;
+	cwd: string;
+	env: Record<string, string>;
+	stateDir: string;
+	spawn: boolean;
+	log: (message: string) => void;
+}): Promise<DaemonHandle> {
+	const { service, key, cwd, env, stateDir, log } = options;
 	if (!service.url) throw new Error(`daemon service "${key}" has no url`);
-	const child = service.command ? spawnDaemon(service, resolveCwd(tool, service), log) : undefined;
+	const child = options.spawn
+		? spawnDaemon(service, cwd, env, log)
+		: undefined;
 	await waitForHttp(service.url);
 	let closed = false;
 	return {
@@ -257,13 +372,34 @@ async function createHttpClient(
 			closed = true;
 			child?.kill("SIGTERM");
 		},
+		stateDir,
 	};
 }
 
 export class ServiceSupervisor {
 	private daemons = new Map<string, DaemonHandle>();
+	private readonly log: (message: string) => void;
+	private readonly projectCwd: string;
+	private readonly agentDir: string;
 
-	constructor(private readonly log: (message: string) => void = () => {}) {}
+	constructor(options: ServiceSupervisorOptions | ((message: string) => void) = {}) {
+		const normalized = typeof options === "function" ? { log: options } : options;
+		this.log = normalized.log ?? (() => {});
+		this.projectCwd = path.resolve(normalized.projectCwd ?? process.cwd());
+		this.agentDir = path.resolve(
+			normalized.agentDir ?? process.env.PI_TOOL_RUNTIME_AGENT_DIR ?? path.join(this.projectCwd, ".pi", "agent"),
+		);
+	}
+
+	placement(tool: ToolManifest, name: string, service: ServiceDefinition): ServicePlacement {
+		return resolveServicePlacement({
+			tool,
+			name,
+			service,
+			projectCwd: this.projectCwd,
+			agentDir: this.agentDir,
+		});
+	}
 
 	async startEager(tool: ToolManifest): Promise<void> {
 		for (const [name, service] of Object.entries(tool.services ?? {})) {
@@ -283,7 +419,7 @@ export class ServiceSupervisor {
 			return { ok: false, error: `unknown service "${serviceName}"` };
 		}
 		if (service.type === "script") {
-			return this.runScript(tool, service, params);
+			return this.runScript(tool, serviceName, service, params);
 		}
 		try {
 			const result = await this.callDaemon(tool, serviceName, service, params);
@@ -295,17 +431,19 @@ export class ServiceSupervisor {
 
 	private async runScript(
 		tool: ToolManifest,
+		name: string,
 		service: ServiceDefinition,
 		params: Record<string, unknown>,
 	): Promise<ServiceResult> {
 		if (!service.command) return { ok: false, error: "script service has no command" };
-		const cwd = resolveCwd(tool, service);
+		const placement = this.placement(tool, name, service);
 		const timeoutMs = service.timeoutMs ?? 60_000;
+		await fs.mkdir(placement.stateDir, { recursive: true }).catch(() => {});
 
 		return new Promise<ServiceResult>((resolve) => {
 			const child = spawn(service.command!, service.args ?? [], {
-				cwd,
-				env: { ...process.env, ...(service.env ?? {}) },
+				cwd: placement.cwd,
+				env: { ...process.env, ...placement.env, ...(service.env ?? {}) },
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			let stdout = "";
@@ -352,22 +490,56 @@ export class ServiceSupervisor {
 	}
 
 	private async ensureDaemon(tool: ToolManifest, name: string, service: ServiceDefinition): Promise<DaemonHandle> {
-		const key = serviceKey(tool, name);
+		const placement = this.placement(tool, name, service);
+		const key = placement.key;
 		const existing = this.daemons.get(key);
 		if (existing && !existing.closed) return existing;
 
 		const protocol = service.protocol ?? "jsonl-stdio";
+		const env = { ...placement.env, ...(service.env ?? {}) };
 		let handle: DaemonHandle;
 		if (protocol === "jsonl-stdio") {
-			handle = createStdioClient(tool, service, key, this.log);
+			handle = createStdioClient(service, key, placement.cwd, env, this.log);
+			handle.stateDir = placement.stateDir;
 		} else if (protocol === "unix-jsonl") {
-			handle = await createUnixClient(tool, service, key, this.log);
+			const socketPath = path.resolve(placement.cwd, service.socket ?? path.join(placement.stateDir, "service.sock"));
+			const reuse = placement.level === "user" && (await canConnect(socketPath));
+			handle = await createUnixClient({
+				service,
+				key,
+				socketPath,
+				cwd: placement.cwd,
+				env,
+				stateDir: placement.stateDir,
+				spawn: !reuse,
+				log: this.log,
+			});
 		} else if (protocol === "http-json") {
-			handle = await createHttpClient(tool, service, key, this.log);
+			const reuse = placement.level === "user" && service.url ? await httpReachable(service.url) : false;
+			handle = await createHttpClient({
+				service,
+				key,
+				cwd: placement.cwd,
+				env,
+				stateDir: placement.stateDir,
+				spawn: !reuse,
+				log: this.log,
+			});
 		} else {
 			throw new Error(`unsupported daemon protocol for "${key}": ${protocol}`);
 		}
 		this.daemons.set(key, handle);
+		if (handle.child) {
+			await writeServiceState(placement.stateDir, {
+				level: placement.level,
+				tool: tool.name,
+				service: name,
+				pid: handle.child.pid ?? null,
+				cwd: placement.cwd,
+				stateDir: placement.stateDir,
+				startedAt: new Date().toISOString(),
+			});
+		}
 		if (service.healthCheck) {
 			await this.callDaemon(tool, name, service, { method: service.healthCheck.method, params: {} });
 		}
@@ -388,6 +560,11 @@ export class ServiceSupervisor {
 	async close(): Promise<void> {
 		for (const [key, handle] of this.daemons) {
 			handle.close();
+			if (handle.stateDir && handle.child) {
+				await writeServiceState(handle.stateDir, {
+					stoppedAt: new Date().toISOString(),
+				});
+			}
 			this.log(`[${key}] daemon closed`);
 		}
 		this.daemons.clear();

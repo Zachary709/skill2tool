@@ -51,7 +51,6 @@ export const CONVERTER_PLAN_SCHEMA: JsonSchema = {
 				workflow: { type: "string" },
 				examples: { type: "string" },
 				tools: { type: "array", items: { type: "string" } },
-				model: { type: "string" },
 				maxTurns: { type: "number" },
 			},
 		},

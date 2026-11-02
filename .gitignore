@@ -9,3 +9,8 @@ dist/
 coverage/
 
 .test-tmp/
+
+.work-adaptive/
+.adaptive-computation/
+
+_intermediate/

@@ -71,6 +71,7 @@ export class JobManager {
 		cwd: string;
 		projectTrusted: boolean;
 		requester?: JobRecord["requester"];
+		model?: string;
 	}): Promise<JobRecord> {
 		const record: JobRecord = {
 			id: newJobId(options.manifest.name),
@@ -86,6 +87,7 @@ export class JobManager {
 			state: "queued",
 			createdAt: new Date().toISOString(),
 			requester: options.requester,
+			model: options.model,
 		};
 		await this.persist(record);
 		await appendJobEvent(this.options.root, record, { state: "queued" });

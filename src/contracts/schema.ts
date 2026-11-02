@@ -37,6 +37,96 @@ export function validateValue(schema: JsonSchema, value: unknown): string[] {
 	return errors.map((error) => `${(error as { path?: string }).path || "/"}: ${error.message}`);
 }
 
+export const RESULT_LIMITS = {
+	/** Maximum characters in the caller-facing summary. */
+	maxSummaryChars: 300,
+	/** Maximum characters in a result string field without an explicit maxLength. */
+	maxStringChars: 4000,
+	/** Maximum newline count in a short string field. */
+	maxNewlines: 8,
+} as const;
+
+export function validateSummary(summary: unknown): string[] {
+	if (typeof summary !== "string") return ["summary: must be a string"];
+	const errors: string[] = [];
+	const text = summary.trim();
+	if (!text) errors.push("summary: must not be empty");
+	if (text.length > RESULT_LIMITS.maxSummaryChars) {
+		errors.push(
+			`summary: ${text.length} characters exceeds ${RESULT_LIMITS.maxSummaryChars}; state the outcome in one or two sentences`,
+		);
+	}
+	if ((text.match(/\n/g) ?? []).length > 2) {
+		errors.push("summary: keep it to a single short paragraph, not a list of steps");
+	}
+	return errors;
+}
+
+function walkResultSchema(
+	schema: JsonSchema,
+	value: unknown,
+	path: string,
+	errors: string[],
+): void {
+	if (value === undefined || value === null) return;
+	if (typeof value === "string") {
+		const limit = typeof schema.maxLength === "number" ? schema.maxLength : RESULT_LIMITS.maxStringChars;
+		if (value.length > limit) {
+			errors.push(
+				`${path}: ${value.length} characters exceeds ${limit}; return the conclusion and the fields the caller needs, not the process`,
+			);
+			return;
+		}
+		if ((value.match(/\n/g) ?? []).length > RESULT_LIMITS.maxNewlines) {
+			errors.push(`${path}: contains a multi-line log; summarize it into the declared fields`);
+		}
+		return;
+	}
+	if (Array.isArray(value)) {
+		const itemSchema = schema.items ?? {};
+		const maxItems = typeof schema.maxItems === "number" ? schema.maxItems : 50;
+		if (value.length > maxItems) {
+			errors.push(`${path}: ${value.length} items exceeds ${maxItems}`);
+		}
+		value.forEach((item, index) => walkResultSchema(itemSchema, item, `${path}[${index}]`, errors));
+		return;
+	}
+	if (typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		const properties = schema.properties;
+		if (properties) {
+			for (const key of Object.keys(record)) {
+				if (!(key in properties)) {
+					errors.push(`${path}.${key}: not declared by the tool output contract; remove it`);
+				}
+			}
+			for (const [key, sub] of Object.entries(properties)) {
+				walkResultSchema(sub, record[key], `${path}.${key}`, errors);
+			}
+			return;
+		}
+		// An object without declared properties is an untyped bag: its keys are not
+		// checked, but every value still goes through the size and log limits.
+		for (const [key, sub] of Object.entries(record)) {
+			walkResultSchema({}, sub, `${path}.${key}`, errors);
+		}
+	}
+}
+
+/**
+ * Enforce the declared result contract beyond JSON Schema types: unknown keys,
+ * oversized strings, and log-like values are rejected so the caller receives
+ * conclusions instead of the worker's process.
+ */
+export function validateResultShape(schema: JsonSchema, value: unknown): string[] {
+	const errors: string[] = [];
+	if (!schema || typeof schema !== "object") return errors;
+	if (schema.type === "object" && value && typeof value === "object" && !Array.isArray(value)) {
+		walkResultSchema(schema, value, "result", errors);
+	}
+	return errors.slice(0, 12);
+}
+
 export function validateEnvelope(output: JsonSchema, value: unknown): string[] {
 	const base = validateValue(
 		{
@@ -133,6 +223,43 @@ export function validateManifest(raw: unknown, dir?: string): {
 			if (!manifest.agent.tools || manifest.agent.tools.length === 0) {
 				errors.push("agent.tools must list the tools available to the worker");
 			}
+			const scopeFields = manifest.agent as unknown as Record<string, unknown>;
+			for (const field of ["sessionScope", "memoryScope"] as const) {
+				const value = scopeFields[field];
+				if (value === "global") {
+					scopeFields[field] = "user";
+					warnings.push(`agent.${field} "global" is deprecated; it now reads as "user"`);
+				} else if (value !== undefined && value !== "user" && value !== "project") {
+					errors.push(`agent.${field} must be "user" or "project"`);
+				}
+			}
+		}
+	}
+
+	if (manifest.output && typeof manifest.output === "object") {
+		const output = manifest.output;
+		if (output.type === "object") {
+			if (!Array.isArray(output.required) || output.required.length === 0) {
+				warnings.push("output should list required fields so the caller always receives the same shape");
+			}
+			if (output.additionalProperties !== false) {
+				warnings.push('output should set "additionalProperties": false to keep the result free of extra fields');
+			}
+			for (const [key, property] of Object.entries(output.properties ?? {})) {
+				const shape = property as JsonSchema;
+				if (shape.type === "object" && !shape.properties) {
+					warnings.push(
+						`output.${key} is an untyped object bag; declare explicit typed fields instead`,
+					);
+				}
+			}
+		}
+	}
+
+	if (manifest.input && typeof manifest.input === "object") {
+		const input = manifest.input;
+		if (input.type === "object" && input.additionalProperties !== false) {
+			warnings.push('input should set "additionalProperties": false so every input is intentional');
 		}
 	}
 
@@ -144,6 +271,9 @@ export function validateManifest(raw: unknown, dir?: string): {
 			}
 			if (service.type !== "script" && service.type !== "daemon") {
 				errors.push(`services.${name}.type must be "script" or "daemon"`);
+			}
+			if (service.level !== undefined && service.level !== "user" && service.level !== "project") {
+				errors.push(`services.${name}.level must be "user" or "project"`);
 			}
 			if (!service.command) {
 				errors.push(`services.${name}.command is required`);

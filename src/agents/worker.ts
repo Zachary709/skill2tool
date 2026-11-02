@@ -12,7 +12,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { validateEnvelope } from "../contracts/schema.ts";
+import { validateEnvelope, validateResultShape, validateSummary } from "../contracts/schema.ts";
 import type { ServiceSupervisor } from "../services/supervisor.ts";
 import type { ResolvedAgent, ToolEnvelope, ToolManifest } from "../types.ts";
 
@@ -28,23 +28,48 @@ export interface WorkerRunResult {
 	warnings: string[];
 }
 
-function workerKey(tool: ToolManifest, agent: ResolvedAgent, cwd: string): string {
-	return createHash("sha256")
-		.update(
-			[
-				tool.name,
-				tool.version,
-				tool.contractVersion ?? tool.version,
-				agent.name,
-				agent.version,
-				agent.contract,
-				agent.source,
-				agent.path ?? "embedded",
-				cwd,
-			].join("|"),
-		)
-		.digest("hex")
-		.slice(0, 16);
+export interface WorkerProgressEntry {
+	time: string;
+	kind: "thinking" | "text" | "tool" | "result";
+	text: string;
+	tool?: string;
+	isError?: boolean;
+}
+
+export type WorkerProgressSink = (entry: WorkerProgressEntry) => void;
+
+function progressText(value: unknown, limit: number): string {
+	const text = typeof value === "string" ? value : JSON.stringify(value ?? null);
+	const flat = (text ?? "").replace(/\s+/g, " ").trim();
+	return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+function summarizeToolResult(result: unknown): string {
+	const payload = result as { content?: Array<{ text?: string }> } | string | undefined;
+	if (typeof payload === "string") return progressText(payload, 400);
+	if (payload && Array.isArray(payload.content)) {
+		const text = payload.content
+			.map((part) => (typeof part?.text === "string" ? part.text : ""))
+			.filter(Boolean)
+			.join(" ");
+		if (text) return progressText(text, 400);
+	}
+	return progressText(payload, 400);
+}
+
+export function workerKey(tool: ToolManifest, agent: ResolvedAgent, cwd: string, userScope = false): string {
+	const parts = [
+		tool.name,
+		tool.version,
+		tool.contractVersion ?? tool.version,
+		agent.name,
+		agent.version,
+		agent.contract,
+		agent.source,
+		agent.path ?? "embedded",
+	];
+	if (!userScope) parts.push(cwd);
+	return createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 16);
 }
 
 async function readIfExists(filePath: string): Promise<string | undefined> {
@@ -63,7 +88,7 @@ function modelFromRuntime(runtime: ModelRuntime, value: string | undefined) {
 	return runtime.getModel(value.slice(0, slash), value.slice(slash + 1));
 }
 
-function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): string {
+export function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): string {
 	const contract = JSON.stringify(
 		{
 			name: tool.name,
@@ -88,6 +113,24 @@ function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): string {
 		"- Do not call the facade tool itself. It is not in your tool list.",
 		"- When the job is finished, call submit_result exactly once. Do not answer with prose only.",
 		"- Keep the final result inside submit_result so the facade can validate it.",
+		"",
+		"## Input contract",
+		"- The job input is the whole requirement. Use only the declared input fields; do not infer extra work.",
+		"- When a required input is missing or contradicts the contract, submit status needs_input with the exact missing field.",
+		"- The input decides which output fields matter. Return those fields, not everything you happened to observe.",
+		"",
+		"## Output contract",
+		"- submit_result.result must match the declared output schema exactly: declared keys only, each with the declared type.",
+		"- Return conclusions and the facts the caller needs for the next decision. Never include thinking, tool transcripts, commands, logs, stack traces, or a step-by-step narrative.",
+		"- Never put the process into a string field. If a fact has no declared field, leave it out.",
+		"- summary is one or two sentences with the outcome, at most 300 characters. Details belong in the typed result fields.",
+		"- Oversized strings, multi-line logs, unknown keys, and empty results are rejected by the runtime; resubmit a compressed result.",
+		"",
+		"## Navigation",
+		"- Read only inside the tool directory, the caller's project directory, and paths named in the job or the instructions below.",
+		"- Do not scan the home directory, other projects, or the whole filesystem. No `find` or `grep -r` over a home or data root.",
+		"- Start with the tool's own references and the caller's project. When a needed path is still unknown, submit status needs_input instead of searching for it.",
+		"- Prefer one targeted read over a directory sweep; keep read-only exploration short before the first real action.",
 		"",
 		"## Tool contract",
 		"```json",
@@ -148,13 +191,22 @@ function createSubmitResultTool(
 				artifacts: input.artifacts,
 				warnings: input.warnings,
 			};
-			const errors = validateEnvelope(tool.output, candidate);
+			const errors = [
+				...validateEnvelope(tool.output, candidate),
+				...validateSummary(input.summary),
+				...validateResultShape(tool.output, input.result),
+			];
 			if (errors.length > 0) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `submit_result failed validation:\n${errors.join("\n")}\nFix the result and call submit_result again.`,
+							text: [
+								"submit_result failed validation:",
+								...errors,
+								"",
+								"Return only the result the caller needs. Do not include the thinking, the tool calls, the commands, the logs, or a step-by-step narrative. Fill the declared fields; drop everything else.",
+							].join("\n"),
 						},
 					],
 					details: { errors },
@@ -217,6 +269,8 @@ export class AgentWorker {
 	private readonly modelRuntime: ModelRuntime;
 	private readonly supervisor: ServiceSupervisor;
 	private readonly log: (message: string) => void;
+	private readonly onProgress?: WorkerProgressSink;
+	private readonly defaultModel?: string;
 
 	constructor(
 		tool: ToolManifest,
@@ -226,22 +280,32 @@ export class AgentWorker {
 		modelRuntime: ModelRuntime,
 		supervisor: ServiceSupervisor,
 		log: (message: string) => void,
+		onProgress?: WorkerProgressSink,
+		defaultModel?: string,
 	) {
 		this.tool = tool;
 		this.agent = agent;
-		this.cwd = cwd;
 		this.agentDir = agentDir;
 		this.modelRuntime = modelRuntime;
 		this.supervisor = supervisor;
 		this.log = log;
-		this.key = workerKey(tool, agent, cwd);
+		this.onProgress = onProgress;
+		this.defaultModel = defaultModel;
+		const sessionScope = tool.agent?.sessionScope ?? "project";
+		const memoryScope = tool.agent?.memoryScope ?? "project";
+		this.cwd = sessionScope === "user" ? (tool.dir ?? cwd) : cwd;
+		this.key = workerKey(tool, agent, this.cwd, sessionScope === "user");
 		this.sessionDir = path.join(agentDir, "tool-workers", this.key);
-		this.memoryPath = path.join(this.sessionDir, "memory.md");
+		this.memoryPath =
+			memoryScope === "user"
+				? path.join(agentDir, "tool-memory", `${tool.name}.md`)
+				: path.join(this.sessionDir, "memory.md");
 		this.journalPath = path.join(this.sessionDir, "journal.jsonl");
 	}
 
 	private async createSession(): Promise<AgentSession> {
 		await fs.mkdir(this.sessionDir, { recursive: true });
+		await fs.mkdir(path.dirname(this.memoryPath), { recursive: true });
 
 		const settingsManager = SettingsManager.inMemory({
 			compaction: {
@@ -307,7 +371,7 @@ export class AgentWorker {
 			customTools.push(createServiceTool(this.tool, this.supervisor));
 		}
 
-		const model = modelFromRuntime(this.modelRuntime, this.agent.model ?? this.tool.agent?.model);
+		const model = modelFromRuntime(this.modelRuntime, this.defaultModel);
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
 			agentDir: this.agentDir,
@@ -319,7 +383,42 @@ export class AgentWorker {
 			tools: selectedTools,
 			customTools,
 		});
+		session.subscribe((event) => this.emitProgress(event));
 		return session;
+	}
+
+	private emitProgress(event: { type: string; [key: string]: unknown }): void {
+		if (!this.onProgress) return;
+		const time = new Date().toISOString();
+		try {
+			if (event.type === "message_end") {
+				const message = event.message as { role?: string; content?: unknown } | undefined;
+				if (!message || message.role !== "assistant") return;
+				const blocks = Array.isArray(message.content) ? message.content : [];
+				for (const block of blocks) {
+					const part = block as { type?: string; thinking?: string; text?: string; name?: string; arguments?: unknown };
+					if (part.type === "thinking" && part.thinking) {
+						this.onProgress({ time, kind: "thinking", text: progressText(part.thinking, 4000) });
+					} else if (part.type === "text" && part.text) {
+						this.onProgress({ time, kind: "text", text: progressText(part.text, 4000) });
+					} else if (part.type === "toolCall" && part.name) {
+						this.onProgress({ time, kind: "tool", tool: part.name, text: progressText(part.arguments ?? {}, 500) });
+					}
+				}
+				return;
+			}
+			if (event.type === "tool_execution_end") {
+				this.onProgress({
+					time,
+					kind: "result",
+					tool: String(event.toolName ?? ""),
+					isError: Boolean(event.isError),
+					text: summarizeToolResult(event.result),
+				});
+			}
+		} catch (error) {
+			this.log(`failed to record worker progress: ${String(error)}`);
+		}
 	}
 
 	private async getSession(): Promise<AgentSession> {

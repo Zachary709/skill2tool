@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import {
 	parseFrontmatter,
+	SettingsManager,
 	type ExtensionAPI,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -13,6 +14,13 @@ import { JobManager } from "../jobs/manager.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import { executeDirectTool } from "./direct-executor.ts";
 import { runSkillConverter, type SkillConverterPlan } from "../conversion/converter.ts";
+import {
+	ProgressWatcher,
+	snapshotProgress,
+	type ProgressSnapshot,
+	type ProgressUi,
+	type ProgressUpdateSink,
+} from "../observability/progress.ts";
 import type {
 	JobRecord,
 	JobToolInput,
@@ -112,13 +120,19 @@ export class ToolRuntime {
 	private readonly tools = new Map<string, RegisteredTool>();
 	private readonly supervisor: ServiceSupervisor;
 	private readonly jobs: JobManager;
+	private readonly progressWatchers = new Map<string, ProgressWatcher>();
+	private settingsManager?: SettingsManager;
 	private lastIsIdle?: () => boolean;
 
 	private readonly options: ToolRuntimeOptions;
 
 	constructor(options: ToolRuntimeOptions) {
 		this.options = options;
-		this.supervisor = new ServiceSupervisor(options.log);
+		this.supervisor = new ServiceSupervisor({
+			log: options.log,
+			projectCwd: options.cwd,
+			agentDir: options.agentDir,
+		});
 		this.jobs = new JobManager({
 			root: path.join(options.cwd, ".pi", "jobs"),
 			agentDir: options.agentDir,
@@ -196,25 +210,73 @@ export class ToolRuntime {
 				: undefined,
 			annotations: manifest.annotations,
 			executionMode: "parallel",
-			execute: async (_id, params, signal, _onUpdate, ctx) => {
+			execute: async (_id, params, signal, onUpdate, ctx) => {
 				this.lastIsIdle = () => ctx.isIdle();
 				const input = params as Record<string, unknown>;
-				return this.execute(manifest, input, signal, ctx);
+				return this.execute(manifest, input, signal, ctx, (partial) => {
+					onUpdate?.(partial as never);
+				});
 			},
 		};
+	}
+
+	private defaultModel(): string | undefined {
+		try {
+			this.settingsManager ??= SettingsManager.create(this.options.cwd, this.options.agentDir);
+			const provider = this.settingsManager.getDefaultProvider();
+			const model = this.settingsManager.getDefaultModel();
+			return provider && model ? `${provider}/${model}` : undefined;
+		} catch (error) {
+			this.options.log(`failed to read the default model from settings: ${String(error)}`);
+			return undefined;
+		}
+	}
+
+	private progressRoot(): string {
+		return path.join(this.options.cwd, ".pi", "jobs");
+	}
+
+	private watchProgress(jobId: string, ui?: ProgressUi, onUpdate?: ProgressUpdateSink): void {
+		if (!ui || this.progressWatchers.has(jobId)) return;
+		const watcher = new ProgressWatcher({
+			jobsRoot: this.progressRoot(),
+			ui,
+			log: this.options.log,
+			onUpdate,
+		});
+		this.progressWatchers.set(jobId, watcher);
+		watcher.start(jobId);
+	}
+
+	async progress(jobId?: string, limit = 8): Promise<ProgressSnapshot> {
+		return snapshotProgress({ jobsRoot: this.progressRoot(), jobId, limit });
 	}
 
 	private async execute(
 		manifest: ToolManifest,
 		input: Record<string, unknown>,
 		signal: AbortSignal | undefined,
-		ctx: { isIdle(): boolean; sessionManager?: { getSessionId?(): string }; cwd?: string },
+		ctx: {
+			isIdle(): boolean;
+			sessionManager?: { getSessionId?(): string };
+			cwd?: string;
+			ui?: ProgressUi;
+			hasUI?: boolean;
+		},
+		onUpdate?: ProgressUpdateSink,
 	) {
-		const errors = validateValue(facadeInputSchema(manifest) as never, input);
+		const schema = facadeInputSchema(manifest);
+		const errors = validateValue(schema as never, input);
+		const declared = new Set(Object.keys(schema.properties ?? {}));
+		for (const key of Object.keys(input)) {
+			if (!declared.has(key)) {
+				errors.push(`${key}: not declared by the tool input contract`);
+			}
+		}
 		if (errors.length > 0) {
 			const envelope: ToolEnvelope = {
 				status: "failed",
-				summary: `Input does not match the tool contract for ${manifest.name}.`,
+				summary: `Input does not match the tool contract for ${manifest.name}. Send only the declared input fields.`,
 				warnings: errors,
 			};
 			return this.toolResult(envelope, manifest, undefined, true);
@@ -238,6 +300,7 @@ export class ToolRuntime {
 				const envelope = await this.jobs.handle({ action: "cancel", jobId: existingJobId });
 				return this.toolResult(envelope, manifest, await this.jobs.get(existingJobId), envelope.status === "failed");
 			}
+			if (mode === "wait") this.watchProgress(existingJobId, ctx.ui, onUpdate);
 			const record =
 				mode === "wait"
 					? await this.jobs.wait(existingJobId, timeoutMs)
@@ -273,7 +336,9 @@ export class ToolRuntime {
 			cwd: ctx.cwd ?? this.options.cwd,
 			projectTrusted: this.options.projectTrusted,
 			requester: { sessionId: ctx.sessionManager?.getSessionId?.(), idle: ctx.isIdle() },
+			model: this.defaultModel(),
 		});
+		this.watchProgress(job.id, ctx.ui, onUpdate);
 
 		if (mode === "start") {
 			return this.toolResult(
@@ -488,6 +553,7 @@ export class ToolRuntime {
 			await this.ensureAgentFiles(dir, manifest, input);
 		}
 		manifest.dir = dir;
+		manifest.scope = scope;
 		this.register(manifest, input.activate ?? true);
 		return {
 			status: "ok",
@@ -601,6 +667,7 @@ export class ToolRuntime {
 				context: { type: "string", description: "Optional context from the caller." },
 			},
 			required: ["task"],
+			additionalProperties: false,
 		};
 		const defaultOutput = {
 			type: "object",
@@ -609,6 +676,7 @@ export class ToolRuntime {
 				result: { type: "object" },
 			},
 			required: ["summary"],
+			additionalProperties: false,
 		};
 
 		const manifest: ToolManifest = {
@@ -629,7 +697,6 @@ export class ToolRuntime {
 				workflow: "WORKFLOW.md",
 				examples: plan?.agent.examples ? "EXAMPLES.md" : undefined,
 				tools: plan?.agent.tools ?? ["read", "grep", "find", "ls"],
-				model: plan?.agent.model,
 				maxTurns: plan?.agent.maxTurns ?? 30,
 				sessionScope: "project",
 				memoryScope: "project",
@@ -653,6 +720,7 @@ export class ToolRuntime {
 			manifest.services = plan.services;
 		}
 		manifest.dir = dir;
+		manifest.scope = scope;
 
 		const agentInstructions =
 			plan?.agent.instructions ??
@@ -713,6 +781,8 @@ export class ToolRuntime {
 	}
 
 	async close(): Promise<void> {
+		for (const watcher of this.progressWatchers.values()) watcher.stopAll();
+		this.progressWatchers.clear();
 		await this.supervisor.close();
 	}
 }

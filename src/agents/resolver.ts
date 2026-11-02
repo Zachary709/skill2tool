@@ -9,7 +9,6 @@ interface AgentFileData {
 	version?: string;
 	contract?: string;
 	tools?: string[];
-	model?: string;
 	thinkingLevel?: AgentConfig["thinkingLevel"];
 	workflow?: string;
 	examples?: string;
@@ -62,7 +61,6 @@ async function loadAgentFile(filePath: string): Promise<AgentFileData | undefine
 		version: typeof frontmatter.version === "string" ? frontmatter.version : undefined,
 		contract: typeof frontmatter.contract === "string" ? frontmatter.contract : undefined,
 		tools: toStringArray(frontmatter.tools),
-		model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 		thinkingLevel:
 			typeof frontmatter.thinkingLevel === "string"
 				? (frontmatter.thinkingLevel as AgentConfig["thinkingLevel"])
@@ -123,7 +121,6 @@ async function toResolvedAgent(options: {
 			workflow: workflow ?? "",
 			examples,
 			tools,
-			model: data.model ?? tool.agent?.model,
 			thinkingLevel: data.thinkingLevel ?? tool.agent?.thinkingLevel,
 			maxTurns: tool.agent?.maxTurns ?? 30,
 			overrides: data.override === true,
@@ -154,7 +151,6 @@ async function loadEmbeddedAgent(tool: ToolManifest): Promise<{ agent?: Resolved
 			workflow,
 			examples,
 			tools: tool.agent.tools ?? [],
-			model: tool.agent.model,
 			thinkingLevel: tool.agent.thinkingLevel,
 			maxTurns: tool.agent.maxTurns ?? 30,
 			overrides: false,

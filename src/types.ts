@@ -26,6 +26,8 @@ export interface ServiceDefinition {
 	command?: string;
 	args?: string[];
 	cwd?: string;
+	/** Ownership level. Defaults to the level of the tool that declares it. */
+	level?: "user" | "project";
 	protocol?: "json-stdin-stdout" | "jsonl-stdio" | "unix-jsonl" | "http-json";
 	/** Unix socket path for unix-jsonl services. */
 	socket?: string;
@@ -49,11 +51,10 @@ export interface AgentConfig {
 	workflow?: string;
 	examples?: string;
 	tools?: string[];
-	model?: string;
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	maxTurns?: number;
-	sessionScope?: "project" | "global";
-	memoryScope?: "project" | "global";
+	sessionScope?: "user" | "project";
+	memoryScope?: "user" | "project";
 	resolution?: "user-first";
 	createProjectIfMissing?: boolean;
 	requireProjectTrust?: boolean;
@@ -100,6 +101,8 @@ export interface ToolManifest {
 	exposure?: ToolExposure;
 	annotations?: ToolAnnotations;
 	namespace?: string;
+	/** Discovery level of the tool. Set by the loader. */
+	scope?: "user" | "project" | "package";
 	/** Absolute directory containing the manifest. Set by the loader. */
 	dir?: string;
 }
@@ -115,7 +118,6 @@ export interface ResolvedAgent {
 	workflow: string;
 	examples?: string;
 	tools: string[];
-	model?: string;
 	thinkingLevel?: AgentConfig["thinkingLevel"];
 	maxTurns: number;
 	overrides: boolean;
@@ -142,6 +144,8 @@ export interface JobRecord {
 	mode: ToolMode;
 	state: JobState;
 	createdAt: string;
+	/** Resolved worker model as "provider/id", taken from the pi settings default. */
+	model?: string;
 	toolDir?: string;
 	projectTrusted?: boolean;
 	pid?: number;

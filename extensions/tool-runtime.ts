@@ -85,6 +85,29 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 	});
 
 
+	pi.registerCommand("tool-progress", {
+		description: "Show worker thinking and tool steps: /tool-progress [jobId|off]",
+		handler: async (args, ctx) => {
+			if (!runtime) {
+				ctx.ui.notify("tool-runtime is not initialized.", "warning");
+				return;
+			}
+			const target = args.trim();
+			if (target === "off") {
+				ctx.ui.setWidget("tool-progress", undefined);
+				ctx.ui.setStatus("tool-progress", undefined);
+				return;
+			}
+			const snapshot = await runtime.progress(target || undefined, 12);
+			if (!snapshot.jobId) {
+				ctx.ui.notify("No tool job recorded in this project.", "warning");
+				return;
+			}
+			ctx.ui.setWidget("tool-progress", snapshot.lines, { placement: "aboveEditor" });
+			ctx.ui.notify(`${snapshot.tool ?? "tool"} ${snapshot.jobId} · ${snapshot.state ?? "unknown"}`, "info");
+		},
+	});
+
 	pi.registerCommand("tool-runtime", {
 		description: "Show pi-tool-runtime status: /tool-runtime [list|diagnostics]",
 		handler: async (args, ctx) => {

@@ -41,14 +41,19 @@ async function main(): Promise<void> {
 	}
 	const manifest = manifestResult.manifest;
 	manifest.dir = initial.toolDir;
+	manifest.scope = initial.toolDir.startsWith(path.join(initial.cwd, ".pi", "tools")) ? "project" : "user";
 
 	const agentDir = process.env.PI_TOOL_RUNTIME_AGENT_DIR || getAgentDir();
 	const modelRuntime = await ModelRuntime.create({
 		authPath: path.join(agentDir, "auth.json"),
 		modelsPath: path.join(agentDir, "models.json"),
 	});
-	const supervisor = new ServiceSupervisor((message) => {
-		void fs.appendFile(path.join(jobDir(root, jobId), "stderr.log"), `${message}\n`).catch(() => {});
+	const supervisor = new ServiceSupervisor({
+		log: (message) => {
+			void fs.appendFile(path.join(jobDir(root, jobId), "stderr.log"), `${message}\n`).catch(() => {});
+		},
+		projectCwd: initial.cwd,
+		agentDir,
 	});
 
 	let record = await update(
@@ -95,6 +100,7 @@ async function main(): Promise<void> {
 				},
 				{ state: "agent-resolved", source: resolution.agent.source, path: resolution.agent.path },
 			);
+			const progressPath = path.join(jobDir(root, jobId), "progress.jsonl");
 			const worker = new AgentWorker(
 				manifest,
 				resolution.agent,
@@ -105,6 +111,10 @@ async function main(): Promise<void> {
 				(message) => {
 					void fs.appendFile(path.join(jobDir(root, jobId), "stderr.log"), `${message}\n`).catch(() => {});
 				},
+				(entry) => {
+					void fs.appendFile(progressPath, `${JSON.stringify(entry)}\n`).catch(() => {});
+				},
+				initial.model,
 			);
 			try {
 				const params = record.input as {
