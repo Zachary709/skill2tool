@@ -4,87 +4,12 @@ import {
 	ModelRuntime,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import { ToolRuntime } from "../src/runtime/tool-runtime.ts";
-import type { ToolAddInput } from "../src/types.ts";
 
 let runtime: ToolRuntime | undefined;
 let modelRuntime: ModelRuntime | undefined;
 
-const TOOL_ADD_PARAMS = Type.Object({
-	action: Type.Union([
-		Type.Literal("list"),
-		Type.Literal("inspect"),
-		Type.Literal("validate"),
-		Type.Literal("add"),
-		Type.Literal("convert_skill"),
-		Type.Literal("disable"),
-		Type.Literal("enable"),
-	]),
-	name: Type.Optional(Type.String()),
-	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("user")])),
-	source: Type.Optional(
-		Type.Object({
-			type: Type.Union([Type.Literal("manifest"), Type.Literal("skill"), Type.Literal("script")]),
-			path: Type.Optional(Type.String()),
-		}),
-	),
-	manifest: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-	instructions: Type.Optional(Type.String()),
-	workflow: Type.Optional(Type.String()),
-	examples: Type.Optional(Type.String()),
-	replace: Type.Optional(Type.Boolean()),
-	activate: Type.Optional(Type.Boolean()),
-});
-
-function resultFromEnvelope(envelope: {
-	status: string;
-	summary: string;
-	jobId?: string;
-	result?: unknown;
-	warnings?: string[];
-}) {
-	return {
-		content: [
-			{
-				type: "text" as const,
-				text: [
-					envelope.summary,
-					envelope.warnings?.length ? `Warnings:\n- ${envelope.warnings.join("\n- ")}` : "",
-					envelope.result !== undefined ? `Result:\n${JSON.stringify(envelope.result, null, 2)}` : "",
-				]
-					.filter(Boolean)
-					.join("\n\n"),
-			},
-		],
-		structuredContent: envelope as never,
-		details: envelope,
-		isError: envelope.status === "failed",
-	};
-}
-
 export default function toolRuntimeExtension(pi: ExtensionAPI) {
-	pi.registerTool({
-		name: "tool_add",
-		label: "Add tool",
-		description:
-			"Manage pi-tool-runtime tools. Add a tool from a manifest, convert a SKILL.md into an agent-backed tool, inspect, validate, or disable tools.",
-		parameters: TOOL_ADD_PARAMS,
-		executionMode: "sequential",
-		execute: async (_id, params, _signal, _onUpdate, ctx) => {
-			if (!runtime) {
-				return {
-					content: [{ type: "text", text: "tool-runtime is not initialized." }],
-					details: undefined,
-					isError: true,
-				};
-			}
-			const envelope = await runtime.handleToolAdd(params as ToolAddInput, ctx);
-			return resultFromEnvelope(envelope);
-		},
-	});
-
-
 	pi.registerCommand("tool-progress", {
 		description: "Show worker thinking and tool steps: /tool-progress [jobId|off]",
 		handler: async (args, ctx) => {

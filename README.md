@@ -33,10 +33,28 @@ tools/repair-shop/
 
 Tools are discovered from:
 
+- `basic-tools/` in this package, loaded under the `package` scope
 - `~/.pi/agent/tools/`
 - `<project>/.pi/tools/`
 
-Project tools load only when the project is trusted.
+Package tools load first and always load. A user or project tool with the same
+name is skipped with a collision diagnostic. Project tools load only when the
+project is trusted.
+
+## Bundled tools
+
+`basic-tools/` holds the tools this package needs itself. They are ordinary tool
+directories, so they also appear in the pi tool list:
+
+- `basic-tools/tool_add/` — management tool. Its manifest declares
+  `"handler": "tool_add"`, which runs the in-process manager instead of a
+  service. The manager and the artifact writer live in this directory, and the
+  skill converter lives in `basic-tools/tool_add/skill-converter/`.
+- `basic-tools/service_keeper/` — agent tool that checks and recovers services
+  registered in the agent directory's `services/registry.json`.
+
+A packaged tool runs with the `package` scope. Its daemons are user-level, its
+state stays under the agent directory, and it needs no project trust.
 
 ## TOOL.json
 
@@ -100,6 +118,7 @@ Project tools load only when the project is trusted.
 
 - `direct` runs a declared service synchronously.
 - `agent` creates a persistent worker and can call declared services through `service_call`.
+- A packaged tool that must run inside the runtime declares `"handler": "tool_add"` instead of a service. `tool_add` uses this, because the manager needs the live tool registry.
 
 ## Services
 
@@ -134,6 +153,11 @@ Daemon protocols:
 - `jsonl-stdio`: newline-delimited JSON over stdin/stdout.
 - `unix-jsonl`: newline-delimited JSON over a Unix socket. Set `socket`; it defaults to `<state dir>/service.sock`.
 - `http-json`: JSON over HTTP. Set `url`, optional `method` and `headers`.
+
+Daemons run continuously. When `lifecycle` and `start` are omitted they default
+to `persistent` and `eager`, so the daemon starts with the tool and keeps
+serving jobs. A persistent daemon that uses a Unix socket or HTTP is left
+running when the session closes and is attached again on the next start.
 
 ### Service levels
 
@@ -217,7 +241,10 @@ Result:
 
 The converter requires typed fields, `required`, and
 `"additionalProperties": false` on both sides, and rejects a catch-all
-`result`, `details`, `notes`, or `output` object in the plan it produces.
+`result`, `details`, `notes`, or `output` object in the plan it produces. It
+also requires a selection description with at least one `whenToUse` entry, a
+described system prompt, a workflow that ends with `submit_result`, `maxLength`
+on output strings, `maxItems` on output arrays, and continuous daemon services.
 
 ## Worker progress
 
@@ -362,28 +389,29 @@ Conversion uses a user-level converter agent:
 ~/.pi/agent/agents/skill_converter.workflow.md
 ```
 
-The runtime installs these from `agents/skill-converter/` on the first conversion. The converter agent reads the skill and its supporting files, then returns a complete plan through `submit_result`. The runtime validates the plan, writes `TOOL.json`, `AGENT.md`, `WORKFLOW.md`, and optional `EXAMPLES.md`, then registers the tool.
+The runtime installs these from `basic-tools/tool_add/skill-converter/` on the first conversion. The converter agent reads the skill and its supporting files, then returns a complete plan through `submit_result`. The runtime validates the plan, writes `TOOL.json`, `AGENT.md`, `WORKFLOW.md`, and optional `EXAMPLES.md`, then registers the tool.
 
-If the converter agent is unavailable or returns an invalid plan, conversion falls back to the deterministic generator.
+A converted tool must carry:
+
+- a selection description and at least one `whenToUse` entry;
+- a closed input schema with typed, described fields and a non-empty `required` list;
+- a closed result schema with typed, described fields, `maxLength` on every string, and `maxItems` on every array;
+- a worker system prompt and a workflow that ends with `submit_result`;
+- services only when the skill already has a matching script or server. Daemons are declared with `lifecycle: "persistent"` and `start: "eager"`, so they run continuously and are started with the tool.
+
+The runtime rejects a plan that misses any of these and falls back to the
+deterministic generator.
+
+If the converter agent is unavailable or returns an invalid or incomplete plan, conversion falls back to the deterministic generator. The fallback writes the same set of files with a closed `task`/`context` input, a typed `outcome`/`facts` result, a generated system prompt, and a generated workflow.
 
 The converted tool uses the permissions proposed by the converter. The converter defaults to read-only; edit `TOOL.json` to allow `bash`, `edit`, or `write`.
 
 `add` accepts `instructions`, `workflow`, and `examples` strings. If an agent tool's files are missing, `tool_add` writes safe defaults. A source path may point to a directory containing `TOOL.json`; the whole directory is copied.
 
-## Examples
-
-```bash
-mkdir -p .pi/tools
-cp -R examples/tools/word-count .pi/tools/
-cp -R examples/tools/demo-agent .pi/tools/
-pi --no-skills -e .
-```
-
-Ask the main agent to use `word_count`, or to start `demo_agent` with `mode=start` and then call `demo_agent` again with `mode=result` and the returned `jobId`.
-
 ## Security
 
 - Project tools and project agents require project trust.
+- Package tools under `basic-tools/` load without project trust and cannot be disabled through `tool_add`.
 - Agent tools default to read-only permissions.
 - Worker tools cannot exceed the permissions declared in `TOOL.json`.
 - `tool_add` refuses to write project tools in an untrusted project.

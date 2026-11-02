@@ -1,0 +1,491 @@
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+import { parseFrontmatter, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { readManifestFile } from "../../src/discovery/manifest.ts";
+import { validateManifest } from "../../src/contracts/schema.ts";
+import type { ServiceSupervisor } from "../../src/services/supervisor.ts";
+import type { JsonSchema, ToolAddInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
+import { runSkillConverter, planErrors, type SkillConverterPlan } from "./skill-converter/converter.ts";
+import {
+	atomicWrite,
+	defaultAgentInstructions,
+	defaultWorkflow,
+	ensureAgentFiles,
+	safeToolName,
+	writeToolArtifacts,
+} from "./artifacts.ts";
+
+export interface ToolAddHost {
+	agentDir: string;
+	cwd: string;
+	modelRuntime: ModelRuntime;
+	supervisor: ServiceSupervisor;
+	log(message: string): void;
+	listTools(): ToolManifest[];
+	getTool(name: string): ToolManifest | undefined;
+	register(manifest: ToolManifest, activate: boolean): void;
+	setEnabled(name: string, enabled: boolean, activate: boolean): Promise<void>;
+	isReserved(name: string): boolean;
+}
+
+type AddContext = { cwd: string; isProjectTrusted(): boolean };
+
+const DEFAULT_INPUT: JsonSchema = {
+	type: "object",
+	properties: {
+		task: {
+			type: "string",
+			maxLength: 8000,
+			description: "The task for the worker, including everything it needs to start.",
+		},
+		context: {
+			type: "string",
+			maxLength: 4000,
+			description: "Optional background from the caller, such as an error message.",
+		},
+	},
+	required: ["task"],
+	additionalProperties: false,
+};
+
+const DEFAULT_OUTPUT: JsonSchema = {
+	type: "object",
+	properties: {
+		outcome: {
+			type: "string",
+			maxLength: 2000,
+			description: "The conclusion the caller needs, without process narration.",
+		},
+		facts: {
+			type: "array",
+			items: { type: "string", maxLength: 500 },
+			maxItems: 20,
+			description: "Supporting facts, at most 20 short entries.",
+		},
+	},
+	required: ["outcome"],
+	additionalProperties: false,
+};
+
+function stringArray(value: unknown): string[] | undefined {
+	return Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]) : undefined;
+}
+
+function fieldSummary(schema: JsonSchema): Array<{ name: string; type: string; required: boolean; description?: string }> {
+	const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+	return Object.entries(schema.properties ?? {}).map(([name, shape]) => ({
+		name,
+		type: typeof (shape as JsonSchema).type === "string" ? String((shape as JsonSchema).type) : "unknown",
+		required: required.has(name),
+		description: typeof (shape as JsonSchema).description === "string" ? (shape as JsonSchema).description : undefined,
+	}));
+}
+
+function inspectResult(manifest: ToolManifest) {
+	const services = Object.entries(manifest.services ?? {}).map(([name, service]) => ({
+		name,
+		type: service.type,
+		protocol: service.protocol ?? "",
+		lifecycle: service.lifecycle ?? "",
+		start: service.start ?? "",
+	}));
+	return {
+		action: "inspect" as const,
+		name: manifest.name,
+		version: manifest.version,
+		kind: manifest.kind,
+		scope: manifest.scope ?? "project",
+		dir: manifest.dir ?? "",
+		description: manifest.description,
+		whenToUse: manifest.whenToUse ?? [],
+		notFor: manifest.notFor ?? [],
+		services,
+		inputFields: fieldSummary(manifest.input),
+		outputFields: fieldSummary(manifest.output),
+		agentFiles: manifest.agent
+			? {
+					instructions: manifest.agent.instructions ?? "AGENT.md",
+					workflow: manifest.agent.workflow ?? "WORKFLOW.md",
+					examples: manifest.agent.examples ?? "",
+					tools: manifest.agent.tools ?? [],
+				}
+			: undefined,
+	};
+}
+
+export class ToolAddManager {
+	constructor(private readonly host: ToolAddHost) {}
+
+	async handle(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+		switch (input.action) {
+			case "list":
+				return this.list();
+			case "inspect":
+				return this.inspect(input);
+			case "validate":
+				return this.validate(input);
+			case "add":
+				return this.add(input, ctx);
+			case "convert_skill":
+				return this.convertSkill(input, ctx);
+			case "disable":
+			case "enable":
+				return this.setEnabled(input);
+			default:
+				return { status: "failed", summary: `Unsupported action: ${String(input.action)}` };
+		}
+	}
+
+	private list(): ToolEnvelope {
+		const tools = this.host.listTools().map((manifest) => ({
+			name: manifest.name,
+			version: manifest.version,
+			kind: manifest.kind,
+			scope: manifest.scope ?? "project",
+			description: manifest.description,
+		}));
+		return {
+			status: "ok",
+			summary: `${tools.length} tool(s) registered.`,
+			result: { action: "list", tools },
+		};
+	}
+
+	private inspect(input: ToolAddInput): ToolEnvelope {
+		const manifest = input.name ? this.host.getTool(input.name) : undefined;
+		if (!manifest) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
+		return { status: "ok", summary: `Tool ${manifest.name}.`, result: inspectResult(manifest) };
+	}
+
+	private validate(input: ToolAddInput): ToolEnvelope {
+		if (!input.manifest) return { status: "failed", summary: "manifest is required for validate." };
+		const result = validateManifest(input.manifest);
+		return {
+			status: result.errors.length ? "failed" : "ok",
+			summary: result.errors.length ? "Manifest validation failed." : "Manifest is valid.",
+			result: { action: "validate", errors: result.errors, warnings: result.warnings },
+			warnings: result.warnings,
+		};
+	}
+
+	private async setEnabled(input: ToolAddInput): Promise<ToolEnvelope> {
+		const manifest = input.name ? this.host.getTool(input.name) : undefined;
+		if (!manifest) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
+		if (manifest.scope === "package") {
+			return {
+				status: "needs_input",
+				summary: `Tool ${manifest.name} ships with the runtime and cannot be disabled or enabled.`,
+			};
+		}
+		await this.host.setEnabled(manifest.name, input.action === "enable", input.activate ?? true);
+		return {
+			status: "ok",
+			summary: `Tool ${manifest.name} ${input.action === "enable" ? "enabled" : "disabled"}.`,
+			result: { action: input.action, name: manifest.name, enabled: input.action === "enable" },
+		};
+	}
+
+	private scopeRoot(scope: "project" | "user", ctx: AddContext): string {
+		return scope === "user"
+			? path.join(this.host.agentDir, "tools")
+			: path.join(ctx.cwd, ".pi", "tools");
+	}
+
+	private async add(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+		let manifest: ToolManifest;
+		let sourceDir: string | undefined;
+		if (input.manifest) {
+			const result = validateManifest(input.manifest);
+			if (!result.manifest || result.errors.length > 0) {
+				return { status: "failed", summary: "Manifest validation failed.", warnings: result.errors };
+			}
+			manifest = result.manifest;
+		} else if (input.source?.path) {
+			const absolute = path.resolve(input.source.path);
+			const stats = await fs.stat(absolute).catch(() => undefined);
+			if (!stats) return { status: "failed", summary: `Source not found: ${absolute}` };
+			const manifestPath = stats.isDirectory() ? path.join(absolute, "TOOL.json") : absolute;
+			sourceDir = path.dirname(manifestPath);
+			const result = await readManifestFile(manifestPath);
+			if (!result.manifest || result.errors.length > 0) {
+				return { status: "failed", summary: "Manifest validation failed.", warnings: result.errors };
+			}
+			manifest = result.manifest;
+		} else {
+			return { status: "failed", summary: "manifest or source.path is required for add." };
+		}
+
+		const scope = input.scope ?? "project";
+		if (this.host.isReserved(manifest.name)) {
+			return { status: "failed", summary: `Tool name "${manifest.name}" is reserved by the runtime.` };
+		}
+		if (scope === "project" && !ctx.isProjectTrusted()) {
+			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
+		}
+		const dir = path.join(this.scopeRoot(scope, ctx), manifest.name);
+		if (!input.replace) {
+			try {
+				await fs.access(dir);
+				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+			} catch {
+				// expected
+			}
+		}
+		await fs.mkdir(dir, { recursive: true });
+		if (sourceDir && path.resolve(sourceDir) !== path.resolve(dir)) {
+			await fs.cp(sourceDir, dir, { recursive: true, force: true });
+		}
+		const persisted = { ...manifest };
+		delete persisted.dir;
+		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
+		await ensureAgentFiles(dir, manifest, input);
+		manifest.dir = dir;
+		manifest.scope = scope;
+		const validation = validateManifest(manifest, dir);
+		if (!validation.manifest || validation.errors.length > 0) {
+			return { status: "failed", summary: "Generated tool failed validation.", warnings: validation.errors };
+		}
+		this.host.register(validation.manifest, input.activate ?? true);
+		return {
+			status: "ok",
+			summary: `Tool ${manifest.name} added.`,
+			result: {
+				action: "add",
+				name: manifest.name,
+				version: manifest.version,
+				kind: manifest.kind,
+				dir,
+				scope,
+			},
+			warnings: validation.warnings,
+		};
+	}
+
+	private async convertSkill(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+		const skillPath = input.source?.path;
+		if (!skillPath) return { status: "failed", summary: "source.path is required for convert_skill." };
+		const absolute = path.resolve(skillPath);
+		let content: string;
+		try {
+			content = await fs.readFile(absolute, "utf8");
+		} catch (error) {
+			return { status: "failed", summary: `Failed to read skill: ${String(error)}` };
+		}
+		const parsed = parseFrontmatter<Record<string, unknown>>(content);
+		const scope = input.scope ?? "project";
+		if (scope === "project" && !ctx.isProjectTrusted()) {
+			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
+		}
+
+		const warnings: string[] = [];
+		let plan: SkillConverterPlan | undefined;
+		try {
+			const candidate = await runSkillConverter({
+				skillDir: path.dirname(absolute),
+				skillFile: absolute,
+				content,
+				cwd: ctx.cwd,
+				agentDir: this.host.agentDir,
+				modelRuntime: this.host.modelRuntime,
+				supervisor: this.host.supervisor,
+				log: this.host.log,
+			});
+			const errors = planErrors(candidate);
+			if (errors.length > 0) {
+				throw new Error(`converter plan is incomplete:\n${errors.join("\n")}`);
+			}
+			plan = candidate;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			warnings.push(`converter agent failed; using deterministic conversion: ${message}`);
+			this.host.log(warnings[warnings.length - 1]);
+		}
+
+		const frontmatterName =
+			typeof parsed.frontmatter.name === "string" ? safeToolName(parsed.frontmatter.name) : undefined;
+		const name = input.name ?? plan?.name ?? frontmatterName ?? safeToolName(path.basename(path.dirname(absolute)));
+		if (!name) return { status: "failed", summary: `Cannot derive a tool name from ${absolute}.` };
+		if (this.host.isReserved(name)) {
+			return { status: "failed", summary: `Tool name "${name}" is reserved by the runtime.` };
+		}
+		const dir = path.join(this.scopeRoot(scope, ctx), name);
+		if (!input.replace) {
+			try {
+				await fs.access(dir);
+				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+			} catch {
+				// expected
+			}
+		}
+
+		const built = plan
+			? this.manifestFromPlan(plan, name, scope, dir)
+			: this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
+		let usedPlan = Boolean(plan);
+		await fs.mkdir(dir, { recursive: true });
+
+		let manifest = built.manifest;
+		let validation = validateManifest(manifest, dir);
+		if (plan && (!validation.manifest || validation.errors.length > 0)) {
+			warnings.push(`converter plan produced an invalid manifest; using deterministic conversion: ${validation.errors.join("; ")}`);
+			const fallback = this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
+			built.files = fallback.files;
+			manifest = fallback.manifest;
+			usedPlan = false;
+			validation = validateManifest(manifest, dir);
+		}
+		if (!validation.manifest || validation.errors.length > 0) {
+			return {
+				status: "failed",
+				summary: "Generated tool failed validation.",
+				warnings: [...warnings, ...validation.errors],
+			};
+		}
+
+		await writeToolArtifacts(dir, validation.manifest, built.files);
+		this.host.register(validation.manifest, input.activate ?? true);
+		return {
+			status: "ok",
+			summary: `Skill ${absolute} converted to tool ${name} using the ${usedPlan ? "converter agent" : "deterministic fallback"}.`,
+			result: {
+				action: "convert_skill",
+				name,
+				version: "0.1.0",
+				kind: "agent",
+				dir,
+				scope,
+				source: absolute,
+				conversionMode: usedPlan ? "agent" : "deterministic",
+				converterAgent: usedPlan ? path.join(this.host.agentDir, "agents", "skill_converter.md") : "",
+			},
+			warnings: [...warnings, ...validation.warnings],
+		};
+	}
+
+	private manifestFromPlan(
+		plan: SkillConverterPlan,
+		name: string,
+		scope: "project" | "user",
+		dir: string,
+	): { manifest: ToolManifest; files: { instructions: string; workflow: string; examples?: string } } {
+		const manifest: ToolManifest = {
+			name,
+			version: "0.1.0",
+			contractVersion: "0.1.0",
+			description: plan.description,
+			whenToUse: plan.whenToUse,
+			notFor: plan.notFor ?? [],
+			kind: "agent",
+			input: plan.input,
+			output: plan.output,
+			agent: {
+				instructions: "AGENT.md",
+				workflow: "WORKFLOW.md",
+				examples: plan.agent.examples ? "EXAMPLES.md" : undefined,
+				tools: plan.agent.tools,
+				maxTurns: plan.agent.maxTurns ?? 30,
+				sessionScope: "project",
+				memoryScope: "project",
+				resolution: "user-first",
+				createProjectIfMissing: true,
+				requireProjectTrust: true,
+				contractRange: "^0.1.0",
+			},
+			permissions: {
+				read: plan.permissions?.read ?? true,
+				write: plan.permissions?.write ?? false,
+				bash: plan.permissions?.bash ?? false,
+				network: plan.permissions?.network ?? false,
+			},
+			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
+			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
+			exposure: "direct",
+			namespace: "tool",
+			dir,
+			scope,
+		};
+		if (plan.services && Object.keys(plan.services).length > 0) {
+			manifest.services = plan.services;
+		}
+		return {
+			manifest,
+			files: {
+				instructions: plan.agent.instructions,
+				workflow: plan.agent.workflow,
+				examples: plan.agent.examples,
+			},
+		};
+	}
+
+	private manifestFromFallback(
+		frontmatter: Record<string, unknown>,
+		body: string,
+		absolute: string,
+		name: string,
+		scope: "project" | "user",
+		dir: string,
+	): {
+		manifest: ToolManifest;
+		files: { instructions: string; workflow: string };
+	} {
+		const frontmatterDescription =
+			typeof frontmatter.description === "string" && frontmatter.description.trim().length >= 20
+				? frontmatter.description.trim()
+				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill description.`;
+		const whenToUse = stringArray(frontmatter.whenToUse);
+		const notFor = stringArray(frontmatter.notFor);
+		const manifest: ToolManifest = {
+			name,
+			version: "0.1.0",
+			contractVersion: "0.1.0",
+			description: frontmatterDescription,
+			whenToUse:
+				whenToUse && whenToUse.length > 0
+					? whenToUse
+					: ["Use when the task matches the original skill description."],
+			notFor: notFor ?? [],
+			kind: "agent",
+			input: DEFAULT_INPUT,
+			output: DEFAULT_OUTPUT,
+			agent: {
+				instructions: "AGENT.md",
+				workflow: "WORKFLOW.md",
+				tools: ["read", "grep", "find", "ls"],
+				maxTurns: 30,
+				sessionScope: "project",
+				memoryScope: "project",
+				resolution: "user-first",
+				createProjectIfMissing: true,
+				requireProjectTrust: true,
+				contractRange: "^0.1.0",
+			},
+			permissions: { read: true, write: false, bash: false, network: false },
+			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
+			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
+			exposure: "direct",
+			namespace: "tool",
+			dir,
+			scope,
+		};
+		const instructions = [
+			defaultAgentInstructions(manifest),
+			"",
+			"## Skill instructions",
+			"",
+			"<skill_instructions>",
+			body.trim(),
+			"</skill_instructions>",
+		].join("\n");
+		const workflow = [
+			defaultWorkflow(manifest),
+			"",
+			"## Skill procedure",
+			"",
+			"Follow the skill instructions in the system prompt for the concrete steps.",
+			"Return only the declared result fields: outcome and, when useful, facts.",
+			"",
+			"Finish with submit_result.",
+		].join("\n");
+		return { manifest, files: { instructions, workflow } };
+	}
+}

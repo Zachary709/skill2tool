@@ -88,7 +88,16 @@ function modelFromRuntime(runtime: ModelRuntime, value: string | undefined) {
 	return runtime.getModel(value.slice(0, slash), value.slice(slash + 1));
 }
 
-export function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): string {
+export interface WorkerRuntimePaths {
+	agentDir?: string;
+	projectCwd?: string;
+}
+
+export function buildSystemPrompt(
+	tool: ToolManifest,
+	agent: ResolvedAgent,
+	paths?: WorkerRuntimePaths,
+): string {
 	const contract = JSON.stringify(
 		{
 			name: tool.name,
@@ -114,6 +123,15 @@ export function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): str
 		"- When the job is finished, call submit_result exactly once. Do not answer with prose only.",
 		"- Keep the final result inside submit_result so the facade can validate it.",
 		"",
+		...(paths
+			? [
+					"## Runtime paths",
+					...(paths.agentDir ? [`- Agent directory: ${paths.agentDir}`] : []),
+					...(paths.projectCwd ? [`- Project directory: ${paths.projectCwd}`] : []),
+					"Use these exact paths when the task or the instructions below name one of them.",
+					"",
+				]
+			: []),
 		"## Input contract",
 		"- The job input is the whole requirement. Use only the declared input fields; do not infer extra work.",
 		"- When a required input is missing or contradicts the contract, submit status needs_input with the exact missing field.",
@@ -127,7 +145,7 @@ export function buildSystemPrompt(tool: ToolManifest, agent: ResolvedAgent): str
 		"- Oversized strings, multi-line logs, unknown keys, and empty results are rejected by the runtime; resubmit a compressed result.",
 		"",
 		"## Navigation",
-		"- Read only inside the tool directory, the caller's project directory, and paths named in the job or the instructions below.",
+		"- Read only inside the tool directory, the caller's project directory, the agent directory, and paths named in the job or the instructions below.",
 		"- Do not scan the home directory, other projects, or the whole filesystem. No `find` or `grep -r` over a home or data root.",
 		"- Start with the tool's own references and the caller's project. When a needed path is still unknown, submit status needs_input instead of searching for it.",
 		"- Prefer one targeted read over a directory sweep; keep read-only exploration short before the first real action.",
@@ -335,7 +353,11 @@ export class AgentWorker {
 			noThemes: true,
 			noContextFiles: true,
 			extensionFactories: [compactionExtension],
-			systemPromptOverride: () => buildSystemPrompt(this.tool, this.agent),
+				systemPromptOverride: () =>
+				buildSystemPrompt(this.tool, this.agent, {
+					agentDir: this.agentDir,
+					projectCwd: this.cwd,
+				}),
 			appendSystemPromptOverride: () => [],
 		});
 		await loader.reload();

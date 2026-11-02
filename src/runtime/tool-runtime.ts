@@ -1,19 +1,19 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-	parseFrontmatter,
 	SettingsManager,
 	type ExtensionAPI,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadTools, readManifestFile, type ToolLoadDiagnostic, type ToolSource } from "../discovery/manifest.ts";
-import { validateManifest, validateValue, envelopeSchema } from "../contracts/schema.ts";
+import { loadTools, type ToolLoadDiagnostic, type ToolSource } from "../discovery/manifest.ts";
+import { validateValue, envelopeSchema } from "../contracts/schema.ts";
 import { JobManager } from "../jobs/manager.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import { executeDirectTool } from "./direct-executor.ts";
-import { runSkillConverter, type SkillConverterPlan } from "../conversion/converter.ts";
+import { ToolAddManager } from "../../basic-tools/tool_add/manager.ts";
 import {
 	ProgressWatcher,
 	snapshotProgress,
@@ -57,21 +57,8 @@ const RESERVED_TOOL_NAMES = new Set([
 	"job",
 ]);
 
-function atomicWrite(filePath: string, content: string): Promise<void> {
-	const dir = path.dirname(filePath);
-	const temp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
-	return fs
-		.mkdir(dir, { recursive: true })
-		.then(() => fs.writeFile(temp, content, "utf8"))
-		.then(() => fs.rename(temp, filePath));
-}
-
-function safeToolName(value: string): string {
-	return value
-		.toLowerCase()
-		.replace(/[^a-z0-9_]+/g, "_")
-		.replace(/^_+|_+$/g, "")
-		.slice(0, 64);
+function packageToolsRoot(): string {
+	return fileURLToPath(new URL("../../basic-tools", import.meta.url));
 }
 
 function facadeInputSchema(manifest: ToolManifest) {
@@ -120,6 +107,7 @@ export class ToolRuntime {
 	private readonly tools = new Map<string, RegisteredTool>();
 	private readonly supervisor: ServiceSupervisor;
 	private readonly jobs: JobManager;
+	private readonly toolAdd: ToolAddManager;
 	private readonly progressWatchers = new Map<string, ProgressWatcher>();
 	private settingsManager?: SettingsManager;
 	private lastIsIdle?: () => boolean;
@@ -139,6 +127,20 @@ export class ToolRuntime {
 			notify: (job) => this.notify(job),
 			log: options.log,
 		});
+		this.toolAdd = new ToolAddManager({
+			agentDir: options.agentDir,
+			cwd: options.cwd,
+			modelRuntime: options.modelRuntime,
+			supervisor: this.supervisor,
+			log: options.log,
+			listTools: () => [...this.tools.values()].map(({ manifest }) => manifest),
+			getTool: (name) => this.tools.get(name)?.manifest,
+			register: (manifest, activate) => {
+				this.register(manifest, activate);
+			},
+			setEnabled: (name, enabled, activate) => this.setToolEnabled(name, enabled, activate),
+			isReserved: (name) => RESERVED_TOOL_NAMES.has(name),
+		});
 	}
 
 	get diagnostics(): ToolLoadDiagnostic[] {
@@ -149,10 +151,29 @@ export class ToolRuntime {
 
 	private sources(): ToolSource[] {
 		const sources: ToolSource[] = [
+			// Package tools ship with the runtime and load before user and project tools.
+			{ root: packageToolsRoot(), scope: "package" },
 			{ root: path.join(this.options.agentDir, "tools"), scope: "user" },
 			{ root: path.join(this.options.cwd, ".pi", "tools"), scope: "project" },
 		];
 		return sources;
+	}
+
+	private async setToolEnabled(name: string, enabled: boolean, activate: boolean): Promise<void> {
+		const registered = this.tools.get(name);
+		if (!registered) throw new Error(`Unknown tool: ${name}`);
+		const dir = registered.manifest.dir;
+		if (!dir) throw new Error(`Tool ${name} has no directory.`);
+		const marker = path.join(dir, ".disabled");
+		if (!enabled) {
+			await fs.writeFile(marker, new Date().toISOString(), "utf8");
+			this.options.pi.registerTool({ ...registered.definition, exposure: "hidden" });
+			const active = this.options.pi.getActiveTools().filter((entry) => entry !== name);
+			this.options.pi.setActiveTools(active);
+			return;
+		}
+		await fs.rm(marker, { force: true });
+		this.register(registered.manifest, activate);
 	}
 
 	async initialize(): Promise<void> {
@@ -176,7 +197,7 @@ export class ToolRuntime {
 	}
 
 	register(manifest: ToolManifest, activate = true): RegisteredTool {
-		if (RESERVED_TOOL_NAMES.has(manifest.name) && !this.tools.has(manifest.name)) {
+		if (RESERVED_TOOL_NAMES.has(manifest.name) && manifest.scope !== "package") {
 			throw new Error(`tool name "${manifest.name}" is reserved by the runtime`);
 		}
 		const definition = this.createFacade(manifest);
@@ -209,7 +230,7 @@ export class ToolRuntime {
 				? { name: manifest.namespace, description: "Tools registered by pi-tool-runtime" }
 				: undefined,
 			annotations: manifest.annotations,
-			executionMode: "parallel",
+			executionMode: manifest.handler ? "sequential" : "parallel",
 			execute: async (_id, params, signal, onUpdate, ctx) => {
 				this.lastIsIdle = () => ctx.isIdle();
 				const input = params as Record<string, unknown>;
@@ -291,6 +312,13 @@ export class ToolRuntime {
 		delete jobInput.jobId;
 
 		if (manifest.kind === "direct") {
+			if (manifest.handler === "tool_add") {
+				const envelope = await this.toolAdd.handle(jobInput as unknown as ToolAddInput, {
+					cwd: ctx.cwd ?? this.options.cwd,
+					isProjectTrusted: () => this.options.projectTrusted,
+				});
+				return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
+			}
 			const envelope = await executeDirectTool(manifest, jobInput, this.supervisor);
 			return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
 		}
@@ -432,352 +460,6 @@ export class ToolRuntime {
 
 	async handleJobTool(input: JobToolInput): Promise<ToolEnvelope> {
 		return this.jobs.handle(input);
-	}
-
-	async handleToolAdd(input: ToolAddInput, ctx: { cwd: string; isProjectTrusted(): boolean }): Promise<ToolEnvelope> {
-		if (input.action === "list") {
-			return {
-				status: "ok",
-				summary: `${this.tools.size} tool(s) registered.`,
-				result: {
-					tools: [...this.tools.values()].map(({ manifest }) => ({
-						name: manifest.name,
-						version: manifest.version,
-						kind: manifest.kind,
-						description: manifest.description,
-					})),
-				},
-			};
-		}
-		if (input.action === "inspect") {
-			const registered = input.name ? this.tools.get(input.name) : undefined;
-			if (!registered) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
-			return { status: "ok", summary: `Tool ${registered.manifest.name}.`, result: registered.manifest };
-		}
-
-		if (input.action === "convert_skill") {
-			const skillPath = input.source?.path;
-			if (!skillPath) return { status: "failed", summary: "source.path is required for convert_skill." };
-			return this.convertSkill(skillPath, input, ctx);
-		}
-
-		if (input.action === "add") {
-			return this.addTool(input, ctx);
-		}
-
-		if (input.action === "disable" || input.action === "enable") {
-			const registered = input.name ? this.tools.get(input.name) : undefined;
-			if (!registered) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
-			const dir = registered.manifest.dir;
-			if (!dir) return { status: "failed", summary: `Tool ${registered.manifest.name} has no directory.` };
-			const marker = path.join(dir, ".disabled");
-			if (input.action === "disable") {
-				await fs.writeFile(marker, new Date().toISOString(), "utf8");
-				this.options.pi.registerTool({ ...registered.definition, exposure: "hidden" });
-				const active = this.options.pi.getActiveTools().filter((name) => name !== registered.manifest.name);
-				this.options.pi.setActiveTools(active);
-				return { status: "ok", summary: `Tool ${registered.manifest.name} disabled.` };
-			}
-			await fs.rm(marker, { force: true });
-			this.register(registered.manifest, input.activate ?? true);
-			return { status: "ok", summary: `Tool ${registered.manifest.name} enabled.` };
-		}
-
-		if (input.action === "validate") {
-			const result = validateManifest(input.manifest, undefined);
-			return {
-				status: result.errors.length ? "failed" : "ok",
-				summary: result.errors.length ? "Manifest validation failed." : "Manifest is valid.",
-				result: { errors: result.errors, warnings: result.warnings },
-				warnings: result.warnings,
-			};
-		}
-
-		return { status: "failed", summary: `Unsupported action: ${input.action}` };
-	}
-
-	private scopeRoot(scope: "project" | "user", ctx: { cwd: string }): string {
-		return scope === "user"
-			? path.join(this.options.agentDir, "tools")
-			: path.join(ctx.cwd, ".pi", "tools");
-	}
-
-	private async addTool(input: ToolAddInput, ctx: { cwd: string; isProjectTrusted(): boolean }): Promise<ToolEnvelope> {
-		let manifest: ToolManifest;
-		let sourceDir: string | undefined;
-		if (input.manifest) {
-			const result = validateManifest(input.manifest);
-			if (!result.manifest || result.errors.length > 0) {
-				return { status: "failed", summary: "Manifest validation failed.", warnings: result.errors };
-			}
-			manifest = result.manifest;
-		} else if (input.source?.path) {
-			const absolute = path.resolve(input.source.path);
-			const stats = await fs.stat(absolute).catch(() => undefined);
-			if (!stats) return { status: "failed", summary: `Source not found: ${absolute}` };
-			const manifestPath = stats.isDirectory() ? path.join(absolute, "TOOL.json") : absolute;
-			sourceDir = path.dirname(manifestPath);
-			const result = await readManifestFile(manifestPath);
-			if (!result.manifest || result.errors.length > 0) {
-				return { status: "failed", summary: "Manifest validation failed.", warnings: result.errors };
-			}
-			manifest = result.manifest;
-		} else {
-			return { status: "failed", summary: "manifest or source.path is required for add." };
-		}
-
-		const scope = input.scope ?? "project";
-		if (RESERVED_TOOL_NAMES.has(manifest.name) && !this.tools.has(manifest.name)) {
-			return { status: "failed", summary: `Tool name "${manifest.name}" is reserved by the runtime.` };
-		}
-		if (scope === "project" && !ctx.isProjectTrusted()) {
-			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
-		}
-		const dir = path.join(this.scopeRoot(scope, ctx), manifest.name);
-		if (!input.replace) {
-			try {
-				await fs.access(dir);
-				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
-			} catch {
-				// expected
-			}
-		}
-		await fs.mkdir(dir, { recursive: true });
-		if (sourceDir && path.resolve(sourceDir) !== path.resolve(dir)) {
-			await fs.cp(sourceDir, dir, { recursive: true, force: true });
-		}
-		const persisted = { ...manifest };
-		delete persisted.dir;
-		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
-		if (manifest.kind === "agent") {
-			await this.ensureAgentFiles(dir, manifest, input);
-		}
-		manifest.dir = dir;
-		manifest.scope = scope;
-		this.register(manifest, input.activate ?? true);
-		return {
-			status: "ok",
-			summary: `Tool ${manifest.name} added.`,
-			result: { name: manifest.name, version: manifest.version, kind: manifest.kind, dir, scope },
-		};
-	}
-
-	private async ensureAgentFiles(dir: string, manifest: ToolManifest, input: ToolAddInput): Promise<void> {
-		const agentPath = path.join(dir, manifest.agent?.instructions ?? "AGENT.md");
-		const workflowPath = path.join(dir, manifest.agent?.workflow ?? "WORKFLOW.md");
-		const agentExists = await fs.access(agentPath).then(() => true).catch(() => false);
-		if (!agentExists) {
-			const instructions =
-				input.instructions ??
-				[
-					`You are the persistent worker for the tool "${manifest.name}".`,
-					"",
-					manifest.description,
-					"",
-					"Work on one job at a time. Use only the tools listed in the tool contract.",
-					"Finish by calling submit_result with a structured result.",
-				].join("\n");
-			await atomicWrite(agentPath, `${instructions}\n`);
-		}
-		const workflowExists = await fs.access(workflowPath).then(() => true).catch(() => false);
-		if (!workflowExists) {
-			const workflow =
-				input.workflow ??
-				[
-					"# Workflow",
-					"",
-					"1. Read the delegated task and optional input.",
-					"2. Follow the agent instructions in the system prompt.",
-					"3. Use the declared tools and services when needed.",
-					"4. If required information is missing, submit status needs_input.",
-					"5. Call submit_result with a short summary and the structured result.",
-				].join("\n");
-			await atomicWrite(workflowPath, `${workflow}\n`);
-		}
-		if (input.examples) {
-			await atomicWrite(path.join(dir, manifest.agent?.examples ?? "EXAMPLES.md"), `${input.examples}\n`);
-		}
-	}
-
-	private async convertSkill(
-		skillPath: string,
-		input: ToolAddInput,
-		ctx: { cwd: string; isProjectTrusted(): boolean },
-	): Promise<ToolEnvelope> {
-		const absolute = path.resolve(skillPath);
-		let content: string;
-		try {
-			content = await fs.readFile(absolute, "utf8");
-		} catch (error) {
-			return { status: "failed", summary: `Failed to read skill: ${String(error)}` };
-		}
-		const parsed = parseFrontmatter<Record<string, unknown>>(content);
-		const scope = input.scope ?? "project";
-		if (scope === "project" && !ctx.isProjectTrusted()) {
-			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
-		}
-
-		const warnings: string[] = [];
-		let plan: SkillConverterPlan | undefined;
-		try {
-			plan = await runSkillConverter({
-				skillDir: path.dirname(absolute),
-				skillFile: absolute,
-				content,
-				cwd: ctx.cwd,
-				agentDir: this.options.agentDir,
-				modelRuntime: this.options.modelRuntime,
-				supervisor: this.supervisor,
-				log: this.options.log,
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			warnings.push(`converter agent failed; using deterministic conversion: ${message}`);
-			this.options.log(warnings[warnings.length - 1]);
-		}
-
-		const fallbackName = safeToolName(path.basename(path.dirname(absolute)));
-		const frontmatterName =
-			typeof parsed.frontmatter.name === "string" ? safeToolName(parsed.frontmatter.name) : fallbackName;
-		const name = input.name ?? plan?.name ?? frontmatterName;
-		const description =
-			plan?.description ??
-			(typeof parsed.frontmatter.description === "string"
-				? parsed.frontmatter.description
-				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill.`);
-		if (RESERVED_TOOL_NAMES.has(name) && !this.tools.has(name)) {
-			return { status: "failed", summary: `Tool name "${name}" is reserved by the runtime.` };
-		}
-		const dir = path.join(this.scopeRoot(scope, ctx), name);
-		if (!input.replace) {
-			try {
-				await fs.access(dir);
-				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
-			} catch {
-				// expected
-			}
-		}
-		await fs.mkdir(dir, { recursive: true });
-
-		const defaultInput = {
-			type: "object",
-			properties: {
-				task: { type: "string", description: "The task for the worker." },
-				input: { type: "object", description: "Optional structured input." },
-				context: { type: "string", description: "Optional context from the caller." },
-			},
-			required: ["task"],
-			additionalProperties: false,
-		};
-		const defaultOutput = {
-			type: "object",
-			properties: {
-				summary: { type: "string" },
-				result: { type: "object" },
-			},
-			required: ["summary"],
-			additionalProperties: false,
-		};
-
-		const manifest: ToolManifest = {
-			name,
-			version: "0.1.0",
-			contractVersion: "0.1.0",
-			description,
-			whenToUse:
-				plan?.whenToUse && plan.whenToUse.length > 0
-					? plan.whenToUse
-					: ["Use when the task matches the original skill description."],
-			notFor: plan?.notFor ?? [],
-			kind: "agent",
-			input: plan?.input ?? defaultInput,
-			output: plan?.output ?? defaultOutput,
-			agent: {
-				instructions: "AGENT.md",
-				workflow: "WORKFLOW.md",
-				examples: plan?.agent.examples ? "EXAMPLES.md" : undefined,
-				tools: plan?.agent.tools ?? ["read", "grep", "find", "ls"],
-				maxTurns: plan?.agent.maxTurns ?? 30,
-				sessionScope: "project",
-				memoryScope: "project",
-				resolution: "user-first",
-				createProjectIfMissing: true,
-				requireProjectTrust: true,
-				contractRange: "^0.1.0",
-			},
-			permissions: {
-				read: plan?.permissions?.read ?? true,
-				write: plan?.permissions?.write ?? false,
-				bash: plan?.permissions?.bash ?? false,
-				network: plan?.permissions?.network ?? false,
-			},
-			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
-			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
-			exposure: "direct",
-			namespace: "tool",
-		};
-		if (plan?.services && Object.keys(plan.services).length > 0) {
-			manifest.services = plan.services;
-		}
-		manifest.dir = dir;
-		manifest.scope = scope;
-
-		const agentInstructions =
-			plan?.agent.instructions ??
-			[
-				`You are the persistent worker for the tool "${name}".`,
-				"",
-				"Follow the skill instructions below. Work on one job at a time.",
-				"Finish by calling submit_result.",
-				"",
-				"<skill_instructions>",
-				parsed.body.trim(),
-				"</skill_instructions>",
-			].join("\n");
-		const workflow =
-			plan?.agent.workflow ??
-			[
-				"# Workflow",
-				"",
-				"1. Read the delegated task and supplied input.",
-				"2. Follow the skill instructions in the system prompt.",
-				"3. Use only the tools listed in the tool contract.",
-				"4. If required information is missing, submit status needs_input.",
-				"5. Call submit_result with a short summary and the structured result.",
-			].join("\n");
-
-		const validation = validateManifest(manifest, dir);
-		if (!validation.manifest || validation.errors.length > 0) {
-			return {
-				status: "failed",
-				summary: "Generated manifest failed validation.",
-				warnings: [...warnings, ...validation.errors],
-			};
-		}
-		const persisted = { ...validation.manifest };
-		delete persisted.dir;
-		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
-		await atomicWrite(path.join(dir, "AGENT.md"), `${agentInstructions}\n`);
-		await atomicWrite(path.join(dir, "WORKFLOW.md"), `${workflow}\n`);
-		if (plan?.agent.examples) {
-			await atomicWrite(path.join(dir, "EXAMPLES.md"), `${plan.agent.examples}\n`);
-		}
-		this.register(validation.manifest, input.activate ?? true);
-		return {
-			status: "ok",
-			summary: `Skill ${absolute} converted to tool ${name} using the ${plan ? "converter agent" : "deterministic fallback"}.`,
-			result: {
-				name,
-				version: "0.1.0",
-				dir,
-				scope,
-				source: absolute,
-				conversionMode: plan ? "agent" : "deterministic",
-				converterAgent: plan ? path.join(this.options.agentDir, "agents", "skill_converter.md") : undefined,
-				notes: plan?.notes,
-			},
-			warnings,
-		};
 	}
 
 	async close(): Promise<void> {

@@ -13,5 +13,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts"]
+  "include": ["extensions/**/*.ts", "src/**/*.ts", "basic-tools/**/*.ts"]
 }

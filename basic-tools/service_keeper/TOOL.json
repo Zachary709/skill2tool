@@ -1,0 +1,147 @@
+{
+  "name": "service_keeper",
+  "version": "1.0.0",
+  "contractVersion": "1.0.0",
+  "description": "检查并恢复控制器上已登记的常驻服务：读服务登记表，探测健康与就绪接口，确认 systemd 用户单元状态，单元停止或健康检查失败时执行登记表里的启动或重启命令，重新检查后报告前后状态。当工具或任务依赖的本地服务不可用、需要判断谁在运行、或服务需要一次受控恢复时使用。",
+  "whenToUse": [
+    "已登记的本地服务无响应",
+    "需要确认某个服务是否在运行、是否就绪",
+    "服务单元处于 inactive 或 failed，需要执行一次启动或重启",
+    "需要查看服务最近的日志而不改动任何状态"
+  ],
+  "notFor": [
+    "需要修改服务登记表、单元文件或端口配置",
+    "需要启动登记表里没有的进程",
+    "需要 sudo、需要改动 tailscale serve 发布规则",
+    "需要维护远程集群节点上的服务"
+  ],
+  "kind": "agent",
+  "input": {
+    "type": "object",
+    "properties": {
+      "task": {
+        "type": "string",
+        "maxLength": 8000,
+        "description": "要检查和维护的服务，以及是否允许执行启动或重启。"
+      },
+      "service": {
+        "type": "string",
+        "maxLength": 128,
+        "description": "登记表里的服务名称。省略时检查全部已登记服务。"
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["check", "repair"],
+        "description": "check 只做只读检查；repair 允许按登记表执行一次启动或重启。默认 check。"
+      },
+      "context": {
+        "type": "string",
+        "maxLength": 4000,
+        "description": "调用方补充的上下文，例如触发这次检查的报错原文。"
+      }
+    },
+    "required": ["task"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "services": {
+        "type": "array",
+        "maxItems": 20,
+        "description": "每个被检查服务的检查结果。",
+        "items": {
+          "type": "object",
+          "properties": {
+            "service": { "type": "string", "maxLength": 128, "description": "登记表里的服务名称。" },
+            "unit": { "type": "string", "maxLength": 200, "description": "systemd 用户单元名称。" },
+            "healthy": { "type": "boolean", "description": "结束时该服务是否健康。" },
+            "before": {
+              "type": "object",
+              "description": "动作前的状态。",
+              "properties": {
+                "unitState": { "type": "string", "maxLength": 64, "description": "单元状态，例如 active、inactive、failed。" },
+                "health": { "type": "string", "maxLength": 16, "description": "健康检查的 HTTP 状态码，探测失败时为 000。" },
+                "readiness": { "type": "string", "maxLength": 16, "description": "就绪检查的 HTTP 状态码，探测失败时为 000。" }
+              },
+              "required": ["unitState", "health", "readiness"],
+              "additionalProperties": false
+            },
+            "after": {
+              "type": "object",
+              "description": "动作后的状态；未执行动作时与 before 相同。",
+              "properties": {
+                "unitState": { "type": "string", "maxLength": 64, "description": "单元状态。" },
+                "health": { "type": "string", "maxLength": 16, "description": "健康检查的 HTTP 状态码。" },
+                "readiness": { "type": "string", "maxLength": 16, "description": "就绪检查的 HTTP 状态码。" }
+              },
+              "required": ["unitState", "health", "readiness"],
+              "additionalProperties": false
+            },
+            "action": {
+              "type": "object",
+              "description": "执行过的启动或重启动作；没有执行动作时省略。",
+              "properties": {
+                "kind": { "type": "string", "enum": ["start", "restart"], "description": "动作类型。" },
+                "command": { "type": "string", "maxLength": 500, "description": "实际执行的登记表命令。" },
+                "exitCode": { "type": "number", "description": "动作的退出码。" },
+                "outputTail": { "type": "string", "maxLength": 800, "description": "动作输出末尾的一行摘要，不含换行。" }
+              },
+              "required": ["kind", "command", "exitCode"],
+              "additionalProperties": false
+            },
+            "policy": {
+              "type": "object",
+              "description": "登记表策略与本次判断使用的额度。",
+              "properties": {
+                "cooldownSeconds": { "type": "number", "description": "登记表里的冷却秒数。" },
+                "maxActionsPerDay": { "type": "number", "description": "登记表里的每日动作上限。" },
+                "remainingToday": { "type": "number", "description": "当日剩余可用动作次数。" },
+                "cooldownRemainingSeconds": { "type": "number", "description": "距离下次允许动作的剩余秒数。" }
+              },
+              "required": ["cooldownSeconds", "maxActionsPerDay", "remainingToday"],
+              "additionalProperties": false
+            },
+            "logTail": { "type": "string", "maxLength": 2000, "description": "仍不健康时登记的日志末尾，压成一行。" }
+          },
+          "required": ["service", "unit", "healthy", "before", "after"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": ["services"],
+    "additionalProperties": false
+  },
+  "agent": {
+    "instructions": "AGENT.md",
+    "workflow": "WORKFLOW.md",
+    "examples": "EXAMPLES.md",
+    "tools": ["read", "write", "bash", "grep", "find", "ls"],
+    "maxTurns": 20,
+    "sessionScope": "project",
+    "memoryScope": "project",
+    "resolution": "user-first",
+    "createProjectIfMissing": true,
+    "requireProjectTrust": true,
+    "contractRange": "^1.0.0"
+  },
+  "permissions": {
+    "read": true,
+    "write": true,
+    "bash": true,
+    "network": true
+  },
+  "limits": {
+    "maxInputBytes": 65536,
+    "maxResultBytes": 30000,
+    "jobTimeoutMs": 600000,
+    "jobIdleTimeoutMs": 0
+  },
+  "execution": {
+    "defaultMode": "start",
+    "notifyOnIdle": true,
+    "asyncByDefault": true
+  },
+  "exposure": "direct",
+  "namespace": "tool"
+}

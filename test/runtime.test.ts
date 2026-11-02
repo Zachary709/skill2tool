@@ -36,7 +36,7 @@ test("manifest validation rejects a direct tool without services", () => {
 });
 
 test("script service runs and returns JSON", async () => {
-	const result = await readManifestFile("examples/tools/word-count/TOOL.json");
+	const result = await readManifestFile("test/fixtures/word-count/TOOL.json");
 	assert.ok(result.manifest);
 	const supervisor = new ServiceSupervisor({ projectCwd: process.cwd(), agentDir: path.join(tempRoot, "agent") });
 	try {
@@ -526,4 +526,206 @@ test("manifest validation warns about loose input and output contracts", () => {
 	assert.ok(result.warnings.some((warning) => warning.includes("additionalProperties")));
 	assert.ok(result.warnings.some((warning) => warning.includes("required")));
 	assert.ok(result.warnings.some((warning) => warning.includes("untyped object bag")));
+});
+
+test("package tools load from basic-tools with the package scope", async () => {
+	const { loadTools } = await import("../src/discovery/manifest.ts");
+	const result = await loadTools([{ root: "basic-tools", scope: "package" }]);
+	assert.deepEqual(result.diagnostics, []);
+	const names = result.tools.map((entry) => entry.manifest.name).sort();
+	assert.deepEqual(names, ["service_keeper", "tool_add"]);
+	const toolAdd = result.tools.find((entry) => entry.manifest.name === "tool_add")?.manifest;
+	assert.equal(toolAdd?.handler, "tool_add");
+	assert.equal(toolAdd?.kind, "direct");
+	assert.ok(toolAdd?.whenToUse?.length);
+	const keeper = result.tools.find((entry) => entry.manifest.name === "service_keeper")?.manifest;
+	assert.equal(keeper?.kind, "agent");
+	assert.ok((keeper?.output.required as string[]).includes("services"));
+});
+
+test("daemon manifests default to persistent and eager", () => {
+	const result = validateManifest({
+		name: "daemon_defaults",
+		version: "1.0.0",
+		description: "A daemon without lifecycle or start.",
+		kind: "agent",
+		input: { type: "object", properties: { task: { type: "string" } }, required: ["task"], additionalProperties: false },
+		output: { type: "object", properties: { value: { type: "string", maxLength: 10 } }, required: ["value"], additionalProperties: false },
+		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
+		whenToUse: ["需要常驻服务"],
+		services: {
+			panel: { type: "daemon", command: "node", args: ["services/panel.mjs"], protocol: "http-json" },
+		},
+	});
+	assert.deepEqual(result.errors, []);
+	assert.equal(result.manifest?.services?.panel.lifecycle, "persistent");
+	assert.equal(result.manifest?.services?.panel.start, "eager");
+});
+
+test("converter plan validation requires a selection intro and a closed typed result", async () => {
+	const { validateConverterPlan } = await import("../basic-tools/tool_add/skill-converter/converter.ts");
+	const plan = {
+		name: "word_count",
+		description: "Count words in one text and return the number.",
+		whenToUse: ["需要统计一段文本的词数"],
+		input: {
+			type: "object",
+			properties: { text: { type: "string", description: "Text to count." } },
+			required: ["text"],
+			additionalProperties: false,
+		},
+		output: {
+			type: "object",
+			properties: { count: { type: "number", description: "Word count." } },
+			required: ["count"],
+			additionalProperties: false,
+		},
+		agent: {
+			instructions: "You count words and return the count. ".repeat(4),
+			workflow: "1. Read the declared text field.\n2. Count the words in it.\n3. Return only the count field.\n4. Call submit_result with the count.",
+			tools: ["read"],
+		},
+	};
+	assert.deepEqual(validateConverterPlan(plan), []);
+
+	const noIntro = { ...plan, whenToUse: [] };
+	assert.ok(validateConverterPlan(noIntro).some((error) => error.includes("whenToUse")));
+
+	const bag = {
+		...plan,
+		output: {
+			type: "object",
+			properties: { result: { type: "object" } },
+			required: ["result"],
+		},
+	};
+	const bagErrors = validateConverterPlan(bag);
+	assert.ok(bagErrors.some((error) => error.includes("additionalProperties")));
+	assert.ok(bagErrors.some((error) => error.includes("catch-all")));
+	assert.ok(bagErrors.some((error) => error.includes("untyped object bag")));
+});
+
+test("deterministic fallback produces a closed contract and agent files", async () => {
+	const { ToolAddManager } = await import("../basic-tools/tool_add/manager.ts");
+	const host = {
+		agentDir: path.join(tempRoot, "agent"),
+		cwd: process.cwd(),
+		modelRuntime: {},
+		supervisor: {},
+		log: () => {},
+		listTools: () => [],
+		getTool: () => undefined,
+		register: () => {},
+		setEnabled: async () => {},
+		isReserved: () => false,
+	};
+	const manager = new ToolAddManager(host as never);
+	const built = (manager as unknown as {
+		manifestFromFallback(
+			frontmatter: Record<string, unknown>,
+			body: string,
+			absolute: string,
+			name: string,
+			scope: "project" | "user",
+			dir: string,
+		): { manifest: ToolManifest; files: { instructions: string; workflow: string } };
+	}).manifestFromFallback({}, "Do the thing.", "/skills/demo/SKILL.md", "demo_skill", "user", "/skills/demo");
+	assert.ok(built.manifest.whenToUse?.length);
+	assert.equal(built.manifest.input.additionalProperties, false);
+	assert.equal(built.manifest.output.additionalProperties, false);
+	assert.ok((built.manifest.output.required as string[]).includes("outcome"));
+	assert.ok(built.files.instructions.includes("Do the thing."));
+	assert.ok(built.files.workflow.includes("submit_result"));
+	assert.deepEqual(validateManifest(built.manifest, "/skills/demo").errors, []);
+});
+
+test("adding an agent tool writes AGENT.md and WORKFLOW.md", async () => {
+	const { ToolAddManager } = await import("../basic-tools/tool_add/manager.ts");
+	const host = {
+		agentDir: path.join(tempRoot, "agent"),
+		cwd: tempRoot,
+		modelRuntime: {},
+		supervisor: {},
+		log: () => {},
+		listTools: () => [],
+		getTool: () => undefined,
+		register: () => {},
+		setEnabled: async () => {},
+		isReserved: () => false,
+	};
+	const manager = new ToolAddManager(host as never);
+	const manifest = {
+		name: "added_agent",
+		version: "1.0.0",
+		description: "An added agent tool used by the artifact test.",
+		whenToUse: ["需要测试添加流程"],
+		kind: "agent",
+		input: { type: "object", properties: { task: { type: "string" } }, required: ["task"], additionalProperties: false },
+		output: {
+			type: "object",
+			properties: { value: { type: "string", maxLength: 100 } },
+			required: ["value"],
+			additionalProperties: false,
+		},
+		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
+	};
+	const envelope = await manager.handle(
+		{ action: "add", manifest, scope: "user", replace: true },
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(envelope.status, "ok", JSON.stringify(envelope));
+	const dir = path.join(tempRoot, "agent", "tools", "added_agent");
+	const instructions = await fs.readFile(path.join(dir, "AGENT.md"), "utf8");
+	const workflow = await fs.readFile(path.join(dir, "WORKFLOW.md"), "utf8");
+	assert.ok(instructions.includes("persistent worker"));
+	assert.ok(workflow.includes("submit_result"));
+	const loaded = await readManifestFile(path.join(dir, "TOOL.json"));
+	assert.equal(loaded.manifest?.name, "added_agent");
+});
+
+test("runtime registers packaged tools and tool_add lists them", async () => {
+	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
+	const cwd = path.join(tempRoot, "integration");
+	await fs.mkdir(cwd, { recursive: true });
+	const registered = new Map<string, { name: string; execute: Function; description: string }>();
+	let active: string[] = [];
+	const pi = {
+		registerTool: (definition: { name: string; execute: Function; description: string }) => {
+			registered.set(definition.name, definition);
+		},
+		getActiveTools: () => [...active],
+		setActiveTools: (names: string[]) => {
+			active = [...names];
+		},
+		sendMessage: () => {},
+	};
+	const runtime = new ToolRuntime({
+		pi: pi as never,
+		cwd,
+		agentDir: path.join(cwd, "agent"),
+		projectTrusted: true,
+		modelRuntime: {} as never,
+		log: () => {},
+	});
+	try {
+		await runtime.initialize();
+		assert.deepEqual(runtime.diagnostics, []);
+		assert.deepEqual([...registered.keys()].sort(), ["service_keeper", "tool_add"]);
+		const toolAdd = registered.get("tool_add");
+		assert.ok(toolAdd);
+		const response = (await toolAdd!.execute(
+			"call-1",
+			{ action: "list" },
+			undefined,
+			undefined,
+			{ isIdle: () => true, cwd, hasUI: false },
+		)) as { structuredContent: { result: { action: string; tools: Array<{ name: string }> } } };
+		assert.equal(response.structuredContent.result.action, "list");
+		assert.deepEqual(response.structuredContent.result.tools.map((entry) => entry.name).sort(), [
+			"service_keeper",
+			"tool_add",
+		]);
+	} finally {
+		await runtime.close();
+	}
 });

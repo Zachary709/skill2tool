@@ -378,6 +378,7 @@ async function createHttpClient(options: {
 
 export class ServiceSupervisor {
 	private daemons = new Map<string, DaemonHandle>();
+	private persistentKeys = new Map<string, string>();
 	private readonly log: (message: string) => void;
 	private readonly projectCwd: string;
 	private readonly agentDir: string;
@@ -529,6 +530,7 @@ export class ServiceSupervisor {
 			throw new Error(`unsupported daemon protocol for "${key}": ${protocol}`);
 		}
 		this.daemons.set(key, handle);
+		if (service.lifecycle === "persistent") this.persistentKeys.set(key, protocol);
 		if (handle.child) {
 			await writeServiceState(placement.stateDir, {
 				level: placement.level,
@@ -559,6 +561,13 @@ export class ServiceSupervisor {
 
 	async close(): Promise<void> {
 		for (const [key, handle] of this.daemons) {
+			const protocol = this.persistentKeys.get(key);
+			if (protocol && protocol !== "jsonl-stdio") {
+				// A socket or HTTP daemon survives the session and is attached again
+				// on the next start. A stdio daemon owns its pipes, so it is closed.
+				this.log(`[${key}] persistent daemon left running`);
+				continue;
+			}
 			handle.close();
 			if (handle.stateDir && handle.child) {
 				await writeServiceState(handle.stateDir, {
@@ -568,5 +577,6 @@ export class ServiceSupervisor {
 			this.log(`[${key}] daemon closed`);
 		}
 		this.daemons.clear();
+		this.persistentKeys.clear();
 	}
 }

@@ -278,14 +278,35 @@ export function validateManifest(raw: unknown, dir?: string): {
 			if (!service.command) {
 				errors.push(`services.${name}.command is required`);
 			}
-			if (service.type === "daemon" && service.lifecycle === undefined) {
-				warnings.push(`services.${name} is a daemon without lifecycle; defaulting to session`);
+			if (service.type === "daemon") {
+				// Daemons serve jobs over time, so they start with the runtime and
+				// keep running instead of being started per call.
+				if (service.lifecycle === undefined) service.lifecycle = "persistent";
+				if (service.start === undefined) service.start = "eager";
+				if (service.lifecycle !== "persistent") {
+					warnings.push(
+						`services.${name}.lifecycle is "${service.lifecycle}"; daemons run continuously, so "persistent" is expected`,
+					);
+				}
 			}
 		}
 	}
 
-	if (manifest.kind === "direct" && !manifest.services) {
-		errors.push('direct tools must declare at least one service or be implemented by an extension');
+	if (manifest.handler !== undefined) {
+		if (manifest.handler !== "tool_add") {
+			errors.push(`handler "${String(manifest.handler)}" is not a runtime handler`);
+		}
+		if (manifest.kind !== "direct") {
+			errors.push('handler is only valid for kind "direct"');
+		}
+	}
+
+	if (manifest.kind === "direct" && !manifest.services && !manifest.handler) {
+		errors.push('direct tools must declare at least one service or use a runtime handler');
+	}
+
+	if (!manifest.whenToUse || manifest.whenToUse.length === 0) {
+		warnings.push("whenToUse is empty; the main agent has only the description to choose this tool");
 	}
 
 	const normalized: ToolManifest = {

@@ -99,6 +99,8 @@ export interface ToolManifest {
 	};
 	execution?: ExecutionConfig;
 	exposure?: ToolExposure;
+	/** In-process handler for a package tool that must run inside the runtime. */
+	handler?: "tool_add";
 	annotations?: ToolAnnotations;
 	namespace?: string;
 	/** Discovery level of the tool. Set by the loader. */
