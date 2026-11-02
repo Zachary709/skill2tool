@@ -36,6 +36,19 @@ interface RegisteredTool {
 	definition: ToolDefinition;
 }
 
+const RESERVED_TOOL_NAMES = new Set([
+	"read",
+	"bash",
+	"powershell",
+	"edit",
+	"write",
+	"grep",
+	"find",
+	"ls",
+	"tool_add",
+	"job",
+]);
+
 function atomicWrite(filePath: string, content: string): Promise<void> {
 	const dir = path.dirname(filePath);
 	const temp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
@@ -140,11 +153,18 @@ export class ToolRuntime {
 				this.options.log(`project tool skipped because the project is not trusted: ${tool.manifest.name}`);
 				continue;
 			}
-			this.register(tool.manifest, true);
+			try {
+				this.register(tool.manifest, true);
+			} catch (error) {
+				this.options.log(`failed to register tool ${tool.manifest.name}: ${String(error)}`);
+			}
 		}
 	}
 
 	register(manifest: ToolManifest, activate = true): RegisteredTool {
+		if (RESERVED_TOOL_NAMES.has(manifest.name) && !this.tools.has(manifest.name)) {
+			throw new Error(`tool name "${manifest.name}" is reserved by the runtime`);
+		}
 		const definition = this.createFacade(manifest);
 		this.options.pi.registerTool(definition);
 		if (activate) {
@@ -442,6 +462,9 @@ export class ToolRuntime {
 		}
 
 		const scope = input.scope ?? "project";
+		if (RESERVED_TOOL_NAMES.has(manifest.name) && !this.tools.has(manifest.name)) {
+			return { status: "failed", summary: `Tool name "${manifest.name}" is reserved by the runtime.` };
+		}
 		if (scope === "project" && !ctx.isProjectTrusted()) {
 			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
 		}
@@ -556,6 +579,9 @@ export class ToolRuntime {
 			(typeof parsed.frontmatter.description === "string"
 				? parsed.frontmatter.description
 				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill.`);
+		if (RESERVED_TOOL_NAMES.has(name) && !this.tools.has(name)) {
+			return { status: "failed", summary: `Tool name "${name}" is reserved by the runtime.` };
+		}
 		const dir = path.join(this.scopeRoot(scope, ctx), name);
 		if (!input.replace) {
 			try {

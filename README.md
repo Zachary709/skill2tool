@@ -295,6 +295,7 @@ Ask the main agent to use `word_count`, or to start `demo_agent` with `mode=star
 - Agent tools default to read-only permissions.
 - Worker tools cannot exceed the permissions declared in `TOOL.json`.
 - `tool_add` refuses to write project tools in an untrusted project.
+- Built-in tool names and the management tools `tool_add` and `job` are reserved; generated tools cannot override them.
 - Daemons are started by the package and receive only declared environment variables plus the inherited environment.
 - Results are validated before they reach the main agent.
 - Large results are truncated; full results belong in artifacts or job files.
