@@ -286,13 +286,17 @@ export class AgentWorker {
 			);
 		}
 
-		const builtinTools = ["read"];
-		if (this.tool.permissions?.bash) builtinTools.push("bash");
-		if (this.tool.permissions?.write) builtinTools.push("edit", "write");
+		const readTools = this.tool.permissions?.read === false ? [] : ["read", "grep", "find", "ls"];
+		const writeTools = this.tool.permissions?.write ? ["edit", "write"] : [];
+		const bashTools = this.tool.permissions?.bash ? ["bash"] : [];
+		const requested = this.agent.tools ?? [];
+		const allowed = new Set([...readTools, ...writeTools, ...bashTools]);
 		const selectedTools = Array.from(
 			new Set([
-				...builtinTools,
-				...(this.agent.tools ?? []),
+				...readTools,
+				...writeTools,
+				...bashTools,
+				...requested.filter((name) => allowed.has(name)),
 				...(this.tool.services && Object.keys(this.tool.services).length > 0 ? ["service_call"] : []),
 				"submit_result",
 			]),

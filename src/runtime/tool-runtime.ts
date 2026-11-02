@@ -12,6 +12,7 @@ import { validateManifest, validateValue, envelopeSchema } from "../contracts/sc
 import { JobManager } from "../jobs/manager.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import { executeDirectTool } from "./direct-executor.ts";
+import { runSkillConverter, type SkillConverterPlan } from "../conversion/converter.ts";
 import type {
 	JobRecord,
 	JobToolInput,
@@ -480,18 +481,39 @@ export class ToolRuntime {
 			return { status: "failed", summary: `Failed to read skill: ${String(error)}` };
 		}
 		const parsed = parseFrontmatter<Record<string, unknown>>(content);
-		const fallbackName = safeToolName(path.basename(path.dirname(absolute)));
-		const name =
-			input.name ??
-			(typeof parsed.frontmatter.name === "string" ? safeToolName(parsed.frontmatter.name) : fallbackName);
-		const description =
-			typeof parsed.frontmatter.description === "string"
-				? parsed.frontmatter.description
-				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill.`;
 		const scope = input.scope ?? "project";
 		if (scope === "project" && !ctx.isProjectTrusted()) {
 			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
 		}
+
+		const warnings: string[] = [];
+		let plan: SkillConverterPlan | undefined;
+		try {
+			plan = await runSkillConverter({
+				skillDir: path.dirname(absolute),
+				skillFile: absolute,
+				content,
+				cwd: ctx.cwd,
+				agentDir: this.options.agentDir,
+				modelRuntime: this.options.modelRuntime,
+				supervisor: this.supervisor,
+				log: this.options.log,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			warnings.push(`converter agent failed; using deterministic conversion: ${message}`);
+			this.options.log(warnings[warnings.length - 1]);
+		}
+
+		const fallbackName = safeToolName(path.basename(path.dirname(absolute)));
+		const frontmatterName =
+			typeof parsed.frontmatter.name === "string" ? safeToolName(parsed.frontmatter.name) : fallbackName;
+		const name = input.name ?? plan?.name ?? frontmatterName;
+		const description =
+			plan?.description ??
+			(typeof parsed.frontmatter.description === "string"
+				? parsed.frontmatter.description
+				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill.`);
 		const dir = path.join(this.scopeRoot(scope, ctx), name);
 		if (!input.replace) {
 			try {
@@ -503,36 +525,44 @@ export class ToolRuntime {
 		}
 		await fs.mkdir(dir, { recursive: true });
 
+		const defaultInput = {
+			type: "object",
+			properties: {
+				task: { type: "string", description: "The task for the worker." },
+				input: { type: "object", description: "Optional structured input." },
+				context: { type: "string", description: "Optional context from the caller." },
+			},
+			required: ["task"],
+		};
+		const defaultOutput = {
+			type: "object",
+			properties: {
+				summary: { type: "string" },
+				result: { type: "object" },
+			},
+			required: ["summary"],
+		};
+
 		const manifest: ToolManifest = {
 			name,
 			version: "0.1.0",
 			contractVersion: "0.1.0",
 			description,
-			whenToUse: ["Use when the task matches the original skill description."],
-			notFor: [],
+			whenToUse:
+				plan?.whenToUse && plan.whenToUse.length > 0
+					? plan.whenToUse
+					: ["Use when the task matches the original skill description."],
+			notFor: plan?.notFor ?? [],
 			kind: "agent",
-			input: {
-				type: "object",
-				properties: {
-					task: { type: "string", description: "The task for the worker." },
-					input: { type: "object", description: "Optional structured input." },
-					context: { type: "string", description: "Optional context from the caller." },
-				},
-				required: ["task"],
-			},
-			output: {
-				type: "object",
-				properties: {
-					summary: { type: "string" },
-					result: { type: "object" },
-				},
-				required: ["summary"],
-			},
+			input: plan?.input ?? defaultInput,
+			output: plan?.output ?? defaultOutput,
 			agent: {
 				instructions: "AGENT.md",
 				workflow: "WORKFLOW.md",
-				tools: ["read", "grep", "find", "ls"],
-				maxTurns: 30,
+				examples: plan?.agent.examples ? "EXAMPLES.md" : undefined,
+				tools: plan?.agent.tools ?? ["read", "grep", "find", "ls"],
+				model: plan?.agent.model,
+				maxTurns: plan?.agent.maxTurns ?? 30,
 				sessionScope: "project",
 				memoryScope: "project",
 				resolution: "user-first",
@@ -540,48 +570,77 @@ export class ToolRuntime {
 				requireProjectTrust: true,
 				contractRange: "^0.1.0",
 			},
-			permissions: { read: true, write: false, bash: false, network: false },
+			permissions: {
+				read: plan?.permissions?.read ?? true,
+				write: plan?.permissions?.write ?? false,
+				bash: plan?.permissions?.bash ?? false,
+				network: plan?.permissions?.network ?? false,
+			},
 			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
 			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
 			exposure: "direct",
 			namespace: "tool",
 		};
+		if (plan?.services && Object.keys(plan.services).length > 0) {
+			manifest.services = plan.services;
+		}
 		manifest.dir = dir;
 
-		const agentInstructions = [
-			`You are the persistent worker for the tool "${name}".`,
-			"",
-			"Follow the skill instructions below. Work on one job at a time.",
-			"Finish by calling submit_result.",
-			"",
-			"<skill_instructions>",
-			parsed.body.trim(),
-			"</skill_instructions>",
-		].join("\n");
-		const workflow = [
-			"# Workflow",
-			"",
-			"1. Read the delegated task and supplied input.",
-			"2. Follow the skill instructions in the system prompt.",
-			"3. Use only the tools listed in the tool contract.",
-			"4. If required information is missing, submit status needs_input.",
-			"5. Call submit_result with a short summary and the structured result.",
-		].join("\n");
+		const agentInstructions =
+			plan?.agent.instructions ??
+			[
+				`You are the persistent worker for the tool "${name}".`,
+				"",
+				"Follow the skill instructions below. Work on one job at a time.",
+				"Finish by calling submit_result.",
+				"",
+				"<skill_instructions>",
+				parsed.body.trim(),
+				"</skill_instructions>",
+			].join("\n");
+		const workflow =
+			plan?.agent.workflow ??
+			[
+				"# Workflow",
+				"",
+				"1. Read the delegated task and supplied input.",
+				"2. Follow the skill instructions in the system prompt.",
+				"3. Use only the tools listed in the tool contract.",
+				"4. If required information is missing, submit status needs_input.",
+				"5. Call submit_result with a short summary and the structured result.",
+			].join("\n");
 
 		const validation = validateManifest(manifest, dir);
 		if (!validation.manifest || validation.errors.length > 0) {
-			return { status: "failed", summary: "Generated manifest failed validation.", warnings: validation.errors };
+			return {
+				status: "failed",
+				summary: "Generated manifest failed validation.",
+				warnings: [...warnings, ...validation.errors],
+			};
 		}
 		const persisted = { ...validation.manifest };
 		delete persisted.dir;
 		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
 		await atomicWrite(path.join(dir, "AGENT.md"), `${agentInstructions}\n`);
 		await atomicWrite(path.join(dir, "WORKFLOW.md"), `${workflow}\n`);
+		if (plan?.agent.examples) {
+			await atomicWrite(path.join(dir, "EXAMPLES.md"), `${plan.agent.examples}\n`);
+		}
 		this.register(validation.manifest, input.activate ?? true);
 		return {
 			status: "ok",
-			summary: `Skill ${absolute} converted to tool ${name}.`,
-			result: { name, version: "0.1.0", dir, scope, source: absolute },
+			summary: `Skill ${absolute} converted to tool ${name} using the ${plan ? "converter agent" : "deterministic fallback"}.`,
+			result: {
+				name,
+				version: "0.1.0",
+				dir,
+				scope,
+				source: absolute,
+				conversionMode: plan ? "agent" : "deterministic",
+				converterAgent: plan ? path.join(this.options.agentDir, "agents", "skill_converter.md") : undefined,
+				notes: plan?.notes,
+			},
+			warnings,
 		};
 	}
 

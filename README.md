@@ -254,7 +254,18 @@ Convert a skill:
 }
 ```
 
-The converted tool uses read-only tools by default. Edit `TOOL.json` to allow `bash`, `edit`, or `write`.
+Conversion uses a user-level converter agent:
+
+```text
+~/.pi/agent/agents/skill_converter.md
+~/.pi/agent/agents/skill_converter.workflow.md
+```
+
+The runtime installs these from `agents/skill-converter/` on the first conversion. The converter agent reads the skill and its supporting files, then returns a complete plan through `submit_result`. The runtime validates the plan, writes `TOOL.json`, `AGENT.md`, `WORKFLOW.md`, and optional `EXAMPLES.md`, then registers the tool.
+
+If the converter agent is unavailable or returns an invalid plan, conversion falls back to the deterministic generator.
+
+The converted tool uses the permissions proposed by the converter. The converter defaults to read-only; edit `TOOL.json` to allow `bash`, `edit`, or `write`.
 
 `add` accepts `instructions`, `workflow`, and `examples` strings. If an agent tool's files are missing, `tool_add` writes safe defaults. A source path may point to a directory containing `TOOL.json`; the whole directory is copied.
 
