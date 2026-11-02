@@ -54,18 +54,25 @@ function safeToolName(value: string): string {
 }
 
 function facadeInputSchema(manifest: ToolManifest) {
-	const properties = {
+	const properties: Record<string, unknown> = {
 		...(manifest.input.properties ?? {}),
-		mode: {
+	};
+	if (manifest.kind === "agent") {
+		properties.mode = {
 			type: "string",
-			enum: ["sync", "start", "wait"],
-			description: "Wait for completion, start a job and return a handle, or wait for a new job.",
-		},
-		timeoutMs: {
+			enum: ["sync", "start", "wait", "status", "result", "cancel"],
+			description:
+				"sync waits for a new job, start returns a job handle, wait waits for a job, status/result/cancel operate on an existing job.",
+		};
+		properties.timeoutMs = {
 			type: "number",
 			description: "Maximum wait time in milliseconds for wait mode.",
-		},
-	};
+		};
+		properties.jobId = {
+			type: "string",
+			description: "Existing job id for wait, status, result, or cancel.",
+		};
+	}
 	return {
 		...manifest.input,
 		type: "object",
@@ -195,13 +202,48 @@ export class ToolRuntime {
 
 		const mode = (input.mode as ToolMode | undefined) ?? manifest.execution?.defaultMode ?? "sync";
 		const timeoutMs = typeof input.timeoutMs === "number" ? input.timeoutMs : undefined;
+		const existingJobId = typeof input.jobId === "string" ? input.jobId : undefined;
 		const jobInput = { ...input };
 		delete jobInput.mode;
 		delete jobInput.timeoutMs;
+		delete jobInput.jobId;
 
 		if (manifest.kind === "direct") {
 			const envelope = await executeDirectTool(manifest, jobInput, this.supervisor);
 			return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
+		}
+
+		if (existingJobId && (mode === "status" || mode === "result" || mode === "cancel" || mode === "wait")) {
+			if (mode === "cancel") {
+				const envelope = await this.jobs.handle({ action: "cancel", jobId: existingJobId });
+				return this.toolResult(envelope, manifest, await this.jobs.get(existingJobId), envelope.status === "failed");
+			}
+			const record =
+				mode === "wait"
+					? await this.jobs.wait(existingJobId, timeoutMs)
+					: await this.jobs.get(existingJobId);
+			if (!record) {
+				return this.toolResult(
+					{ status: "failed", summary: `Unknown job: ${existingJobId}` },
+					manifest,
+					undefined,
+					true,
+				);
+			}
+			const terminal = ["succeeded", "failed", "cancelled", "timed_out", "lost"].includes(record.state);
+			if (terminal && record.result) {
+				return this.toolResult(record.result, manifest, record, record.result.status === "failed");
+			}
+			return this.toolResult(
+				{
+					status: "accepted",
+					summary: `Job ${record.id} is ${record.state}.`,
+					jobId: record.id,
+				},
+				manifest,
+				record,
+				false,
+			);
 		}
 
 		const job = await this.jobs.create({
@@ -217,7 +259,7 @@ export class ToolRuntime {
 			return this.toolResult(
 				{
 					status: "accepted",
-					summary: `Job ${job.id} accepted. Use the job tool to inspect or wait for it.`,
+					summary: `Job ${job.id} accepted. Use ${manifest.name} with mode=status, wait, result, or cancel and jobId=${job.id}.`,
 					jobId: job.id,
 				},
 				manifest,
@@ -292,7 +334,7 @@ export class ToolRuntime {
 		if (!registered?.manifest.execution?.notifyOnIdle) return;
 		const message = {
 			customType: "tool_job_completed",
-			content: `Job ${job.id} for tool ${job.tool} is ${job.state}. ${job.message ?? job.error ?? ""}`.trim(),
+			content: `Job ${job.id} for tool ${job.tool} is ${job.state}. ${job.message ?? job.error ?? ""} Use ${job.tool} with mode=result and jobId=${job.id} to read it.`.trim(),
 			display: true,
 			details: { jobId: job.id, tool: job.tool, state: job.state },
 		};

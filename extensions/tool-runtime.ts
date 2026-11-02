@@ -6,7 +6,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ToolRuntime } from "../src/runtime/tool-runtime.ts";
-import type { JobToolInput, ToolAddInput } from "../src/types.ts";
+import type { ToolAddInput } from "../src/types.ts";
 
 let runtime: ToolRuntime | undefined;
 let modelRuntime: ModelRuntime | undefined;
@@ -35,19 +35,6 @@ const TOOL_ADD_PARAMS = Type.Object({
 	examples: Type.Optional(Type.String()),
 	replace: Type.Optional(Type.Boolean()),
 	activate: Type.Optional(Type.Boolean()),
-});
-
-const JOB_PARAMS = Type.Object({
-	action: Type.Union([
-		Type.Literal("list"),
-		Type.Literal("status"),
-		Type.Literal("wait"),
-		Type.Literal("result"),
-		Type.Literal("cancel"),
-		Type.Literal("logs"),
-	]),
-	jobId: Type.Optional(Type.String()),
-	timeoutMs: Type.Optional(Type.Number()),
 });
 
 function resultFromEnvelope(envelope: {
@@ -97,24 +84,6 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "job",
-		label: "Jobs",
-		description: "Inspect, wait for, read, list, or cancel background tool jobs.",
-		parameters: JOB_PARAMS,
-		executionMode: "parallel",
-		execute: async (_id, params, _signal, _onUpdate) => {
-			if (!runtime) {
-				return {
-					content: [{ type: "text", text: "tool-runtime is not initialized." }],
-					details: undefined,
-					isError: true,
-				};
-			}
-			const envelope = await runtime.handleJobTool(params as JobToolInput);
-			return resultFromEnvelope(envelope);
-		},
-	});
 
 	pi.registerCommand("tool-runtime", {
 		description: "Show pi-tool-runtime status: /tool-runtime [list|diagnostics]",

@@ -162,13 +162,22 @@ returns:
 }
 ```
 
-Use the `job` tool later:
+Read or wait for that job through the same tool:
 
 ```json
-{ "action": "wait", "jobId": "job_...", "timeoutMs": 600000 }
+{ "mode": "wait", "jobId": "job_...", "timeoutMs": 600000 }
 ```
 
-Actions: `list`, `status`, `wait`, `result`, `cancel`, `logs`.
+Modes:
+
+- `sync`: run a new job and wait for it.
+- `start`: create a new job and return its id.
+- `wait`: wait for an existing job, or create and wait when `jobId` is omitted.
+- `status`: read an existing job's state.
+- `result`: read an existing job's result.
+- `cancel`: cancel an existing job.
+
+`job` is an internal concept. There is no separate public job tool. Every agent-backed tool exposes job operations through its own `mode` and `jobId` fields. The `/tool-runtime` command can list runtime jobs for diagnostics.
 
 Jobs run in detached worker processes. The job store survives a Pi restart. On restart, queued jobs are re-enqueued; running jobs with a dead worker are marked `lost`.
 
@@ -278,7 +287,7 @@ cp -R examples/tools/demo-agent .pi/tools/
 pi --no-skills -e .
 ```
 
-Ask the main agent to use `word_count`, or to start a `demo_agent` job and then use the `job` tool.
+Ask the main agent to use `word_count`, or to start `demo_agent` with `mode=start` and then call `demo_agent` again with `mode=result` and the returned `jobId`.
 
 ## Security
 
