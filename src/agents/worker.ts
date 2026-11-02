@@ -182,10 +182,12 @@ function createServiceTool(tool: ToolManifest, supervisor: ServiceSupervisor): T
 		}),
 		execute: async (_id, params) => {
 			const input = params as { service: string; method?: string; params?: Record<string, unknown> };
-			const result = await supervisor.call(tool, input.service, {
-				method: input.method,
-				params: input.params ?? {},
-			});
+			const service = tool.services?.[input.service];
+			const payload =
+				service?.type === "script"
+					? (input.params ?? {})
+					: { method: input.method, params: input.params ?? {} };
+			const result = await supervisor.call(tool, input.service, payload);
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: `service "${input.service}" failed: ${result.error}` }],
@@ -208,16 +210,30 @@ export class AgentWorker {
 	private readonly sessionDir: string;
 	private readonly memoryPath: string;
 	private readonly journalPath: string;
+	private readonly tool: ToolManifest;
+	private readonly agent: ResolvedAgent;
+	private readonly cwd: string;
+	private readonly agentDir: string;
+	private readonly modelRuntime: ModelRuntime;
+	private readonly supervisor: ServiceSupervisor;
+	private readonly log: (message: string) => void;
 
 	constructor(
-		private readonly tool: ToolManifest,
-		private readonly agent: ResolvedAgent,
-		private readonly cwd: string,
-		private readonly agentDir: string,
-		private readonly modelRuntime: ModelRuntime,
-		private readonly supervisor: ServiceSupervisor,
-		private readonly log: (message: string) => void,
+		tool: ToolManifest,
+		agent: ResolvedAgent,
+		cwd: string,
+		agentDir: string,
+		modelRuntime: ModelRuntime,
+		supervisor: ServiceSupervisor,
+		log: (message: string) => void,
 	) {
+		this.tool = tool;
+		this.agent = agent;
+		this.cwd = cwd;
+		this.agentDir = agentDir;
+		this.modelRuntime = modelRuntime;
+		this.supervisor = supervisor;
+		this.log = log;
 		this.key = workerKey(tool, agent, cwd);
 		this.sessionDir = path.join(agentDir, "tool-workers", this.key);
 		this.memoryPath = path.join(this.sessionDir, "memory.md");

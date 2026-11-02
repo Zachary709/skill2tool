@@ -19,6 +19,7 @@ const TOOL_ADD_PARAMS = Type.Object({
 		Type.Literal("add"),
 		Type.Literal("convert_skill"),
 		Type.Literal("disable"),
+		Type.Literal("enable"),
 	]),
 	name: Type.Optional(Type.String()),
 	scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("user")])),
@@ -29,6 +30,9 @@ const TOOL_ADD_PARAMS = Type.Object({
 		}),
 	),
 	manifest: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+	instructions: Type.Optional(Type.String()),
+	workflow: Type.Optional(Type.String()),
+	examples: Type.Optional(Type.String()),
 	replace: Type.Optional(Type.Boolean()),
 	activate: Type.Optional(Type.Boolean()),
 });

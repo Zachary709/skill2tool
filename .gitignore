@@ -7,3 +7,5 @@ dist/
 .pi/tools/
 .pi/agents/
 coverage/
+
+.test-tmp/

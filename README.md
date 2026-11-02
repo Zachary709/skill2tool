@@ -129,12 +129,20 @@ Daemon service:
 }
 ```
 
-Daemon requests and responses are JSON lines over stdio:
+Daemon protocols:
+
+- `jsonl-stdio`: newline-delimited JSON over stdin/stdout.
+- `unix-jsonl`: newline-delimited JSON over a Unix socket. Set `socket`.
+- `http-json`: JSON over HTTP. Set `url`, optional `method` and `headers`.
+
+Request and response shape:
 
 ```json
 {"id":"1","method":"ping","params":{}}
 {"id":"1","status":"ok","result":{"ok":true}}
 ```
+
+For `http-json`, the request body is `{"method":"ping","params":{}}` and the response body is `{"status":"ok","result":{...}}`.
 
 ## Jobs
 
@@ -161,6 +169,8 @@ Use the `job` tool later:
 ```
 
 Actions: `list`, `status`, `wait`, `result`, `cancel`, `logs`.
+
+Jobs run in detached worker processes. The job store survives a Pi restart. On restart, queued jobs are re-enqueued; running jobs with a dead worker are marked `lost`.
 
 When a started job finishes and the requesting agent is idle, the runtime sends a short completion message. The full result stays in the job store.
 
@@ -231,6 +241,7 @@ Actions:
 - `add`
 - `convert_skill`
 - `disable`
+- `enable`
 
 Convert a skill:
 
@@ -244,6 +255,8 @@ Convert a skill:
 ```
 
 The converted tool uses read-only tools by default. Edit `TOOL.json` to allow `bash`, `edit`, or `write`.
+
+`add` accepts `instructions`, `workflow`, and `examples` strings. If an agent tool's files are missing, `tool_add` writes safe defaults. A source path may point to a directory containing `TOOL.json`; the whole directory is copied.
 
 ## Examples
 
@@ -271,6 +284,7 @@ Ask the main agent to use `word_count`, or to start a `demo_agent` job and then 
 ```bash
 npm install
 npm run typecheck
+npm test
 ```
 
 The extension entry point is `extensions/tool-runtime.ts`.

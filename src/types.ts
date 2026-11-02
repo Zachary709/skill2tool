@@ -26,7 +26,14 @@ export interface ServiceDefinition {
 	command?: string;
 	args?: string[];
 	cwd?: string;
-	protocol?: "json-stdin-stdout" | "jsonl-stdio";
+	protocol?: "json-stdin-stdout" | "jsonl-stdio" | "unix-jsonl" | "http-json";
+	/** Unix socket path for unix-jsonl services. */
+	socket?: string;
+	/** Base URL for http-json services. */
+	url?: string;
+	/** HTTP method for http-json services. Defaults to POST. */
+	method?: string;
+	headers?: Record<string, string>;
 	timeoutMs?: number;
 	lifecycle?: "session" | "persistent";
 	start?: "lazy" | "eager";
@@ -135,6 +142,9 @@ export interface JobRecord {
 	mode: ToolMode;
 	state: JobState;
 	createdAt: string;
+	toolDir?: string;
+	projectTrusted?: boolean;
+	pid?: number;
 	startedAt?: string;
 	finishedAt?: string;
 	heartbeatAt?: string;
@@ -151,7 +161,7 @@ export interface JobRecord {
 }
 
 export interface ToolAddInput {
-	action: "list" | "inspect" | "validate" | "add" | "convert_skill" | "disable";
+	action: "list" | "inspect" | "validate" | "add" | "convert_skill" | "disable" | "enable";
 	name?: string;
 	scope?: "project" | "user";
 	source?: {
@@ -159,6 +169,9 @@ export interface ToolAddInput {
 		path?: string;
 	};
 	manifest?: unknown;
+	instructions?: string;
+	workflow?: string;
+	examples?: string;
 	replace?: boolean;
 	activate?: boolean;
 }

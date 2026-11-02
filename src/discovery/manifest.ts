@@ -40,6 +40,12 @@ export async function loadTools(sources: ToolSource[]): Promise<{
 
 		for (const entry of entries.sort()) {
 			const dir = path.join(source.root, entry);
+			try {
+				await fs.access(path.join(dir, ".disabled"));
+				continue;
+			} catch {
+				// enabled
+			}
 			const manifestPath = path.join(dir, "TOOL.json");
 			let raw: unknown;
 			try {

@@ -1,60 +1,67 @@
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
-import type { JobRecord, JobState, JobToolInput, ToolEnvelope, ToolManifest, ToolMode } from "../types.ts";
-import type { WorkerRunResult } from "../agents/worker.ts";
-
-interface JobEntry {
-	record: JobRecord;
-	controller: AbortController;
-	done: Promise<void>;
-	resolveDone: () => void;
-}
+import { fileURLToPath } from "node:url";
+import type { JobRecord, JobToolInput, ToolEnvelope, ToolManifest, ToolMode } from "../types.ts";
+import {
+	appendJobEvent,
+	atomicWrite,
+	jobDir,
+	jobFilePath,
+	readJobRecord,
+	writeJobRecord,
+	writeJobResult,
+} from "./store.ts";
 
 export interface JobManagerOptions {
 	root: string;
-	runJob: (job: JobRecord, signal: AbortSignal) => Promise<WorkerRunResult>;
+	agentDir: string;
 	notify: (job: JobRecord) => void;
 	log: (message: string) => void;
 }
+
+const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled", "timed_out", "lost"]);
 
 function newJobId(tool: string): string {
 	return `job_${tool}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function atomicWrite(filePath: string, content: string): Promise<void> {
-	const dir = path.dirname(filePath);
-	await fs.mkdir(dir, { recursive: true });
-	const temp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
-	await fs.writeFile(temp, content, "utf8");
-	await fs.rename(temp, filePath);
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms);
+		timer.unref?.();
+	});
+}
+
+function isAlive(pid: number | undefined): boolean {
+	if (!pid) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export class JobManager {
-	private readonly jobs = new Map<string, JobEntry>();
+	private readonly records = new Map<string, JobRecord>();
 	private readonly queues = new Map<string, Promise<void>>();
+	private readonly workerEntry = fileURLToPath(new URL("./worker-entry.ts", import.meta.url));
+	private readonly options: JobManagerOptions;
 
-	constructor(private readonly options: JobManagerOptions) {}
-
-	private jobDir(id: string): string {
-		return path.join(this.options.root, id);
+	constructor(options: JobManagerOptions) {
+		this.options = options;
 	}
 
 	private async persist(record: JobRecord): Promise<void> {
-		await atomicWrite(path.join(this.jobDir(record.id), "job.json"), `${JSON.stringify(record, null, 2)}\n`);
+		this.records.set(record.id, record);
+		await writeJobRecord(this.options.root, record);
 	}
 
-	private async event(record: JobRecord, event: Record<string, unknown>): Promise<void> {
-		try {
-			await fs.mkdir(this.jobDir(record.id), { recursive: true });
-			await fs.appendFile(
-				path.join(this.jobDir(record.id), "events.jsonl"),
-				`${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`,
-				"utf8",
-			);
-		} catch (error) {
-			this.options.log(`failed to append job event: ${String(error)}`);
-		}
+	private async read(id: string): Promise<JobRecord | undefined> {
+		const record = (await readJobRecord(this.options.root, id)) ?? this.records.get(id);
+		if (record) this.records.set(id, record);
+		return record;
 	}
 
 	async create(options: {
@@ -62,6 +69,7 @@ export class JobManager {
 		input: Record<string, unknown>;
 		mode: ToolMode;
 		cwd: string;
+		projectTrusted: boolean;
 		requester?: JobRecord["requester"];
 	}): Promise<JobRecord> {
 		const record: JobRecord = {
@@ -71,117 +79,130 @@ export class JobManager {
 			agentId: "",
 			agentSource: "embedded",
 			cwd: options.cwd,
+			toolDir: options.manifest.dir,
+			projectTrusted: options.projectTrusted,
 			input: options.input,
 			mode: options.mode,
 			state: "queued",
 			createdAt: new Date().toISOString(),
 			requester: options.requester,
 		};
-		const controller = new AbortController();
-		let resolveDone!: () => void;
-		const done = new Promise<void>((resolve) => {
-			resolveDone = resolve;
-		});
-		this.jobs.set(record.id, { record, controller, done, resolveDone });
 		await this.persist(record);
-		await this.event(record, { state: "queued" });
+		await appendJobEvent(this.options.root, record, { state: "queued" });
 
 		if (options.mode === "status" || options.mode === "result" || options.mode === "cancel") {
 			return record;
 		}
 
-		const queueKey = `${options.manifest.name}:${options.cwd}`;
+		this.enqueue(record);
+		return record;
+	}
+
+	private enqueue(record: JobRecord): void {
+		const queueKey = `${record.tool}:${record.cwd}`;
 		const previous = this.queues.get(queueKey) ?? Promise.resolve();
-		const next = previous
+		let next: Promise<void>;
+		next = previous
 			.catch(() => {})
 			.then(() => this.run(record.id))
 			.finally(() => {
 				if (this.queues.get(queueKey) === next) this.queues.delete(queueKey);
 			});
 		this.queues.set(queueKey, next);
-		return record;
 	}
 
 	private async run(id: string): Promise<void> {
-		const entry = this.jobs.get(id);
-		if (!entry) return;
-		if (entry.record.state !== "queued") return;
-		const { record, controller } = entry;
+		const record = await this.read(id);
+		if (!record || record.state !== "queued") return;
+
+		const dir = jobDir(this.options.root, record.id);
+		await fs.mkdir(dir, { recursive: true });
+		const stdout = await fs.open(path.join(dir, "stdout.log"), "a");
+		const stderr = await fs.open(path.join(dir, "stderr.log"), "a");
+		const child = spawn(process.execPath, [this.workerEntry, jobFilePath(this.options.root, id)], {
+			cwd: record.cwd,
+			env: {
+				...process.env,
+				PI_TOOL_RUNTIME_AGENT_DIR: this.options.agentDir,
+				NODE_OPTIONS: [process.env.NODE_OPTIONS, "--experimental-transform-types"].filter(Boolean).join(" "),
+				NODE_NO_WARNINGS: "1",
+			},
+			detached: true,
+			stdio: ["ignore", stdout.fd, stderr.fd],
+		});
+		await stdout.close();
+		await stderr.close();
+
 		record.state = "running";
+		record.pid = child.pid;
 		record.startedAt = new Date().toISOString();
 		record.heartbeatAt = record.startedAt;
 		await this.persist(record);
-		await this.event(record, { state: "running" });
+		await appendJobEvent(this.options.root, record, { state: "running", pid: child.pid });
 
-		try {
-			const result = await this.options.runJob(record, controller.signal);
-			record.state = result.envelope.status === "cancelled" ? "cancelled" : "succeeded";
-			if (result.envelope.status === "failed") record.state = "failed";
-			record.result = { ...result.envelope, jobId: record.id } as ToolEnvelope;
-			record.usage = result.usage;
-			record.artifacts = result.envelope.artifacts;
-			record.message = result.envelope.summary;
-		} catch (error) {
-			record.state = controller.signal.aborted ? "cancelled" : "failed";
-			record.error = error instanceof Error ? error.message : String(error);
-			record.result = {
-				status: record.state === "cancelled" ? "cancelled" : "failed",
-				summary: record.error,
-				jobId: record.id,
-			};
-		} finally {
-			record.finishedAt = new Date().toISOString();
-			record.heartbeatAt = record.finishedAt;
-			await this.persist(record);
-			await this.event(record, { state: record.state, message: record.message ?? record.error });
-			if (record.result) {
-				await atomicWrite(
-					path.join(this.jobDir(record.id), "result.json"),
-					`${JSON.stringify(record.result, null, 2)}\n`,
-				);
-			}
-			entry.resolveDone();
+		child.on("error", (error) => {
+			this.options.log(`worker process failed for ${id}: ${error.message}`);
+		});
+
+		await new Promise<void>((resolve) => {
+			child.once("exit", () => resolve());
+			child.once("error", () => resolve());
+		});
+
+		let finished = (await this.read(id)) ?? record;
+		if (!TERMINAL_STATES.has(finished.state)) {
+			finished.state = "failed";
+			finished.error = "worker process exited without writing a terminal job state";
+			finished.result = { status: "failed", summary: finished.error, jobId: id };
+			finished.finishedAt = new Date().toISOString();
+			finished.heartbeatAt = finished.finishedAt;
+			await this.persist(finished);
+			await writeJobResult(this.options.root, finished);
+			await appendJobEvent(this.options.root, finished, { state: finished.state, message: finished.error });
+		}
+		if (finished.mode === "start") {
 			try {
-				this.options.notify(record);
+				this.options.notify(finished);
 			} catch (error) {
 				this.options.log(`job notification failed: ${String(error)}`);
 			}
 		}
 	}
 
-	get(id: string): JobRecord | undefined {
-		return this.jobs.get(id)?.record;
+	async get(id: string): Promise<JobRecord | undefined> {
+		return this.read(id);
 	}
 
-	list(): JobRecord[] {
-		return [...this.jobs.values()]
-			.map((entry) => entry.record)
-			.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	async list(): Promise<JobRecord[]> {
+		await fs.mkdir(this.options.root, { recursive: true });
+		let entries: string[] = [];
+		try {
+			entries = await fs.readdir(this.options.root);
+		} catch {
+			return [...this.records.values()];
+		}
+		const records: JobRecord[] = [];
+		for (const entry of entries) {
+			const record = await this.read(entry);
+			if (record) records.push(record);
+		}
+		return records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 	}
 
 	async wait(id: string, timeoutMs?: number): Promise<JobRecord | undefined> {
-		const entry = this.jobs.get(id);
-		if (!entry) return undefined;
-		if (["succeeded", "failed", "cancelled", "timed_out", "lost"].includes(entry.record.state)) {
-			return entry.record;
+		const deadline = timeoutMs && timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+		while (true) {
+			const record = await this.read(id);
+			if (!record) return undefined;
+			if (TERMINAL_STATES.has(record.state)) return record;
+			if (Date.now() >= deadline) return record;
+			await sleep(200);
 		}
-		if (!timeoutMs || timeoutMs <= 0) {
-			await entry.done;
-			return entry.record;
-		}
-		await Promise.race([
-			entry.done,
-			new Promise<void>((resolve) => {
-				const timer = setTimeout(resolve, timeoutMs);
-				timer.unref?.();
-			}),
-		]);
-		return entry.record;
 	}
 
 	async handle(input: JobToolInput): Promise<ToolEnvelope> {
 		if (input.action === "list") {
-			const jobs = this.list().slice(0, 50);
+			const jobs = (await this.list()).slice(0, 50);
 			return {
 				status: "ok",
 				summary: `${jobs.length} job(s) known to this runtime.`,
@@ -191,22 +212,28 @@ export class JobManager {
 		if (!input.jobId) {
 			return { status: "failed", summary: "jobId is required for this action." };
 		}
-		const entry = this.jobs.get(input.jobId);
-		if (!entry) {
+		const record = await this.read(input.jobId);
+		if (!record) {
 			return { status: "failed", summary: `Unknown job: ${input.jobId}` };
 		}
 		if (input.action === "cancel") {
-			entry.controller.abort();
-			if (entry.record.state === "queued") {
-				entry.record.state = "cancelled";
-				entry.record.finishedAt = new Date().toISOString();
-				await this.persist(entry.record);
-				entry.resolveDone();
+			if (record.pid && isAlive(record.pid)) {
+				try {
+					process.kill(record.pid, "SIGTERM");
+				} catch {
+					// ignore
+				}
 			}
+			record.state = "cancelled";
+			record.finishedAt = new Date().toISOString();
+			record.result = { status: "cancelled", summary: "Job cancelled.", jobId: record.id };
+			await this.persist(record);
+			await writeJobResult(this.options.root, record);
+			await appendJobEvent(this.options.root, record, { state: "cancelled" });
 			return {
 				status: "ok",
 				summary: `Cancellation requested for ${input.jobId}.`,
-				result: { job: entry.record },
+				result: { job: record },
 			};
 		}
 		if (input.action === "wait") {
@@ -220,26 +247,33 @@ export class JobManager {
 		if (input.action === "result") {
 			return {
 				status: "ok",
-				summary: `Job ${entry.record.id} is ${entry.record.state}.`,
-				result: { job: entry.record, result: entry.record.result ?? null },
+				summary: `Job ${record.id} is ${record.state}.`,
+				result: { job: record, result: record.result ?? null },
 			};
 		}
 		if (input.action === "logs") {
 			try {
-				const events = await fs.readFile(path.join(this.jobDir(input.jobId), "events.jsonl"), "utf8");
+				const events = await fs.readFile(path.join(jobDir(this.options.root, input.jobId), "events.jsonl"), "utf8");
+				const stderr = await fs
+					.readFile(path.join(jobDir(this.options.root, input.jobId), "stderr.log"), "utf8")
+					.catch(() => "");
 				return {
 					status: "ok",
 					summary: `Events for ${input.jobId}.`,
-					result: { job: entry.record, events: events.trim().split("\n").slice(-100) },
+					result: {
+						job: record,
+						events: events.trim().split("\n").slice(-100),
+						stderr: stderr.split("\n").slice(-50).join("\n"),
+					},
 				};
 			} catch {
-				return { status: "ok", summary: `No events for ${input.jobId}.`, result: { job: entry.record } };
+				return { status: "ok", summary: `No events for ${input.jobId}.`, result: { job: record } };
 			}
 		}
 		return {
 			status: "ok",
-			summary: `Job ${entry.record.id} is ${entry.record.state}.`,
-			result: { job: entry.record },
+			summary: `Job ${record.id} is ${record.state}.`,
+			result: { job: record },
 		};
 	}
 
@@ -252,22 +286,20 @@ export class JobManager {
 			return;
 		}
 		for (const entry of entries) {
-			const jobPath = path.join(this.options.root, entry, "job.json");
-			try {
-				const record = JSON.parse(await fs.readFile(jobPath, "utf8")) as JobRecord;
-				if (record.state === "running") {
-					record.state = "lost";
-					record.error = "runtime restarted while the job was running";
-					record.finishedAt = new Date().toISOString();
-					await this.persist(record);
-				}
-			} catch {
-				// ignore malformed job directories
+			const record = await this.read(entry);
+			if (!record) continue;
+			if (record.state === "running" && !isAlive(record.pid)) {
+				record.state = "lost";
+				record.error = "runtime restarted while the job was running";
+				record.result = { status: "failed", summary: record.error, jobId: record.id };
+				record.finishedAt = new Date().toISOString();
+				record.heartbeatAt = record.finishedAt;
+				await this.persist(record);
+				await writeJobResult(this.options.root, record);
+				await appendJobEvent(this.options.root, record, { state: "lost", message: record.error });
+			} else if (record.state === "queued") {
+				this.enqueue(record);
 			}
 		}
 	}
-}
-
-export function jobStoreKey(tool: string, cwd: string): string {
-	return createHash("sha256").update(`${tool}|${cwd}`).digest("hex").slice(0, 12);
 }
