@@ -217,6 +217,13 @@ export class JobManager {
 			return { status: "failed", summary: `Unknown job: ${input.jobId}` };
 		}
 		if (input.action === "cancel") {
+			if (TERMINAL_STATES.has(record.state)) {
+				return {
+					status: "ok",
+					summary: `Job ${record.id} is already ${record.state}.`,
+					result: { job: record },
+				};
+			}
 			if (record.pid && isAlive(record.pid)) {
 				try {
 					process.kill(record.pid, "SIGTERM");
