@@ -8,11 +8,14 @@ Every action is executed by calling the `tool_add_manage` tool. It runs against 
 
 ## Actions that need a plan
 
-For `convert_skill` and `create_tool`, build one complete tool plan, then call `tool_add_manage` with the action and the plan.
+For `convert_skill` and `create_tool`, build one complete tool plan, then call `tool_add_manage` with the action and the plan as a JSON object. Never send the plan as a serialized string.
 
 `convert_skill`:
 - `sourcePath` points to a `SKILL.md`. Read it completely with the read tool, then inspect the surrounding directory and the supporting files that affect execution.
 - Keep the skill's actual instructions. Do not invent capabilities the skill does not have.
+- The runtime bundles the whole skill directory as `skill/` inside the new tool directory. When the parent repository ships a service deployment unit named `service/` or `services/` and the skill references it, that code is bundled under the same name next to `skill/`. Write every service command, script path, and instruction as a path relative to the tool directory, for example `skill/scripts/adaptive-runner` or `service/scripts/adaptive-service`. Never use the source checkout path.
+- Extract the skill's services. Inspect `scripts/`, `service/`, `services/`, and any executable entry point. Declare a script service when an existing script speaks `json-stdin-stdout`, and a daemon when an existing server speaks `jsonl-stdio`, `unix-jsonl`, or `http-json`. Do not drop a service the skill ships. When a bundled script is a command line tool without a service protocol, grant `bash` and call it from `skill/...` instead.
+- Extract services the skill depends on but does not contain. Inspect the parent repository and the references for deployment units such as `service/`, a systemd user unit, a listening port, and health or readiness URLs. The bundled `service/` copy is reference code; the running service is the registered systemd unit, so maintain it through `externalServices`, not by starting the bundled copy. Add each one to `externalServices` with a `name`, a `description`, the systemd `unit`, optional `checks` (`health` and `readiness` with `url`, `expectStatus`, `timeoutMs`), and optional `policy`. Only `kind: "systemd-user"` is supported. Never invent a unit name; when it cannot be determined, leave the dependency out and say so in `notes`. If the service registry already lists an entry with the same unit, use that entry name instead of adding a second entry.
 
 `create_tool`:
 - `name` is the tool name and `requirements` is the brief stated by the calling agent. The requirements are complete; do not ask for a chat transcript.
@@ -32,8 +35,9 @@ The plan is a JSON object with these fields:
 - `agent.workflow`: ordered steps that end with `submit_result`, at least 80 characters;
 - `agent.tools`: the worker tools, a subset of read, grep, find, ls, edit, write, bash;
 - `agent.examples`: optional examples text;
-- `services`: optional services, only from an existing script or server;
-- `permissions`: read, write, bash, network, defaulting to read-only.
+- `services`: optional runtime services, only from an existing script or server;
+- `externalServices`: optional systemd user units the skill depends on but does not contain;
+- `permissions`: an object with `read`, `write`, `bash`, and `network` booleans, defaulting to read-only. Never send it as an array.
 
 Plan rules:
 - every schema sets `"additionalProperties": false`, describes every property, and lists a non-empty `required`;

@@ -17,8 +17,11 @@ import { resolveAgent } from "../agents/resolver.ts";
 import { executeDirectTool } from "./direct-executor.ts";
 import { ToolAddManager } from "../../basic-tools/tool_add/manager.ts";
 import {
+	InlineProgress,
 	ProgressWatcher,
+	listJobs,
 	snapshotProgress,
+	type JobSummary,
 	type ProgressSnapshot,
 	type ProgressUi,
 	type ProgressUpdateSink,
@@ -73,7 +76,7 @@ function facadeInputSchema(manifest: ToolManifest) {
 			type: "string",
 			enum: ["sync", "start", "wait", "status", "result", "cancel"],
 			description:
-				"sync waits for a new job, start returns a job handle, wait waits for a job, status/result/cancel operate on an existing job.",
+				"sync waits for a new job, start returns a job handle, wait waits for a job, status/result/cancel operate on an existing job. Job-control modes need only mode and jobId.",
 		};
 		properties.timeoutMs = {
 			type: "number",
@@ -84,11 +87,17 @@ function facadeInputSchema(manifest: ToolManifest) {
 			description: "Existing job id for wait, status, result, or cancel.",
 		};
 	}
-	return {
+	const schema: Record<string, unknown> = {
 		...manifest.input,
 		type: "object",
 		properties,
 	};
+	if (supportsJobs) {
+		// A job-control call does not repeat the task fields. The runtime enforces
+		// the task contract only when a job is created.
+		delete schema.required;
+	}
+	return schema;
 }
 
 function truncate(text: string, maxBytes: number): string {
@@ -246,7 +255,7 @@ export class ToolRuntime {
 		};
 	}
 
-	private async runToolAddAgent(
+	private async runHandlerAgent(
 		manifest: ToolManifest,
 		input: Record<string, unknown>,
 		mode: ToolMode,
@@ -254,12 +263,14 @@ export class ToolRuntime {
 		ctx: {
 			cwd?: string;
 			isProjectTrusted?(): boolean;
+			ui?: ProgressUi;
 		},
+		extraTools: ToolDefinition[],
 	): Promise<ToolEnvelope> {
 		if (mode !== "sync") {
 			return {
 				status: "failed",
-				summary: "tool_add manages the live tool registry, so it runs in process and supports only sync mode.",
+				summary: `${manifest.name} manages live runtime state, so it runs in process and supports only sync mode.`,
 			};
 		}
 		const cwd = ctx.cwd ?? this.options.cwd;
@@ -273,28 +284,96 @@ export class ToolRuntime {
 		if (!resolution.agent) {
 			return {
 				status: "failed",
-				summary: resolution.error ?? "No usable agent for tool_add.",
+				summary: resolution.error ?? `No usable agent for ${manifest.name}.`,
 				warnings: resolution.warnings,
 			};
 		}
+		const inline = ctx.ui ? new InlineProgress({ ui: ctx.ui, title: manifest.name }) : undefined;
+		const worker = new AgentWorker(
+			manifest,
+			resolution.agent,
+			cwd,
+			this.options.agentDir,
+			this.options.modelRuntime,
+			this.supervisor,
+			this.options.log,
+			(entry) => {
+				if (inline) {
+					inline.push(entry);
+					return;
+				}
+				this.options.log(`[${manifest.name}] ${entry.kind}: ${entry.text.slice(0, 300)}`);
+			},
+			this.defaultModel(),
+			extraTools,
+		);
+		try {
+			const result = await worker.run(
+				{
+					task: `Handle this ${manifest.name} request and finish with submit_result.`,
+					input,
+					context: `Project directory: ${cwd}`,
+				},
+				signal,
+			);
+			return result.envelope;
+		} catch (error) {
+			return {
+				status: "failed",
+				summary: `${manifest.name} worker failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		} finally {
+			await worker.dispose();
+			inline?.stop();
+		}
+	}
 
-		const properties = { ...(manifest.input.properties ?? {}) };
+	private toolAddManageTool(cwd: string): ToolDefinition {
+		const properties = { ...(this.tools.get("tool_add")?.manifest.input.properties ?? {}) };
 		properties.plan = {
 			type: "object",
 			description: "Complete tool plan. Required for create_tool; optional for convert_skill.",
 		};
-		const manageTool: ToolDefinition = {
+		const parameters = Type.Unsafe({
+			...this.tools.get("tool_add")?.manifest.input,
+			type: "object",
+			properties,
+		});
+		return {
 			name: "tool_add_manage",
 			label: "Manage tools",
 			description:
 				"Run one tool_add management action. For convert_skill and create_tool, pass the complete plan built from the skill or the requirements.",
-			parameters: Type.Unsafe({
-				...manifest.input,
-				type: "object",
-				properties,
-			}),
+			parameters,
 			execute: async (_id, params) => {
-				const envelope = await this.toolAdd.handle(params as unknown as ToolAddInput, {
+				const request = { ...(params as Record<string, unknown>) };
+				if (typeof request.plan === "string") {
+					try {
+						request.plan = JSON.parse(request.plan);
+					} catch (error) {
+						return {
+							content: [
+								{
+									type: "text" as const,
+									text: `plan must be a JSON object, not a serialized string: ${String(error)}`,
+								},
+							],
+							details: undefined,
+							isError: true,
+						};
+					}
+				}
+				if (
+					request.plan !== undefined &&
+					(typeof request.plan !== "object" || request.plan === null || Array.isArray(request.plan))
+				) {
+					return {
+						content: [{ type: "text" as const, text: "plan must be a JSON object." }],
+						details: undefined,
+						isError: true,
+					};
+				}
+				const envelope = await this.toolAdd.handle(request as unknown as ToolAddInput, {
 					cwd,
 					isProjectTrusted: () => this.options.projectTrusted,
 				});
@@ -313,37 +392,89 @@ export class ToolRuntime {
 				};
 			},
 		};
+	}
 
-		const worker = new AgentWorker(
-			manifest,
-			resolution.agent,
-			cwd,
-			this.options.agentDir,
-			this.options.modelRuntime,
-			this.supervisor,
-			this.options.log,
-			undefined,
-			this.defaultModel(),
-			[manageTool],
-		);
-		try {
-			const result = await worker.run(
-				{
-					task: "Handle this tool_add request and finish with submit_result.",
-					input,
-					context: `Project directory: ${cwd}`,
-				},
-				signal,
-			);
-			return result.envelope;
-		} catch (error) {
-			return {
-				status: "failed",
-				summary: `tool_add worker failed: ${error instanceof Error ? error.message : String(error)}`,
-			};
-		} finally {
-			await worker.dispose();
+	private daemonTargets(toolName?: string, serviceName?: string): Array<{ manifest: ToolManifest; name: string }> {
+		const targets: Array<{ manifest: ToolManifest; name: string }> = [];
+		for (const { manifest } of this.tools.values()) {
+			for (const [name, service] of Object.entries(manifest.services ?? {})) {
+				if (service.type !== "daemon") continue;
+				if (toolName && manifest.name !== toolName) continue;
+				if (serviceName && name !== serviceName) continue;
+				targets.push({ manifest, name });
+			}
 		}
+		return targets;
+	}
+
+	private serviceKeeperManageTool(): ToolDefinition {
+		return {
+			name: "service_keeper_manage",
+			label: "Maintain tool daemons",
+			description:
+				"List, inspect, or restart daemons declared by installed tools. The runtime owns these processes, so a restart must run through this tool and not through bash.",
+			parameters: Type.Object({
+				action: Type.Union([Type.Literal("list"), Type.Literal("status"), Type.Literal("restart")]),
+				tool: Type.Optional(Type.String()),
+				service: Type.Optional(Type.String()),
+			}),
+			execute: async (_id, params) => {
+				const input = params as { action: string; tool?: string; service?: string };
+				try {
+					if (input.action === "restart") {
+						if (!input.tool || !input.service) {
+							return {
+								content: [{ type: "text" as const, text: "restart requires tool and service." }],
+								details: undefined,
+								isError: true,
+							};
+						}
+						const manifest = this.tools.get(input.tool)?.manifest;
+						if (!manifest) throw new Error(`unknown tool "${input.tool}"`);
+						const status = await this.supervisor.restartDaemon(manifest, input.service);
+						return {
+							content: [{ type: "text" as const, text: JSON.stringify(status, null, 2) }],
+							details: status,
+						};
+					}
+					const targets = this.daemonTargets(input.tool, input.service);
+					if (input.action === "status" && (!input.tool || !input.service)) {
+						return {
+							content: [{ type: "text" as const, text: "status requires tool and service." }],
+							details: undefined,
+							isError: true,
+						};
+					}
+					const statuses = [];
+					for (const target of targets) {
+						try {
+							statuses.push(await this.supervisor.daemonStatus(target.manifest, target.name));
+						} catch (error) {
+							statuses.push({
+								tool: target.manifest.name,
+								service: target.name,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+					}
+					return {
+						content: [{ type: "text" as const, text: JSON.stringify(statuses, null, 2) }],
+						details: { statuses },
+					};
+				} catch (error) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `service_keeper_manage failed: ${error instanceof Error ? error.message : String(error)}`,
+							},
+						],
+						details: undefined,
+						isError: true,
+					};
+				}
+			},
+		};
 	}
 
 	private defaultModel(): string | undefined {
@@ -374,8 +505,12 @@ export class ToolRuntime {
 		watcher.start(jobId);
 	}
 
-	async progress(jobId?: string, limit = 8): Promise<ProgressSnapshot> {
-		return snapshotProgress({ jobsRoot: this.progressRoot(), jobId, limit });
+	async progress(reference?: string, limit = 8): Promise<ProgressSnapshot> {
+		return snapshotProgress({ jobsRoot: this.progressRoot(), reference, limit });
+	}
+
+	async progressJobs(): Promise<JobSummary[]> {
+		return listJobs(this.progressRoot());
 	}
 
 	private async execute(
@@ -393,6 +528,13 @@ export class ToolRuntime {
 	) {
 		const schema = facadeInputSchema(manifest);
 		const errors = validateValue(schema as never, input);
+		const mode = (input.mode as ToolMode | undefined) ?? manifest.execution?.defaultMode ?? "sync";
+		const jobControl = ["status", "wait", "result", "cancel"].includes(mode);
+		if (!jobControl) {
+			for (const field of manifest.input.required ?? []) {
+				if (!(field in input)) errors.push(`${field}: required by the task contract`);
+			}
+		}
 		const declared = new Set(Object.keys(schema.properties ?? {}));
 		for (const key of Object.keys(input)) {
 			if (!declared.has(key)) {
@@ -408,7 +550,6 @@ export class ToolRuntime {
 			return this.toolResult(envelope, manifest, undefined, true);
 		}
 
-		const mode = (input.mode as ToolMode | undefined) ?? manifest.execution?.defaultMode ?? "sync";
 		const timeoutMs = typeof input.timeoutMs === "number" ? input.timeoutMs : undefined;
 		const existingJobId = typeof input.jobId === "string" ? input.jobId : undefined;
 		const jobInput = { ...input };
@@ -416,8 +557,12 @@ export class ToolRuntime {
 		delete jobInput.timeoutMs;
 		delete jobInput.jobId;
 
-		if (manifest.handler === "tool_add") {
-			const envelope = await this.runToolAddAgent(manifest, jobInput, mode, signal, ctx);
+		if (manifest.handler) {
+			const extraTools =
+				manifest.handler === "tool_add"
+					? [this.toolAddManageTool(ctx.cwd ?? this.options.cwd)]
+					: [this.serviceKeeperManageTool()];
+			const envelope = await this.runHandlerAgent(manifest, jobInput, mode, signal, ctx, extraTools);
 			return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
 		}
 

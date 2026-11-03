@@ -2,16 +2,17 @@
   "name": "service_keeper",
   "version": "1.0.0",
   "contractVersion": "1.0.0",
-  "description": "检查并恢复控制器上已登记的常驻服务：读服务登记表，探测健康与就绪接口，确认 systemd 用户单元状态，单元停止或健康检查失败时执行登记表里的启动或重启命令，重新检查后报告当前状态。当工具或任务依赖的本地服务不可用、需要判断谁在运行、或服务需要一次受控恢复时使用。",
+  "description": "检查并恢复控制器上已登记的服务和工具声明的 daemon：读服务登记表，探测健康与就绪接口，确认 systemd 用户单元状态，单元停止或健康检查失败时按登记表执行一次启动或重启；工具声明的 daemon 通过运行时查看并重启。当工具或任务依赖的本地服务不可用、需要判断谁在运行、或服务需要一次受控恢复时使用。",
   "whenToUse": [
     "已登记的本地服务无响应",
+    "工具声明的 daemon 进程退出或端点不可达",
     "需要确认某个服务是否在运行、是否就绪",
     "服务单元处于 inactive 或 failed，需要执行一次启动或重启",
     "需要查看服务最近的日志而不改动任何状态"
   ],
   "notFor": [
     "需要修改服务登记表、单元文件或端口配置",
-    "需要启动登记表里没有的进程",
+    "需要启动既未登记也未由工具声明的进程",
     "需要 sudo、需要改动 tailscale serve 发布规则",
     "需要维护远程集群节点上的服务"
   ],
@@ -27,7 +28,7 @@
       "service": {
         "type": "string",
         "maxLength": 128,
-        "description": "登记表里的服务名称。省略时检查全部已登记服务。"
+        "description": "登记表里的服务名称，或工具 daemon 的 <tool>/<service>。省略时检查全部已登记服务和工具 daemon。"
       },
       "allowRepair": {
         "type": "boolean",
@@ -130,5 +131,6 @@
     "asyncByDefault": false
   },
   "exposure": "direct",
-  "namespace": "tool"
+  "namespace": "tool",
+  "handler": "service_keeper"
 }

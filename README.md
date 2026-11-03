@@ -52,7 +52,9 @@ directories, so they also appear in the pi tool list:
   declares `"handler": "tool_add"`, so the worker runs in process and can
   register tools in the live registry.
 - `basic-tools/service_keeper/` — agent tool that checks and recovers services
-  registered in the agent directory's `services/registry.json`.
+  registered in the agent directory's `services/registry.json`, and daemons
+  declared by installed tools. It declares `"handler": "service_keeper"`, so its
+  worker runs in process and restarts tool daemons through the runtime.
 
 A packaged tool runs with the `package` scope. Its daemons start in the tool
 directory, its state stays under the agent directory, and it needs no project
@@ -120,7 +122,7 @@ trust.
 
 - `direct` runs a declared service synchronously.
 - `agent` creates a persistent worker and can call declared services through `service_call`.
-- A packaged agent tool may declare `"handler": "tool_add"`. The runtime then runs its worker in process instead of a detached job, because the management action changes the live tool registry. `tool_add` uses this and supports only `mode: "sync"`.
+- A packaged agent tool may declare `"handler": "tool_add"` or `"handler": "service_keeper"`. The runtime then runs its worker in process instead of a detached job, because the action changes live runtime state. Both handlers support only `mode: "sync"`.
 
 ## Services
 
@@ -181,6 +183,23 @@ the child environment carries `PI_TOOL_NAME` and `PI_SERVICE_NAME`.
   "protocol": "unix-jsonl"
 }
 ```
+
+### Tool daemon maintenance
+
+A tool's daemon services start eagerly when the tool is registered. The runtime
+owns the protocol client, so a restart must run inside the runtime. The
+`service_keeper` worker therefore runs in process and receives an extra
+`service_keeper_manage` tool:
+
+- `action: "list"` lists every daemon declared by an installed tool with its tool
+  name, service name, protocol, pid, process state, and endpoint reachability.
+- `action: "status"` with `tool` and `service` reports one daemon.
+- `action: "restart"` with `tool` and `service` stops the recorded process and
+  starts it again through the supervisor.
+
+`service_keeper` still reads `services/registry.json` for external services such
+as systemd user units and uses the registered commands for those. It never
+starts, kills, or probes a tool daemon with bash.
 
 A worker uses the default model from pi settings (`defaultProvider` and
 `defaultModel`) and nothing else. Tool manifests and agent files no longer
@@ -252,7 +271,15 @@ widget while a job runs, so the steps stay out of the conversation context.
     tool block itself shows what the worker is doing;
   - an editor widget repeats the last lines above the editor and clears four
     seconds after the job reaches a terminal state;
-  - `/tool-progress [jobId]` pins a snapshot; `/tool-progress off` clears it.
+  - `/tool-progress` pins a snapshot for 30 seconds, then clears it;
+    `/tool-progress off` clears it immediately. A reference that matches no job
+    only prints a warning and does not create a widget.
+- A job reference never needs the full job id. `/tool-progress` with no argument
+  shows the running job or the latest one. `/tool-progress list` prints recent
+  jobs with a short id, and `/tool-progress <index>` or
+  `/tool-progress <short id>` selects one. An id prefix, suffix, or fragment is
+  accepted when it matches exactly one job. The widget header and status line
+  show the short id instead of the full job id.
 - Partial output is replaced by the final tool result, so only the result
   reaches the conversation. Nothing in the progress file is appended to the
   main conversation or to the worker's own later turns.

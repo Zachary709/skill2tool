@@ -11,16 +11,39 @@ export interface ProgressUi {
 
 export interface ProgressSnapshot {
 	jobId?: string;
+	shortId?: string;
 	state?: string;
 	tool?: string;
 	entries: WorkerProgressEntry[];
 	lines: string[];
 	updatedAt?: string;
+	error?: string;
+}
+
+export interface JobSummary {
+	jobId: string;
+	state?: string;
+	tool?: string;
+	createdAt?: string;
+}
+
+export interface JobReference {
+	jobId?: string;
+	error?: string;
+}
+
+const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled", "timed_out", "lost"]);
+
+export function shortJobRef(jobId: string): string {
+	const parts = jobId.split("_").filter(Boolean);
+	return parts.length > 0 ? parts[parts.length - 1] : jobId;
 }
 
 export const PROGRESS_WIDGET_KEY = "tool-progress";
 export const PROGRESS_STATUS_KEY = "tool-progress";
 const MAX_ENTRIES = 60;
+const INLINE_LIMIT = 8;
+const INLINE_FLUSH_MS = 400;
 
 function marker(entry: WorkerProgressEntry): string {
 	switch (entry.kind) {
@@ -78,16 +101,14 @@ async function readJobState(jobPath: string): Promise<{ state?: string; tool?: s
 	}
 }
 
-export async function listJobs(
-	jobsRoot: string,
-): Promise<Array<{ jobId: string; state?: string; tool?: string; createdAt?: string }>> {
+export async function listJobs(jobsRoot: string): Promise<JobSummary[]> {
 	let names: string[];
 	try {
 		names = await fs.readdir(jobsRoot);
 	} catch {
 		return [];
 	}
-	const jobs: Array<{ jobId: string; state?: string; tool?: string; createdAt?: string }> = [];
+	const jobs: JobSummary[] = [];
 	for (const name of names) {
 		if (!name.startsWith("job_")) continue;
 		const info = await readJobState(path.join(jobsRoot, name, "job.json"));
@@ -96,38 +117,130 @@ export async function listJobs(
 	return jobs.sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
 }
 
+export function formatJobRow(job: JobSummary, index: number): string {
+	const clock = job.createdAt?.slice(11, 19) ?? "--:--:--";
+	return [
+		`${index}.`,
+		shortJobRef(job.jobId).padEnd(8),
+		(job.tool ?? "tool").padEnd(16),
+		(job.state ?? "unknown").padEnd(9),
+		clock,
+	].join(" ");
+}
+
+async function pickDefaultJob(jobsRoot: string): Promise<string | undefined> {
+	const jobs = await listJobs(jobsRoot);
+	return jobs.find((job) => job.state === "running")?.jobId ?? jobs[0]?.jobId;
+}
+
+export async function resolveJobReference(jobsRoot: string, reference: string): Promise<JobReference> {
+	const ref = reference.trim();
+	if (!ref) return { jobId: await pickDefaultJob(jobsRoot) };
+	const jobs = await listJobs(jobsRoot);
+	const exact = jobs.find((job) => job.jobId === ref);
+	if (exact) return { jobId: exact.jobId };
+	if (/^\d+$/.test(ref)) {
+		const job = jobs[Number(ref) - 1];
+		if (!job) return { error: `没有第 ${ref} 个任务，当前只有 ${jobs.length} 个任务。` };
+		return { jobId: job.jobId };
+	}
+	const lowered = ref.toLowerCase();
+	const suffixed = jobs.filter(
+		(job) => job.jobId.toLowerCase().endsWith(lowered) || shortJobRef(job.jobId).toLowerCase() === lowered,
+	);
+	if (suffixed.length === 1) return { jobId: suffixed[0].jobId };
+	const contained = jobs.filter((job) => job.jobId.toLowerCase().includes(lowered));
+	const matches = suffixed.length > 1 ? suffixed : contained;
+	if (matches.length === 1) return { jobId: matches[0].jobId };
+	if (matches.length === 0) return { error: `没有匹配「${ref}」的任务，用 /tool-progress list 查看任务。` };
+	const candidates = matches.slice(0, 5).map((job) => shortJobRef(job.jobId)).join("、");
+	return { error: `「${ref}」匹配到 ${matches.length} 个任务：${candidates}。请给出更长的片段。` };
+}
+
 export async function snapshotProgress(options: {
 	jobsRoot: string;
 	jobId?: string;
+	reference?: string;
 	limit?: number;
 }): Promise<ProgressSnapshot> {
 	const limit = options.limit ?? 8;
 	let jobId = options.jobId;
+	let error: string | undefined;
 	if (!jobId) {
-		const jobs = await listJobs(options.jobsRoot);
-		jobId = jobs.find((job) => job.state === "running")?.jobId ?? jobs[0]?.jobId;
+		if (options.reference) {
+			const resolved = await resolveJobReference(options.jobsRoot, options.reference);
+			jobId = resolved.jobId;
+			error = resolved.error;
+		} else {
+			jobId = await pickDefaultJob(options.jobsRoot);
+		}
 	}
-	if (!jobId) return { entries: [], lines: [] };
+	if (!jobId) return { entries: [], lines: [], error };
 	const dir = path.join(options.jobsRoot, jobId);
 	const info = await readJobState(path.join(dir, "job.json"));
 	const entries = await readProgressEntries(path.join(dir, "progress.jsonl"), limit);
-	const header = `${info.tool ?? "tool"} ${jobId} · ${info.state ?? "unknown"}`;
+	const shortId = shortJobRef(jobId);
+	const header = `${info.tool ?? "tool"} · ${info.state ?? "unknown"} · ${shortId}`;
 	return {
 		jobId,
+		shortId,
 		state: info.state,
 		tool: info.tool,
 		entries,
 		lines: entries.length > 0 ? [header, ...entries.map(formatProgressEntry)] : [header, "（尚无进展记录）"],
 		updatedAt: entries[entries.length - 1]?.time,
+		error,
 	};
 }
-
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled", "timed_out", "lost"]);
 
 export type ProgressUpdateSink = (partial: {
 	content: Array<{ type: "text"; text: string }>;
 	details: Record<string, unknown>;
 }) => void;
+
+export class InlineProgress {
+	private readonly entries: string[] = [];
+	private readonly ui: ProgressUi;
+	private readonly title: string;
+	private readonly limit: number;
+	private flushTimer?: NodeJS.Timeout;
+	private closed = false;
+
+	constructor(options: { ui: ProgressUi; title: string; limit?: number }) {
+		this.ui = options.ui;
+		this.title = options.title;
+		this.limit = options.limit ?? INLINE_LIMIT;
+	}
+
+	push(entry: WorkerProgressEntry): void {
+		if (this.closed) return;
+		this.entries.push(formatProgressEntry(entry));
+		if (this.entries.length > this.limit) {
+			this.entries.splice(0, this.entries.length - this.limit);
+		}
+		if (this.flushTimer) return;
+		this.flushTimer = setTimeout(() => {
+			this.flushTimer = undefined;
+			this.render();
+		}, INLINE_FLUSH_MS);
+		this.flushTimer.unref?.();
+	}
+
+	private render(): void {
+		if (this.closed) return;
+		this.ui.setWidget?.(PROGRESS_WIDGET_KEY, [this.title, ...this.entries], { placement: "aboveEditor" });
+		this.ui.setStatus?.(PROGRESS_STATUS_KEY, this.title);
+	}
+
+	stop(): void {
+		if (this.closed) return;
+		this.closed = true;
+		if (this.flushTimer) clearTimeout(this.flushTimer);
+		this.flushTimer = undefined;
+		this.ui.setWidget?.(PROGRESS_WIDGET_KEY, undefined);
+		this.ui.setStatus?.(PROGRESS_STATUS_KEY, undefined);
+	}
+}
 
 export class ProgressWatcher {
 	private timer?: NodeJS.Timeout;
@@ -156,15 +269,24 @@ export class ProgressWatcher {
 		this.stop();
 		const render = async () => {
 			const snapshot = await snapshotProgress({ jobsRoot: this.jobsRoot, jobId, limit: this.limit });
+			if (!snapshot.state) {
+				this.stopAll();
+				return;
+			}
 			if (snapshot.lines.length === 0) return;
 			this.ui.setWidget?.(PROGRESS_WIDGET_KEY, snapshot.lines, { placement: "aboveEditor" });
 			this.onUpdate?.({
 				content: [{ type: "text", text: snapshot.lines.join("\n") }],
-				details: { jobId: snapshot.jobId, state: snapshot.state, tool: snapshot.tool },
+				details: {
+					jobId: snapshot.jobId,
+					shortId: snapshot.shortId,
+					state: snapshot.state,
+					tool: snapshot.tool,
+				},
 			});
 			this.ui.setStatus?.(
 				PROGRESS_STATUS_KEY,
-				`${snapshot.tool ?? "tool"} ${snapshot.state ?? ""}`.trim(),
+				`${snapshot.tool ?? "tool"} ${snapshot.state ?? ""} ${snapshot.shortId ?? ""}`.trim(),
 			);
 			if (snapshot.state && TERMINAL_STATES.has(snapshot.state)) {
 				this.stopTimer();

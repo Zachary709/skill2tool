@@ -46,3 +46,17 @@ true，`message` 里放命令和复查后的状态码。
 
 预期行为：单元 active、两个检查都通过。按登记的恢复规则，健康状态下不执行重启，
 提交 `ok`，结果里 `action` 为 `none`，`message` 说明“服务已健康，未执行动作”。
+
+## 工具声明的 daemon 掉线
+
+调用参数：
+
+- `task`: 检查 `repair_shop` 工具的 `panel` 服务，必要时重启。
+- `allowRepair`: true
+
+预期行为：调用 `service_keeper_manage` 的 `action: "list"`，找到
+`tool: "repair_shop"`、`service: "panel"` 的条目；再用 `action: "status"` 读取
+进程与端点状态。进程不在或端点不可达且 `allowRepair` 为 true 时，调用
+`action: "restart"`，随后重新 `status`，提交 `ok` 或 `failed`，`service` 写
+`repair_shop/panel`，`action` 写 `restart`。整个过程不直接用 bash 启动、杀死或
+探测该 daemon。

@@ -362,6 +362,39 @@ async function createHttpClient(options: {
 	};
 }
 
+export interface DaemonStatus {
+	tool: string;
+	service: string;
+	protocol: string;
+	stateDir: string;
+	pid?: number;
+	alive: boolean;
+	reachable: boolean;
+}
+
+async function processMatchesService(pid: number, service: ServiceDefinition): Promise<boolean> {
+	if (!service.command) return false;
+	try {
+		const raw = await fs.readFile(`/proc/${pid}/cmdline`, "utf8");
+		const parts = raw.split("\0").filter(Boolean);
+		if (parts.length === 0) return false;
+		if (parts[0] === service.command) return true;
+		if (path.basename(parts[0]) === path.basename(service.command)) return true;
+		return parts.includes(service.command);
+	} catch {
+		return false;
+	}
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export class ServiceSupervisor {
 	private daemons = new Map<string, DaemonHandle>();
 	private persistentKeys = new Map<string, string>();
@@ -541,6 +574,122 @@ export class ServiceSupervisor {
 		const handle = await this.ensureDaemon(tool, name, service);
 		const timeoutMs = service.timeoutMs ?? 60_000;
 		return handle.request(typeof params.method === "string" ? params.method : undefined, params.params as Record<string, unknown> ?? {}, timeoutMs);
+	}
+
+	async daemonStatus(tool: ToolManifest, name: string): Promise<DaemonStatus> {
+		const service = tool.services?.[name];
+		if (!service || service.type !== "daemon") {
+			throw new Error(`tool "${tool.name}" has no daemon service "${name}"`);
+		}
+		const placement = this.placement(tool, name, service);
+		const protocol = service.protocol ?? "jsonl-stdio";
+		let pid: number | undefined;
+		try {
+			const state = JSON.parse(await fs.readFile(path.join(placement.stateDir, "state.json"), "utf8")) as {
+				pid?: unknown;
+			};
+			if (typeof state.pid === "number") pid = state.pid;
+		} catch {
+			// the state file is advisory
+		}
+		const handle = this.daemons.get(placement.key);
+		const alive = pid !== undefined ? isProcessAlive(pid) : Boolean(handle && !handle.closed);
+		let reachable = alive;
+		if (protocol === "unix-jsonl") {
+			const socketPath = path.resolve(
+				placement.cwd,
+				service.socket ?? path.join(placement.stateDir, "service.sock"),
+			);
+			reachable = await canConnect(socketPath);
+		} else if (protocol === "http-json" && service.url) {
+			reachable = await httpReachable(service.url);
+		}
+		return {
+			tool: tool.name,
+			service: name,
+			protocol,
+			stateDir: placement.stateDir,
+			pid,
+			alive,
+			reachable,
+		};
+	}
+
+	/**
+	 * Stop the recorded daemon process and start it again through the normal
+	 * ensure path. The runtime owns the protocol client, so a restart must run
+	 * here and not in a separate process.
+	 */
+	async restartDaemon(tool: ToolManifest, name: string): Promise<DaemonStatus> {
+		const service = tool.services?.[name];
+		if (!service || service.type !== "daemon") {
+			throw new Error(`tool "${tool.name}" has no daemon service "${name}"`);
+		}
+		const placement = this.placement(tool, name, service);
+		const key = placement.key;
+		const protocol = service.protocol ?? "jsonl-stdio";
+		let pid: number | undefined;
+		try {
+			const state = JSON.parse(await fs.readFile(path.join(placement.stateDir, "state.json"), "utf8")) as {
+				pid?: unknown;
+			};
+			if (typeof state.pid === "number") pid = state.pid;
+		} catch {
+			// no recorded process
+		}
+		if (pid !== undefined && isProcessAlive(pid)) {
+			if (!(await processMatchesService(pid, service))) {
+				throw new Error(
+					`recorded pid ${pid} for ${tool.name}/${name} does not match the declared command; refusing to restart it`,
+				);
+			}
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch {
+				// the process may have exited between the check and the signal
+			}
+			const deadline = Date.now() + 3_000;
+			while (Date.now() < deadline && isProcessAlive(pid)) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			if (isProcessAlive(pid)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// already gone
+				}
+			}
+		}
+		const handle = this.daemons.get(key);
+		handle?.close();
+		this.daemons.delete(key);
+		this.persistentKeys.delete(key);
+
+		// Wait briefly for the old listener to disappear before spawning a new one.
+		const deadline = Date.now() + 5_000;
+		while (Date.now() < deadline) {
+			const reachable =
+				protocol === "unix-jsonl"
+					? await canConnect(
+							path.resolve(placement.cwd, service.socket ?? path.join(placement.stateDir, "service.sock")),
+						)
+					: protocol === "http-json" && service.url
+						? await httpReachable(service.url)
+						: false;
+			if (!reachable) break;
+			await new Promise((resolve) => setTimeout(resolve, 200));
+		}
+		if (protocol === "unix-jsonl") {
+			// A killed server can leave its socket path behind; a new bind needs
+			// the path gone so readiness reflects the new listener.
+			await fs.rm(
+				path.resolve(placement.cwd, service.socket ?? path.join(placement.stateDir, "service.sock")),
+				{ force: true },
+			);
+		}
+
+		await this.ensureDaemon(tool, name, service);
+		return this.daemonStatus(tool, name);
 	}
 
 	async close(): Promise<void> {

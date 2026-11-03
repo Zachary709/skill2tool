@@ -7,7 +7,15 @@ import { validateManifest, validateResultShape, validateSummary } from "../src/c
 import { readManifestFile } from "../src/discovery/manifest.ts";
 import { resolveServicePlacement, ServiceSupervisor } from "../src/services/supervisor.ts";
 import { buildSystemPrompt, workerKey } from "../src/agents/worker.ts";
-import { formatProgressEntry, ProgressWatcher, snapshotProgress } from "../src/observability/progress.ts";
+import {
+	formatJobRow,
+	formatProgressEntry,
+	InlineProgress,
+	ProgressWatcher,
+	resolveJobReference,
+	shortJobRef,
+	snapshotProgress,
+} from "../src/observability/progress.ts";
 import { JobManager } from "../src/jobs/manager.ts";
 import { writeJobRecord } from "../src/jobs/store.ts";
 import type { ResolvedAgent, ToolManifest } from "../src/types.ts";
@@ -356,7 +364,7 @@ test("progress snapshot prefers the running job and skips a partial line", async
 	assert.equal(snapshot.jobId, "job_running");
 	assert.equal(snapshot.state, "running");
 	assert.equal(snapshot.entries.length, 2);
-	assert.ok(snapshot.lines[0].includes("job_running"));
+	assert.ok(snapshot.lines[0].includes("running"));
 	assert.ok(snapshot.lines.some((line) => line.includes("[思考]")));
 	assert.ok(snapshot.lines.some((line) => line.includes("[调用] bash")));
 	assert.equal(
@@ -392,6 +400,31 @@ test("worker system prompt confines navigation to known roots", () => {
 	assert.ok(prompt.includes("needs_input"));
 });
 
+test("progress job reference resolves an index, a short id, and reports ambiguity", async () => {
+	const root = path.join(tempRoot, "jobs-reference");
+	const names = ["job_echo_aaa_alpha1", "job_echo_bbb_alpha2", "job_word_ccc_beta3"];
+	for (const [index, name] of names.entries()) {
+		await fs.mkdir(path.join(root, name), { recursive: true });
+		await fs.writeFile(
+			path.join(root, name, "job.json"),
+			JSON.stringify({
+				id: name,
+				tool: name.split("_")[1],
+				state: "succeeded",
+				createdAt: `2026-01-0${index + 1}T00:00:00Z`,
+			}),
+		);
+	}
+	assert.equal((await resolveJobReference(root, "1")).jobId, "job_word_ccc_beta3");
+	assert.equal((await resolveJobReference(root, "beta3")).jobId, "job_word_ccc_beta3");
+	assert.equal((await resolveJobReference(root, "job_echo_aaa_alpha1")).jobId, "job_echo_aaa_alpha1");
+	const ambiguous = await resolveJobReference(root, "alpha");
+	assert.equal(ambiguous.jobId, undefined);
+	assert.ok(ambiguous.error?.includes("2 个任务"));
+	assert.equal(shortJobRef("job_echo_aaa_alpha1"), "alpha1");
+	assert.ok(formatJobRow({ jobId: "job_echo_aaa_alpha1", tool: "echo", state: "running" }, 2).startsWith("2. alpha1"));
+});
+
 test("progress watcher streams widget lines and partial updates", async () => {
 	const root = path.join(tempRoot, "jobs-watch");
 	const dir = path.join(root, "job_watch");
@@ -421,9 +454,48 @@ test("progress watcher streams widget lines and partial updates", async () => {
 	watcher.stopAll();
 
 	assert.ok(widgets.length >= 1, "expected at least one widget render");
-	assert.ok(widgets[widgets.length - 1][0].includes("job_watch"));
+	assert.ok(widgets[widgets.length - 1][0].includes("watch"));
 	assert.ok(updates.length >= 1, "expected at least one partial update");
 	assert.ok(updates[updates.length - 1].content[0].text.includes("[思考]"));
+});
+
+test("inline progress writes a widget and clears it without notifications", async () => {
+	const widgets: Array<string[] | undefined> = [];
+	const statuses: Array<string | undefined> = [];
+	const progress = new InlineProgress({
+		ui: {
+			setWidget: (_key, content) => widgets.push(content),
+			setStatus: (_key, text) => statuses.push(text),
+		},
+		title: "tool_add",
+		limit: 2,
+	});
+	progress.push({ time: "2026-01-01T00:00:01Z", kind: "tool", tool: "read", text: "a" });
+	progress.push({ time: "2026-01-01T00:00:02Z", kind: "tool", tool: "grep", text: "b" });
+	progress.push({ time: "2026-01-01T00:00:03Z", kind: "tool", tool: "ls", text: "c" });
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	progress.stop();
+	const rendered = widgets.filter((content) => content !== undefined).at(-1);
+	assert.deepEqual(rendered, ["tool_add", "00:00:02 [调用] grep b", "00:00:03 [调用] ls c"]);
+	assert.equal(widgets.at(-1), undefined);
+	assert.equal(statuses.at(-1), undefined);
+});
+
+test("progress watcher clears a widget for a job that no longer exists", async () => {
+	const root = path.join(tempRoot, "jobs-missing");
+	await fs.mkdir(root, { recursive: true });
+	const widgets: Array<string[] | undefined> = [];
+	const watcher = new ProgressWatcher({
+		jobsRoot: root,
+		ui: {
+			setWidget: (_key, content) => widgets.push(content),
+		},
+	});
+	watcher.start("job_missing");
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	watcher.stopAll();
+	assert.ok(widgets.length >= 1);
+	assert.equal(widgets[0], undefined);
 });
 
 test("job record carries the requester model for workers without a model", async () => {
@@ -548,6 +620,8 @@ test("package tools load from basic-tools with the package scope", async () => {
 	assert.ok(toolAdd?.whenToUse?.length);
 	const keeper = result.tools.find((entry) => entry.manifest.name === "service_keeper")?.manifest;
 	assert.equal(keeper?.kind, "agent");
+	assert.equal(keeper?.handler, "service_keeper");
+	assert.equal(keeper?.agent?.instructions, "agent/AGENT.md");
 	assert.ok((keeper?.output.required as string[]).includes("services"));
 });
 
@@ -926,7 +1000,13 @@ test("tool_add applies a plan supplied by its worker", async () => {
 	const skillDir = path.join(tempRoot, "apply-skill");
 	await fs.mkdir(skillDir, { recursive: true });
 	const skillFile = path.join(skillDir, "SKILL.md");
-	await fs.writeFile(skillFile, "---\nname: apply_demo\ndescription: A skill used by the apply test.\n---\n\nDo the work.\n");
+	await fs.writeFile(
+		skillFile,
+		"---\nname: apply_demo\ndescription: A skill used by the apply test.\n---\n\nDo the work through service/scripts/svc.sh.\n",
+	);
+	const serviceDir = path.join(tempRoot, "service", "scripts");
+	await fs.mkdir(serviceDir, { recursive: true });
+	await fs.writeFile(path.join(serviceDir, "svc.sh"), "#!/bin/sh\necho ok\n");
 	const registered: string[] = [];
 	const host = {
 		agentDir,
@@ -958,6 +1038,14 @@ test("tool_add applies a plan supplied by its worker", async () => {
 			workflow: "1. Read the task.\n2. Do the work.\n3. Return only the outcome field.\n4. Call submit_result.",
 			tools: ["read"],
 		},
+		externalServices: [
+			{
+				name: "apply-service",
+				description: "The service this skill depends on.",
+				unit: "apply-service.service",
+				checks: { health: { url: "http://127.0.0.1:8765/healthz", expectStatus: 200 } },
+			},
+		],
 	};
 	const envelope = await manager.handle(
 		{
@@ -975,4 +1063,127 @@ test("tool_add applies a plan supplied by its worker", async () => {
 	assert.equal(loaded.manifest?.whenToUse?.[0], "需要验证计划写入流程");
 	assert.ok((await fs.readFile(path.join(dir, "AGENT.md"), "utf8")).includes("submit_result"));
 	assert.ok((await fs.readFile(path.join(dir, "WORKFLOW.md"), "utf8")).includes("submit_result"));
+	const bundled = await fs.readdir(path.join(dir, "skill"));
+	assert.ok(bundled.includes("SKILL.md"));
+	const bundledService = await fs.readdir(path.join(dir, "service"));
+	assert.ok(bundledService.includes("scripts"));
+	const registry = JSON.parse(await fs.readFile(path.join(agentDir, "services", "registry.json"), "utf8")) as {
+		services: Array<{ name: string; unit: string; generatedBy?: string; commands?: Record<string, string> }>;
+	};
+	const entry = registry.services.find((item) => item.name === "apply-service");
+	assert.equal(entry?.unit, "apply-service.service");
+	assert.equal(entry?.generatedBy, "tool_add");
+	assert.equal(entry?.commands?.start, "systemctl --user start apply-service.service");
+});
+
+test("supervisor reports and restarts a tool daemon", async () => {
+	const socketPath = path.join(tempRoot, "restart.sock");
+	const tool: ToolManifest = {
+		name: "restart_test",
+		version: "1.0.0",
+		kind: "direct",
+		description: "Test daemon restart tool.",
+		input: { type: "object" },
+		output: { type: "object" },
+		dir: process.cwd(),
+		services: {
+			echo: {
+				type: "daemon",
+				command: process.execPath,
+				args: ["test/fixtures/unix-daemon.mjs", socketPath],
+				socket: socketPath,
+				protocol: "unix-jsonl",
+				start: "lazy",
+			},
+		},
+	};
+	const supervisor = new ServiceSupervisor({ projectCwd: process.cwd(), agentDir: path.join(tempRoot, "restart-agent") });
+	try {
+		const first = await supervisor.call(tool, "echo", { method: "ping", params: { value: 1 } });
+		assert.equal(first.ok, true);
+		const before = await supervisor.daemonStatus(tool, "echo");
+		assert.equal(before.alive, true);
+		assert.equal(before.reachable, true);
+		const restarted = await supervisor.restartDaemon(tool, "echo");
+		assert.equal(restarted.alive, true);
+		assert.equal(restarted.reachable, true);
+		assert.notEqual(restarted.pid, before.pid);
+		const second = await supervisor.call(tool, "echo", { method: "ping", params: { value: 2 } });
+		assert.equal(second.ok, true);
+		assert.deepEqual(second.result, { echo: { value: 2 }, method: "ping" });
+	} finally {
+		await supervisor.close();
+	}
+});
+
+test("job-control calls do not require the task fields", async () => {
+	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
+	const cwd = path.join(tempRoot, "facade-job");
+	await fs.mkdir(cwd, { recursive: true });
+	const registered = new Map<string, { execute: Function }>();
+	const pi = {
+		registerTool: (definition: { name: string; execute: Function }) => registered.set(definition.name, definition),
+		getActiveTools: () => [],
+		setActiveTools: () => {},
+		sendMessage: () => {},
+	};
+	const runtime = new ToolRuntime({
+		pi: pi as never,
+		cwd,
+		agentDir: path.join(cwd, "agent"),
+		projectTrusted: true,
+		modelRuntime: {} as never,
+		log: () => {},
+	});
+	try {
+		runtime.register(
+			{
+				name: "job_contract_test",
+				version: "1.0.0",
+				description: "A tool used to check the job-control contract.",
+				whenToUse: ["需要验证作业控制参数"],
+				kind: "agent",
+				input: {
+					type: "object",
+					properties: { task: { type: "string", description: "Task text." } },
+					required: ["task"],
+					additionalProperties: false,
+				},
+				output: {
+					type: "object",
+					properties: { value: { type: "string", maxLength: 100, description: "Value." } },
+					required: ["value"],
+					additionalProperties: false,
+				},
+				agent: {
+					instructions: "You run the task and return the value.",
+					workflow: "1. Read the task.\n2. Return the value.\n3. Call submit_result.",
+					tools: ["read"],
+				},
+				execution: { defaultMode: "start", asyncByDefault: true },
+			},
+			false,
+		);
+		const facade = registered.get("job_contract_test");
+		assert.ok(facade);
+		const waitResponse = (await facade!.execute(
+			"call-wait",
+			{ mode: "wait", jobId: "job_missing" },
+			undefined,
+			undefined,
+			{ isIdle: () => true, cwd, hasUI: false },
+		)) as { structuredContent: { summary: string } };
+		assert.ok(waitResponse.structuredContent.summary.includes("Unknown job"));
+		const startResponse = (await facade!.execute(
+			"call-start",
+			{ mode: "start" },
+			undefined,
+			undefined,
+			{ isIdle: () => true, cwd, hasUI: false },
+		)) as { structuredContent: { summary: string; warnings?: string[] } };
+		assert.ok(startResponse.structuredContent.summary.includes("Input does not match"));
+		assert.ok(startResponse.structuredContent.warnings?.some((warning) => warning.includes("task")));
+	} finally {
+		await runtime.close();
+	}
 });

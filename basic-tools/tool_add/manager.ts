@@ -5,6 +5,7 @@ import { readManifestFile } from "../../src/discovery/manifest.ts";
 import { validateManifest, validateValue } from "../../src/contracts/schema.ts";
 import type { JsonSchema, ToolAddInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
 import { TOOL_PLAN_SCHEMA, planErrors, type ToolPlan } from "./plan.ts";
+import { registerExternalServices } from "./registry.ts";
 import {
 	atomicWrite,
 	defaultAgentInstructions,
@@ -81,6 +82,24 @@ function inspectResult(manifest: ToolManifest) {
 			},
 		],
 	};
+}
+
+/**
+ * Bundle the source skill with the generated tool. Relative service paths and
+ * instructions then resolve from the tool directory, and the tool keeps working
+ * after the source checkout moves.
+ */
+async function copySkillBundle(sourceDir: string, targetDir: string): Promise<void> {
+	const skip = new Set([".git", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"]);
+	await fs.cp(sourceDir, targetDir, {
+		recursive: true,
+		force: true,
+		filter: (source) => {
+			const relative = path.relative(sourceDir, source);
+			if (!relative) return true;
+			return !relative.split(path.sep).some((part) => skip.has(part));
+		},
+	});
 }
 
 export class ToolAddManager {
@@ -240,6 +259,25 @@ export class ToolAddManager {
 			plan = input.plan as ToolPlan;
 			if (input.name) plan.name = safeToolName(input.name);
 			const errors = this.validatePlan(plan);
+			const sourceDir = path.dirname(absolute);
+			const repoRoot = path.dirname(sourceDir);
+			if (errors.length === 0 && JSON.stringify(plan).includes(sourceDir)) {
+				errors.push(
+					`plan must use skill/... paths relative to the tool directory, not the source path ${sourceDir}`,
+				);
+			}
+			if (errors.length === 0 && JSON.stringify(plan).includes(repoRoot)) {
+				errors.push(
+					`plan must use service/... paths relative to the tool directory, not the source path ${repoRoot}`,
+				);
+			}
+			const scriptsDir = path.join(sourceDir, "scripts");
+			const hasScripts = await fs.access(scriptsDir).then(() => true).catch(() => false);
+			if (errors.length === 0 && hasScripts && !JSON.stringify(plan).includes("skill/scripts/")) {
+				errors.push(
+					"the skill ships scripts; declare a service or reference skill/scripts/... in the plan",
+				);
+			}
 			if (errors.length > 0) {
 				return {
 					status: "failed",
@@ -271,6 +309,15 @@ export class ToolAddManager {
 			: this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
 		let usedPlan = Boolean(plan);
 		await fs.mkdir(dir, { recursive: true });
+		const sourceRoot = path.dirname(path.dirname(absolute));
+		await copySkillBundle(path.dirname(absolute), path.join(dir, "skill"));
+		for (const name of ["service", "services"]) {
+			const serviceRoot = path.join(sourceRoot, name);
+			const exists = await fs.access(serviceRoot).then(() => true).catch(() => false);
+			if (exists && content.includes(`${name}/`)) {
+				await copySkillBundle(serviceRoot, path.join(dir, name));
+			}
+		}
 
 		let manifest = built.manifest;
 		let validation = validateManifest(manifest, dir);
@@ -292,6 +339,12 @@ export class ToolAddManager {
 
 		await writeToolArtifacts(dir, validation.manifest, built.files);
 		this.host.register(validation.manifest, true);
+		const registry = await registerExternalServices(
+			this.host.agentDir,
+			name,
+			plan?.externalServices ?? [],
+		);
+		warnings.push(...registry.errors.map((error) => `service registry: ${error}`));
 		return {
 			status: "ok",
 			summary: `Skill ${absolute} converted to tool ${name} using the ${usedPlan ? "builder agent" : "deterministic fallback"}.`,
@@ -355,6 +408,12 @@ export class ToolAddManager {
 		await fs.mkdir(dir, { recursive: true });
 		await writeToolArtifacts(dir, validation.manifest, built.files);
 		this.host.register(validation.manifest, true);
+		const registry = await registerExternalServices(
+			this.host.agentDir,
+			name,
+			plan.externalServices ?? [],
+		);
+		warnings.push(...registry.errors.map((error) => `service registry: ${error}`));
 		return {
 			status: "ok",
 			summary: `Built tool ${name}.`,
@@ -482,6 +541,10 @@ export class ToolAddManager {
 			"<skill_instructions>",
 			body.trim(),
 			"</skill_instructions>",
+			"",
+			"The original skill package is bundled under `skill/` inside this tool directory.",
+			"Read `skill/SKILL.md` and run its scripts from that bundled directory.",
+			"When the tool directory also contains `service/` or `services/`, that deployment code is part of the tool; use those relative paths.",
 		].join("\n");
 		const workflow = [
 			defaultWorkflow(manifest),

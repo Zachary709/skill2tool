@@ -7,6 +7,9 @@
 3. For `convert_skill`:
    - read `sourcePath` completely;
    - list the skill directory and read the supporting instructions, scripts, and references that affect execution;
+   - record every script, service, and executable entry point. The skill directory is bundled as `skill/` inside the new tool directory, so every command and instruction uses `skill/...` paths;
+   - declare a service for each existing script or server that speaks a runtime protocol, and grant `bash` for bundled command line tools that do not;
+   - inspect the parent repository for services the skill depends on but does not contain. A referenced `service/` or `services/` deployment unit is bundled next to `skill/`, so use `service/...` paths; add its systemd user unit to `externalServices` with health and readiness URLs when known;
    - design one complete plan from the skill's actual behavior;
    - call `tool_add_manage` with `action: "convert_skill"`, the source path, the scope, and `plan`;
    - on a plan validation failure, correct the reported fields and call it again.

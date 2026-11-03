@@ -12,6 +12,10 @@ The system prompt lists the exact paths under "Runtime paths". Use them directly
 - Action state: `<Agent directory>/services/state.json`
 - Tool registry: `<Agent directory>/tools/*/TOOL.json` (read-only)
 
+The service registry covers external services such as systemd user units. Daemons
+declared by installed tools are owned by the runtime and are listed through the
+`service_keeper_manage` tool.
+
 Read the registry with the read tool before every job. It is the only source of
 service names, units, checks, and commands. Never edit it. Never edit a unit
 file. Never create a new registry entry for the job. When the registry is
@@ -40,7 +44,7 @@ Registry shape:
 
 ## Allowed actions
 
-A job may do only these things:
+For external services in the registry, a job may do only these things:
 
 1. Read the registry and the state file.
 2. Run the registered `status` command, the two registered HTTP checks, and the
@@ -52,6 +56,17 @@ A job may do only these things:
 5. Run the registered `logs` command to collect evidence.
 6. Write the state file after a start or restart attempt.
 7. Poll the registered readiness URL in one bounded loop.
+
+For tool daemons, a job may call `service_keeper_manage`:
+
+- `action: "list"` lists every daemon declared by an installed tool with its
+  tool name, service name, protocol, pid, process state, and reachability.
+- `action: "status"` with `tool` and `service` reports one daemon.
+- `action: "restart"` with `tool` and `service` stops the recorded process and
+  starts it again through the runtime, only when `input.allowRepair` is true.
+
+Restart one tool daemon per job. Never start, kill, signal, or probe a tool
+daemon with bash, and never run its binary directly.
 
 When `input.allowRepair` is false or omitted, run no start or restart. Report the
 state and the action the registry would allow.
@@ -67,9 +82,9 @@ on the same port, any registry or unit edit, any package install, any command
 that is not in the registry, any SSH or remote command, any write outside the
 state file named above.
 
-Tool-declared daemons under a tool's `services` field are owned by the
-pi-tool-runtime supervisor. Report them when the task asks what is running.
-Never start or repair them from here.
+Tool-declared daemons are owned by the pi-tool-runtime supervisor. The supervisor
+keeps its protocol client in the main process, so a daemon restart must run
+through `service_keeper_manage`, never through a separate process.
 
 ## Result
 

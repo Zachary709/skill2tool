@@ -34,7 +34,10 @@ export function validateValue(schema: JsonSchema, value: unknown): string[] {
 	const compiled = compileSchema(schema);
 	if (compiled.Check(value)) return [];
 	const errors = [...compiled.Errors(value)].slice(0, 12);
-	return errors.map((error) => `${(error as { path?: string }).path || "/"}: ${error.message}`);
+	return errors.map((error) => {
+		const item = error as { path?: string; instancePath?: string };
+		return `${item.instancePath || item.path || "/"}: ${error.message}`;
+	});
 }
 
 export const RESULT_LIMITS = {
@@ -302,7 +305,11 @@ export function validateManifest(raw: unknown, dir?: string): {
 		}
 	}
 
-	if (manifest.handler !== undefined && manifest.handler !== "tool_add") {
+	if (
+		manifest.handler !== undefined &&
+		manifest.handler !== "tool_add" &&
+		manifest.handler !== "service_keeper"
+	) {
 		errors.push(`handler "${String(manifest.handler)}" is not a runtime handler`);
 	}
 

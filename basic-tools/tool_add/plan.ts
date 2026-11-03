@@ -15,6 +15,7 @@ export interface ToolPlan {
 		maxTurns?: number;
 	};
 	services?: Record<string, ServiceDefinition>;
+	externalServices?: ExternalServiceSpec[];
 	permissions?: {
 		read?: boolean;
 		write?: boolean;
@@ -22,6 +23,18 @@ export interface ToolPlan {
 		network?: boolean;
 	};
 	notes?: string[];
+}
+
+export interface ExternalServiceSpec {
+	name: string;
+	description: string;
+	kind?: "systemd-user";
+	unit: string;
+	checks?: {
+		health?: { url: string; expectStatus?: number; timeoutMs?: number };
+		readiness?: { url: string; expectStatus?: number; timeoutMs?: number };
+	};
+	policy?: { cooldownSeconds?: number; maxActionsPerDay?: number; waitSeconds?: number };
 }
 
 export const TOOL_PLAN_SCHEMA: JsonSchema = {
@@ -50,6 +63,21 @@ export const TOOL_PLAN_SCHEMA: JsonSchema = {
 			},
 		},
 		services: { type: "object" },
+		externalServices: {
+			type: "array",
+			items: {
+				type: "object",
+				required: ["name", "description", "unit"],
+				properties: {
+					name: { type: "string" },
+					description: { type: "string" },
+					kind: { type: "string", enum: ["systemd-user"] },
+					unit: { type: "string" },
+					checks: { type: "object" },
+					policy: { type: "object" },
+				},
+			},
+		},
 		permissions: {
 			type: "object",
 			properties: {
@@ -214,6 +242,33 @@ export function validateToolPlan(plan: ToolPlan): string[] {
 
 	if (plan.services && Object.keys(plan.services).length > 0) {
 		checkServices(plan.services, errors, warnings);
+	}
+
+	for (const [index, spec] of (plan.externalServices ?? []).entries()) {
+		const prefix = `externalServices[${index}]`;
+		if (!/^[a-z][a-z0-9_-]*$/.test(spec.name ?? "")) errors.push(`${prefix}.name: invalid service name`);
+		if (!spec.description || spec.description.trim().length < 8) {
+			errors.push(`${prefix}.description: must explain the dependency`);
+		}
+		if (!/^[A-Za-z0-9_.@-]+\.service$/.test(spec.unit ?? "")) {
+			errors.push(`${prefix}.unit: must be a systemd unit name such as adaptive-service.service`);
+		}
+		if (spec.kind !== undefined && spec.kind !== "systemd-user") {
+			errors.push(`${prefix}.kind: only "systemd-user" is supported`);
+		}
+		for (const checkName of ["health", "readiness"] as const) {
+			const check = spec.checks?.[checkName];
+			if (!check) continue;
+			if (typeof check.url !== "string" || !/^https?:\/\//.test(check.url)) {
+				errors.push(`${prefix}.checks.${checkName}.url: must be an http(s) URL`);
+			}
+			if (check.expectStatus !== undefined && (check.expectStatus < 100 || check.expectStatus > 599)) {
+				errors.push(`${prefix}.checks.${checkName}.expectStatus: must be 100..599`);
+			}
+			if (check.timeoutMs !== undefined && check.timeoutMs <= 0) {
+				errors.push(`${prefix}.checks.${checkName}.timeoutMs: must be positive`);
+			}
+		}
 	}
 
 	if (plan.permissions?.network && !plan.services) {
