@@ -24,6 +24,7 @@
 - [tool_add](#tool_add)
 - [安全](#安全)
 - [开发](#开发)
+- [友情链接](#友情链接)
 
 ## 快速开始
 
@@ -457,3 +458,7 @@ npm test
 ```
 
 扩展入口是 `extensions/tool-runtime.ts`。
+
+## 友情链接
+
+[LINUX DO](https://linux.do/) — 新的理想型社区

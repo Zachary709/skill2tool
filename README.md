@@ -24,6 +24,7 @@ The main Pi agent only sees a tool facade: name, description, input schema, and 
 - [tool_add](#tool_add)
 - [Security](#security)
 - [Development](#development)
+- [Friendly links](#friendly-links)
 
 ## Quick start
 
@@ -457,3 +458,7 @@ npm test
 ```
 
 The extension entry point is `extensions/tool-runtime.ts`.
+
+## Friendly links
+
+- [LINUX DO](https://linux.do/) — a new ideal community
