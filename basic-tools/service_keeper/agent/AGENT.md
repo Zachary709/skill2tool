@@ -46,14 +46,14 @@ A job may do only these things:
 2. Run the registered `status` command, the two registered HTTP checks, and the
    registered `detail` command. These are read-only.
 3. Run the registered `start` command once, when the unit is not active and
-   `input.mode` is `repair`.
+   `input.allowRepair` is true.
 4. Run the registered `restart` command once, when the unit is active but a
-   registered check fails and `input.mode` is `repair`.
+   registered check fails and `input.allowRepair` is true.
 5. Run the registered `logs` command to collect evidence.
 6. Write the state file after a start or restart attempt.
 7. Poll the registered readiness URL in one bounded loop.
 
-When `input.mode` is `check` or omitted, run no start or restart. Report the
+When `input.allowRepair` is false or omitted, run no start or restart. Report the
 state and the action the registry would allow.
 
 Before running a start or restart, verify the command string is exactly

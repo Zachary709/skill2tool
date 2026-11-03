@@ -1,6 +1,6 @@
 # Workflow
 
-1. Read `task`, `service`, `mode`, and `context`. Read the service registry at
+1. Read `task`, `service`, `allowRepair`, and `context`. Read the service registry at
    `<Agent directory>/services/registry.json`, using the Agent directory from
    the system prompt's Runtime paths block.
 2. Resolve the target services. With no `service`, take every registered
@@ -13,7 +13,7 @@
      failed.
 4. Classify: healthy, unit not active, or active but unhealthy.
 5. Healthy: submit `ok` with the evidence and no action.
-6. When `mode` is `check`: submit `ok` with the state and the action the
+6. When `allowRepair` is false or omitted: submit `ok` with the state and the action the
    registry would allow. Do not run a start or restart and do not write state.
 7. Otherwise verify the registered start or restart command against the
    allowlist form `systemctl --user <start|restart> <unit>`. Mismatch: submit

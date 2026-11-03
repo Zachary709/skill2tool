@@ -272,9 +272,6 @@ export function validateManifest(raw: unknown, dir?: string): {
 			if (service.type !== "script" && service.type !== "daemon") {
 				errors.push(`services.${name}.type must be "script" or "daemon"`);
 			}
-			if (service.level !== undefined && service.level !== "user" && service.level !== "project") {
-				errors.push(`services.${name}.level must be "user" or "project"`);
-			}
 			if (!service.command) {
 				errors.push(`services.${name}.command is required`);
 			}
@@ -292,13 +289,8 @@ export function validateManifest(raw: unknown, dir?: string): {
 		}
 	}
 
-	if (manifest.handler !== undefined) {
-		if (manifest.handler !== "tool_add") {
-			errors.push(`handler "${String(manifest.handler)}" is not a runtime handler`);
-		}
-		if (manifest.kind !== "direct") {
-			errors.push('handler is only valid for kind "direct"');
-		}
+	if (manifest.handler !== undefined && manifest.handler !== "tool_add") {
+		errors.push(`handler "${String(manifest.handler)}" is not a runtime handler`);
 	}
 
 	if (manifest.kind === "direct" && !manifest.services && !manifest.handler) {

@@ -29,10 +29,7 @@ interface ServiceResult {
 	exitCode?: number | null;
 }
 
-export type ServiceLevel = "user" | "project";
-
 export interface ServicePlacement {
-	level: ServiceLevel;
 	cwd: string;
 	stateDir: string;
 	env: Record<string, string>;
@@ -45,43 +42,30 @@ export interface ServiceSupervisorOptions {
 	agentDir?: string;
 }
 
-function serviceLevel(tool: ToolManifest, service: ServiceDefinition): ServiceLevel {
-	return service.level ?? (tool.scope === "project" ? "project" : "user");
-}
-
 /**
- * Resolve where a service runs. A `user` service is rooted at the user-level
- * agent directory and keeps its state under `services/<tool>/<name>`. A
- * `project` service is rooted at the project directory and keeps its state
- * under `<project>/.pi/services/<tool>/<name>`. The daemon key carries the
- * project path for project services, so two projects never share one handle.
+ * Resolve where a service runs. Every service is rooted at the tool directory
+ * and keeps its state under `services/<tool>/<name>` in the agent directory.
+ * The daemon key names the tool and service, so every project shares one handle.
  */
 export function resolveServicePlacement(options: {
 	tool: ToolManifest;
 	name: string;
 	service: ServiceDefinition;
-	projectCwd: string;
 	agentDir: string;
 }): ServicePlacement {
-	const { tool, name, service, projectCwd, agentDir } = options;
-	const level = serviceLevel(tool, service);
-	const baseDir = level === "user" ? (tool.dir ?? agentDir) : projectCwd;
+	const { tool, name, service, agentDir } = options;
+	const baseDir = tool.dir ?? agentDir;
 	const cwd = service.cwd ? path.resolve(baseDir, service.cwd) : baseDir;
-	const stateDir =
-		level === "user"
-			? path.join(agentDir, "services", tool.name, name)
-			: path.join(projectCwd, ".pi", "services", tool.name, name);
+	const stateDir = path.join(agentDir, "services", tool.name, name);
 	return {
-		level,
 		cwd,
 		stateDir,
 		env: {
 			PI_TOOL_NAME: tool.name,
 			PI_SERVICE_NAME: name,
-			PI_SERVICE_LEVEL: level,
 			PI_SERVICE_STATE_DIR: stateDir,
 		},
-		key: level === "user" ? `user:${tool.name}:${name}` : `project:${projectCwd}:${tool.name}:${name}`,
+		key: `user:${tool.name}:${name}`,
 	};
 }
 
@@ -250,6 +234,8 @@ async function writeServiceState(stateDir: string, payload: Record<string, unkno
 		} catch {
 			// a missing or unreadable state file starts from an empty object
 		}
+		// drop a level recorded by an older runtime
+		delete current.level;
 		await fs.writeFile(file, `${JSON.stringify({ ...current, ...payload }, null, 2)}\n`, "utf8");
 	} catch {
 		// state is advisory; a failed write must not break the service call
@@ -397,7 +383,6 @@ export class ServiceSupervisor {
 			tool,
 			name,
 			service,
-			projectCwd: this.projectCwd,
 			agentDir: this.agentDir,
 		});
 	}
@@ -504,7 +489,7 @@ export class ServiceSupervisor {
 			handle.stateDir = placement.stateDir;
 		} else if (protocol === "unix-jsonl") {
 			const socketPath = path.resolve(placement.cwd, service.socket ?? path.join(placement.stateDir, "service.sock"));
-			const reuse = placement.level === "user" && (await canConnect(socketPath));
+			const reuse = await canConnect(socketPath);
 			handle = await createUnixClient({
 				service,
 				key,
@@ -516,7 +501,7 @@ export class ServiceSupervisor {
 				log: this.log,
 			});
 		} else if (protocol === "http-json") {
-			const reuse = placement.level === "user" && service.url ? await httpReachable(service.url) : false;
+			const reuse = service.url ? await httpReachable(service.url) : false;
 			handle = await createHttpClient({
 				service,
 				key,
@@ -533,7 +518,6 @@ export class ServiceSupervisor {
 		if (service.lifecycle === "persistent") this.persistentKeys.set(key, protocol);
 		if (handle.child) {
 			await writeServiceState(placement.stateDir, {
-				level: placement.level,
 				tool: tool.name,
 				service: name,
 				pid: handle.child.pid ?? null,

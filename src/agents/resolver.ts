@@ -89,6 +89,9 @@ async function toResolvedAgent(options: {
 	if (data.tool && data.tool !== tool.name) {
 		return { error: `agent is for tool "${data.tool}", expected "${tool.name}"` };
 	}
+	if (data.name && data.name !== tool.name) {
+		return { error: `agent name "${data.name}" must match the tool name "${tool.name}"` };
+	}
 	const contract = data.contract ?? tool.agent?.contractRange ?? "*";
 	if (!versionSatisfies(contract, tool.contractVersion ?? tool.version)) {
 		return { error: `agent contract "${contract}" does not include tool version "${tool.contractVersion ?? tool.version}"` };
@@ -111,7 +114,7 @@ async function toResolvedAgent(options: {
 
 	return {
 		agent: {
-			name: data.name ?? tool.name,
+			name: tool.name,
 			tool: tool.name,
 			version: data.version ?? tool.version,
 			contract,

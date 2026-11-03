@@ -1,14 +1,6 @@
-import { promises as fs } from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { AgentWorker } from "../../../src/agents/worker.ts";
-import { resolveAgent } from "../../../src/agents/resolver.ts";
-import { validateValue } from "../../../src/contracts/schema.ts";
-import type { ServiceSupervisor } from "../../../src/services/supervisor.ts";
-import type { JsonSchema, ServiceDefinition, ToolManifest } from "../../../src/types.ts";
+import type { JsonSchema, ServiceDefinition } from "../../src/types.ts";
 
-export interface SkillConverterPlan {
+export interface ToolPlan {
 	name: string;
 	description: string;
 	whenToUse: string[];
@@ -32,7 +24,7 @@ export interface SkillConverterPlan {
 	notes?: string[];
 }
 
-export const CONVERTER_PLAN_SCHEMA: JsonSchema = {
+export const TOOL_PLAN_SCHEMA: JsonSchema = {
 	type: "object",
 	required: ["name", "description", "whenToUse", "input", "output", "agent"],
 	properties: {
@@ -71,126 +63,13 @@ export const CONVERTER_PLAN_SCHEMA: JsonSchema = {
 	},
 };
 
-const TEMPLATE_DIR = fileURLToPath(new URL(".", import.meta.url));
-
 const CATCH_ALL_NAMES = new Set(["result", "details", "notes", "output", "data", "payload", "content"]);
-
-async function readIfExists(filePath: string): Promise<string | undefined> {
-	try {
-		return await fs.readFile(filePath, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw error;
-	}
-}
-
-async function ensureUserConverterAgent(agentDir: string): Promise<void> {
-	const agentsDir = path.join(agentDir, "agents");
-	await fs.mkdir(agentsDir, { recursive: true });
-	const userAgentPath = path.join(agentsDir, "skill_converter.md");
-	const userWorkflowPath = path.join(agentsDir, "skill_converter.workflow.md");
-
-	const instructions = await readIfExists(path.join(TEMPLATE_DIR, "AGENT.md"));
-	const workflow = await readIfExists(path.join(TEMPLATE_DIR, "WORKFLOW.md"));
-	const examples = await readIfExists(path.join(TEMPLATE_DIR, "EXAMPLES.md"));
-	if (!instructions || !workflow) {
-		throw new Error(`converter template is incomplete: ${TEMPLATE_DIR}`);
-	}
-
-	// The user-level converter agent is a generated copy of the package template.
-	// Rewrite it on every run so template fixes reach existing installations.
-	await fs.writeFile(userWorkflowPath, workflow, "utf8");
-	const userAgent = [
-		"---",
-		"name: skill_converter",
-		"tool: skill_converter",
-		'version: "1.0.0"',
-		'contract: "*"',
-		'tools: ["read", "grep", "find", "ls"]',
-		"workflow: skill_converter.workflow.md",
-		"override: false",
-		"---",
-		"",
-		instructions.trim(),
-		...(examples ? ["", "## Examples", examples.trim()] : []),
-		"",
-	].join("\n");
-	await fs.writeFile(userAgentPath, userAgent, "utf8");
-}
-
-async function listSkillFiles(skillDir: string): Promise<string[]> {
-	const files: string[] = [];
-	const walk = async (dir: string, depth: number) => {
-		if (depth > 4 || files.length >= 200) return;
-		let entries: Array<{ name: string; isDirectory(): boolean }>;
-		try {
-			entries = await fs.readdir(dir, { withFileTypes: true });
-		} catch {
-			return;
-		}
-		for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-			if (entry.name === ".git" || entry.name === "node_modules") continue;
-			const absolute = path.join(dir, entry.name);
-			const relative = path.relative(skillDir, absolute);
-			if (entry.isDirectory()) {
-				files.push(`${relative}/`);
-				await walk(absolute, depth + 1);
-			} else {
-				files.push(relative);
-			}
-			if (files.length >= 200) return;
-		}
-	};
-	await walk(skillDir, 0);
-	return files;
-}
-
-function converterManifest(): ToolManifest {
-	return {
-		name: "skill_converter",
-		version: "1.0.0",
-		contractVersion: "1.0.0",
-		description: "Convert a skill directory into a tool manifest.",
-		kind: "agent",
-		input: {
-			type: "object",
-			properties: {
-				task: { type: "string" },
-				context: { type: "string" },
-			},
-			required: ["task"],
-		},
-		output: CONVERTER_PLAN_SCHEMA,
-		agent: {
-			instructions: "AGENT.md",
-			workflow: "WORKFLOW.md",
-			tools: ["read", "grep", "find", "ls"],
-			maxTurns: 30,
-			sessionScope: "project",
-			memoryScope: "project",
-			resolution: "user-first",
-			createProjectIfMissing: false,
-			requireProjectTrust: false,
-			contractRange: "*",
-		},
-		permissions: { read: true, write: false, bash: false, network: false },
-		limits: { maxInputBytes: 5_000_000, maxResultBytes: 200_000, jobTimeoutMs: 600_000 },
-		execution: { defaultMode: "sync", notifyOnIdle: false },
-		exposure: "hidden",
-		namespace: "tool",
-		dir: TEMPLATE_DIR,
-	};
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function checkObjectSchema(
-	schema: JsonSchema,
-	side: "input" | "output",
-	errors: string[],
-): void {
+function checkObjectSchema(schema: JsonSchema, side: "input" | "output", errors: string[]): void {
 	if (!isRecord(schema) || schema.type !== "object") {
 		errors.push(`${side}: must be a JSON Schema object`);
 		return;
@@ -286,11 +165,11 @@ function checkServices(services: Record<string, ServiceDefinition>, errors: stri
 }
 
 /**
- * Enforce the minimum shape of a converted tool: a selection description, a
+ * Enforce the minimum shape of a generated tool: a selection description, a
  * closed input contract, a closed and typed result contract, a worker system
  * prompt, an execution workflow, and continuous services.
  */
-export function validateConverterPlan(plan: SkillConverterPlan): string[] {
+export function validateToolPlan(plan: ToolPlan): string[] {
 	const errors: string[] = [];
 	const warnings: string[] = [];
 	if (!/^[a-z][a-z0-9_]*$/.test(plan.name ?? "")) {
@@ -344,81 +223,6 @@ export function validateConverterPlan(plan: SkillConverterPlan): string[] {
 	return [...errors, ...warnings.map((warning) => `warning: ${warning}`)];
 }
 
-export function planErrors(plan: SkillConverterPlan): string[] {
-	return validateConverterPlan(plan).filter((entry) => !entry.startsWith("warning: "));
-}
-
-export async function runSkillConverter(options: {
-	skillDir: string;
-	skillFile: string;
-	content: string;
-	cwd: string;
-	agentDir: string;
-	modelRuntime: ModelRuntime;
-	supervisor: ServiceSupervisor;
-	log: (message: string) => void;
-}): Promise<SkillConverterPlan> {
-	await ensureUserConverterAgent(options.agentDir);
-	const userAgentPath = path.join(options.agentDir, "agents", "skill_converter.md");
-	const userAgent = await readIfExists(userAgentPath);
-	if (!userAgent) throw new Error(`failed to install user-level converter agent: ${userAgentPath}`);
-
-	const provisional = converterManifest();
-	const resolution = await resolveAgent({
-		tool: provisional,
-		cwd: options.cwd,
-		agentDir: options.agentDir,
-		projectTrusted: false,
-		allowCreateProject: false,
-	});
-	if (!resolution.agent) {
-		throw new Error(`user-level converter agent is not usable: ${resolution.error ?? "unknown error"}`);
-	}
-
-	const manifest = converterManifest();
-	const worker = new AgentWorker(
-		manifest,
-		resolution.agent,
-		options.cwd,
-		options.agentDir,
-		options.modelRuntime,
-		options.supervisor,
-		options.log,
-	);
-	try {
-		const files = await listSkillFiles(options.skillDir);
-		const task = [
-			"Convert this skill directory into a tool plan.",
-			"",
-			`Skill directory: ${options.skillDir}`,
-			`Skill file: ${options.skillFile}`,
-			"",
-			"Files:",
-			...files.map((file) => `- ${file}`),
-			"",
-			"SKILL.md:",
-			"```markdown",
-			options.content,
-			"```",
-			"",
-			"Inspect supporting files with the read tool when they affect execution.",
-			"Return the complete plan through submit_result.",
-		].join("\n");
-		const result = await worker.run({ task, context: `Working directory: ${options.cwd}` });
-		if (result.envelope.status !== "ok") {
-			throw new Error(`converter agent failed: ${result.envelope.summary}`);
-		}
-		const plan = result.envelope.result as SkillConverterPlan;
-		const schemaErrors = validateValue(CONVERTER_PLAN_SCHEMA, plan);
-		if (schemaErrors.length > 0) {
-			throw new Error(`converter plan is invalid:\n${schemaErrors.join("\n")}`);
-		}
-		const errors = planErrors(plan);
-		if (errors.length > 0) {
-			throw new Error(`converter plan is incomplete:\n${errors.join("\n")}`);
-		}
-		return plan;
-	} finally {
-		await worker.dispose();
-	}
+export function planErrors(plan: ToolPlan): string[] {
+	return validateToolPlan(plan).filter((entry) => !entry.startsWith("warning: "));
 }

@@ -14,3 +14,5 @@ coverage/
 .adaptive-computation/
 
 _intermediate/
+AGENTS.md
+AGENTS.local.md

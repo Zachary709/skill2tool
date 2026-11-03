@@ -174,9 +174,9 @@ test("http service responds to JSON requests", async () => {
 	}
 });
 
-test("service placement follows the tool scope and honors an explicit level", () => {
+test("service placement uses the tool directory and agent state dir", () => {
 	const tool: ToolManifest = {
-		name: "level_probe",
+		name: "placement_probe",
 		version: "1.0.0",
 		kind: "direct",
 		description: "Placement probe.",
@@ -185,62 +185,50 @@ test("service placement follows the tool scope and honors an explicit level", ()
 		dir: "/opt/tool",
 	};
 	const agentDir = "/home/u/.pi/agent";
-	const projectCwd = "/work/project";
 
 	const user = resolveServicePlacement({
 		tool,
 		name: "svc",
 		service: { type: "script", command: "x" },
-		projectCwd,
 		agentDir,
 	});
-	assert.equal(user.level, "user");
 	assert.equal(user.cwd, "/opt/tool");
-	assert.equal(user.stateDir, "/home/u/.pi/agent/services/level_probe/svc");
-	assert.equal(user.key, "user:level_probe:svc");
+	assert.equal(user.stateDir, "/home/u/.pi/agent/services/placement_probe/svc");
+	assert.equal(user.key, "user:placement_probe:svc");
 
 	const project = resolveServicePlacement({
 		tool: { ...tool, scope: "project" },
 		name: "svc",
 		service: { type: "script", command: "x" },
-		projectCwd,
 		agentDir,
 	});
-	assert.equal(project.level, "project");
-	assert.equal(project.cwd, "/work/project");
-	assert.equal(project.stateDir, "/work/project/.pi/services/level_probe/svc");
-	assert.equal(project.key, "project:/work/project:level_probe:svc");
-
-	const explicit = resolveServicePlacement({
-		tool: { ...tool, scope: "project" },
-		name: "svc",
-		service: { type: "script", command: "x", level: "user" },
-		projectCwd,
-		agentDir,
-	});
-	assert.equal(explicit.level, "user");
+	assert.equal(project.cwd, "/opt/tool");
+	assert.equal(project.stateDir, "/home/u/.pi/agent/services/placement_probe/svc");
+	assert.equal(project.key, "user:placement_probe:svc");
 });
 
-test("project level script runs in the project cwd with the placement env", async () => {
-	const projectCwd = path.join(tempRoot, "project-level");
+test("service script runs in the tool directory with the placement env", async () => {
+	const projectCwd = path.join(tempRoot, "project-dir");
 	const agentDir = path.join(tempRoot, "agent");
+	const toolDir = path.join(tempRoot, "tool-dir");
 	await fs.mkdir(projectCwd, { recursive: true });
+	await fs.mkdir(toolDir, { recursive: true });
 	const tool: ToolManifest = {
-		name: "level_probe",
+		name: "placement_probe",
 		version: "1.0.0",
 		kind: "direct",
 		description: "Placement probe.",
 		scope: "project",
 		input: { type: "object" },
 		output: { type: "object" },
-		dir: path.join(tempRoot, "tool-dir"),
+		dir: toolDir,
 		services: {
 			probe: {
 				type: "script",
 				command: process.execPath,
 				args: [
 					"-e",
-					"console.log(JSON.stringify({cwd: process.cwd(), state: process.env.PI_SERVICE_STATE_DIR, level: process.env.PI_SERVICE_LEVEL}))",
+					"console.log(JSON.stringify({cwd: process.cwd(), state: process.env.PI_SERVICE_STATE_DIR, level: process.env.PI_SERVICE_LEVEL === undefined ? null : process.env.PI_SERVICE_LEVEL}))",
 				],
 			},
 		},
@@ -250,11 +238,11 @@ test("project level script runs in the project cwd with the placement env", asyn
 		const call = await supervisor.call(tool, "probe", {});
 		assert.equal(call.ok, true, call.error);
 		assert.deepEqual(call.result, {
-			cwd: projectCwd,
-			state: path.join(projectCwd, ".pi", "services", "level_probe", "probe"),
-			level: "project",
+			cwd: toolDir,
+			state: path.join(agentDir, "services", "placement_probe", "probe"),
+			level: null,
 		});
-		assert.equal((await fs.stat(path.join(projectCwd, ".pi", "services", "level_probe", "probe"))).isDirectory(), true);
+		assert.equal((await fs.stat(path.join(agentDir, "services", "placement_probe", "probe"))).isDirectory(), true);
 	} finally {
 		await supervisor.close();
 	}
@@ -284,11 +272,11 @@ test("worker key carries the project path only for project scope", () => {
 	assert.equal(workerKey(tool, agent, "/a", true), workerKey(tool, agent, "/b", true));
 });
 
-test("manifest validation rejects unknown service levels and worker scopes", () => {
+test("manifest validation rejects unknown worker scopes", () => {
 	const base = {
-		name: "bad_levels",
+		name: "bad_scopes",
 		version: "1.0.0",
-		description: "Validation probe for service and worker levels.",
+		description: "Validation probe for worker scopes.",
 		kind: "agent" as const,
 		input: { type: "object" },
 		output: { type: "object" },
@@ -300,13 +288,12 @@ test("manifest validation rejects unknown service levels and worker scopes", () 
 			memoryScope: "tenant",
 		},
 		services: {
-			probe: { type: "script", command: "node", level: "cluster" },
+			probe: { type: "script", command: "node" },
 		},
 	};
 	const result = validateManifest(base);
 	assert.ok(result.errors.some((error) => error.includes("agent.sessionScope")));
 	assert.ok(result.errors.some((error) => error.includes("agent.memoryScope")));
-	assert.ok(result.errors.some((error) => error.includes("services.probe.level")));
 });
 
 test("worker scope uses user and project, and reads global as a legacy alias", () => {
@@ -536,7 +523,8 @@ test("package tools load from basic-tools with the package scope", async () => {
 	assert.deepEqual(names, ["service_keeper", "tool_add"]);
 	const toolAdd = result.tools.find((entry) => entry.manifest.name === "tool_add")?.manifest;
 	assert.equal(toolAdd?.handler, "tool_add");
-	assert.equal(toolAdd?.kind, "direct");
+	assert.equal(toolAdd?.kind, "agent");
+	assert.equal(toolAdd?.agent?.instructions, "agent/AGENT.md");
 	assert.ok(toolAdd?.whenToUse?.length);
 	const keeper = result.tools.find((entry) => entry.manifest.name === "service_keeper")?.manifest;
 	assert.equal(keeper?.kind, "agent");
@@ -563,7 +551,7 @@ test("daemon manifests default to persistent and eager", () => {
 });
 
 test("converter plan validation requires a selection intro and a closed typed result", async () => {
-	const { validateConverterPlan } = await import("../basic-tools/tool_add/skill-converter/converter.ts");
+	const { validateToolPlan } = await import("../basic-tools/tool_add/plan.ts");
 	const plan = {
 		name: "word_count",
 		description: "Count words in one text and return the number.",
@@ -586,10 +574,10 @@ test("converter plan validation requires a selection intro and a closed typed re
 			tools: ["read"],
 		},
 	};
-	assert.deepEqual(validateConverterPlan(plan), []);
+	assert.deepEqual(validateToolPlan(plan), []);
 
 	const noIntro = { ...plan, whenToUse: [] };
-	assert.ok(validateConverterPlan(noIntro).some((error) => error.includes("whenToUse")));
+	assert.ok(validateToolPlan(noIntro).some((error) => error.includes("whenToUse")));
 
 	const bag = {
 		...plan,
@@ -599,7 +587,7 @@ test("converter plan validation requires a selection intro and a closed typed re
 			required: ["result"],
 		},
 	};
-	const bagErrors = validateConverterPlan(bag);
+	const bagErrors = validateToolPlan(bag);
 	assert.ok(bagErrors.some((error) => error.includes("additionalProperties")));
 	assert.ok(bagErrors.some((error) => error.includes("catch-all")));
 	assert.ok(bagErrors.some((error) => error.includes("untyped object bag")));
@@ -687,10 +675,18 @@ test("runtime registers packaged tools and tool_add lists them", async () => {
 	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
 	const cwd = path.join(tempRoot, "integration");
 	await fs.mkdir(cwd, { recursive: true });
-	const registered = new Map<string, { name: string; execute: Function; description: string }>();
+	const registered = new Map<
+		string,
+		{ name: string; execute: Function; description: string; parameters: { properties?: Record<string, unknown> } }
+	>();
 	let active: string[] = [];
 	const pi = {
-		registerTool: (definition: { name: string; execute: Function; description: string }) => {
+		registerTool: (definition: {
+			name: string;
+			execute: Function;
+			description: string;
+			parameters: { properties?: Record<string, unknown> };
+		}) => {
 			registered.set(definition.name, definition);
 		},
 		getActiveTools: () => [...active],
@@ -713,19 +709,250 @@ test("runtime registers packaged tools and tool_add lists them", async () => {
 		assert.deepEqual([...registered.keys()].sort(), ["service_keeper", "tool_add"]);
 		const toolAdd = registered.get("tool_add");
 		assert.ok(toolAdd);
-		const response = (await toolAdd!.execute(
-			"call-1",
+		const keeper = registered.get("service_keeper");
+		assert.ok(keeper);
+		assert.equal(toolAdd!.parameters.properties?.mode, undefined);
+		assert.equal(toolAdd!.parameters.properties?.jobId, undefined);
+		assert.ok(keeper!.parameters.properties?.mode);
+		assert.ok(keeper!.parameters.properties?.allowRepair);
+		const startResponse = (await toolAdd!.execute(
+			"call-start",
+			{ action: "list", mode: "start" },
+			undefined,
+			undefined,
+			{ isIdle: () => true, cwd, hasUI: false },
+		)) as { structuredContent: { status: string; summary: string } };
+		assert.equal(startResponse.structuredContent.status, "failed");
+		assert.ok(startResponse.structuredContent.summary.includes("does not match"));
+		const syncResponse = (await toolAdd!.execute(
+			"call-sync",
 			{ action: "list" },
 			undefined,
 			undefined,
 			{ isIdle: () => true, cwd, hasUI: false },
-		)) as { structuredContent: { result: { action: string; tools: Array<{ name: string }> } } };
-		assert.equal(response.structuredContent.result.action, "list");
-		assert.deepEqual(response.structuredContent.result.tools.map((entry) => entry.name).sort(), [
-			"service_keeper",
-			"tool_add",
-		]);
+		)) as { structuredContent: { status: string; summary: string } };
+		assert.equal(syncResponse.structuredContent.status, "failed");
+		assert.ok(syncResponse.structuredContent.summary.includes("tool_add worker failed"));
 	} finally {
 		await runtime.close();
 	}
+});
+
+test("create_tool validates the name and requirements before calling the builder", async () => {
+	const { ToolAddManager } = await import("../basic-tools/tool_add/manager.ts");
+	const host = {
+		agentDir: path.join(tempRoot, "agent"),
+		cwd: tempRoot,
+		modelRuntime: {},
+		supervisor: {},
+		log: () => {},
+		listTools: () => [],
+		getTool: () => undefined,
+		register: () => {},
+		setEnabled: async () => {},
+		isReserved: () => false,
+	};
+	const manager = new ToolAddManager(host as never);
+	const missingName = await manager.handle(
+		{ action: "create_tool", name: "", requirements: "生成一个汇总日志文件的工具，读取最近的行并统计错误码。" },
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(missingName.status, "failed");
+	const shortRequirements = await manager.handle(
+		{ action: "create_tool", name: "log_tool", requirements: "太短" },
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(shortRequirements.status, "failed");
+	assert.ok(shortRequirements.summary.includes("requirements"));
+	const noPlan = await manager.handle(
+		{
+			action: "create_tool",
+			name: "log_tool",
+			requirements: "汇总一个日志文件里最近的错误行，输入是路径和行数，结果是错误总数与每个错误码的次数。",
+		},
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(noPlan.status, "failed");
+	assert.ok(noPlan.summary.includes("plan"));
+});
+
+test("tool_add manifest exposes the create_tool action and requirements field", async () => {
+	const { loadTools } = await import("../src/discovery/manifest.ts");
+	const { tools } = await loadTools([{ root: "basic-tools", scope: "package" }]);
+	const toolAdd = tools.find((entry) => entry.manifest.name === "tool_add")?.manifest;
+	const input = toolAdd?.input as { properties?: Record<string, { enum?: string[] }>; required?: string[] };
+	assert.ok(input.properties?.action.enum?.includes("create_tool"));
+	assert.ok(input.properties?.requirements);
+	assert.deepEqual(input.required, ["action"]);
+});
+
+test("tool_add resolves its packaged agent without a user install", async () => {
+	const { loadTools } = await import("../src/discovery/manifest.ts");
+	const { resolveAgent } = await import("../src/agents/resolver.ts");
+	const { tools } = await loadTools([{ root: "basic-tools", scope: "package" }]);
+	const tool = tools.find((entry) => entry.manifest.name === "tool_add")!.manifest;
+	const resolved = await resolveAgent({
+		tool,
+		cwd: path.join(tempRoot, "empty-project"),
+		agentDir: path.join(tempRoot, "empty-agent"),
+		projectTrusted: false,
+		allowCreateProject: false,
+	});
+	assert.equal(resolved.agent?.source, "embedded");
+	assert.equal(resolved.agent?.name, "tool_add");
+	assert.ok(resolved.agent?.instructions.includes("tool_add_manage"));
+	assert.ok(resolved.agent?.workflow.includes("submit_result"));
+});
+
+test("a newly added tool resolves to an agent named after the tool", async () => {
+	const { ToolAddManager } = await import("../basic-tools/tool_add/manager.ts");
+	const { resolveAgent } = await import("../src/agents/resolver.ts");
+	const agentDir = path.join(tempRoot, "named-agent");
+	const host = {
+		agentDir,
+		cwd: tempRoot,
+		modelRuntime: {},
+		supervisor: {},
+		log: () => {},
+		listTools: () => [],
+		getTool: () => undefined,
+		register: () => {},
+		setEnabled: async () => {},
+		isReserved: () => false,
+	};
+	const manager = new ToolAddManager(host as never);
+	const manifest = {
+		name: "named_agent_tool",
+		version: "1.0.0",
+		description: "A tool whose worker agent must share its name.",
+		whenToUse: ["需要验证 agent 名称"],
+		kind: "agent",
+		input: { type: "object", properties: { task: { type: "string" } }, required: ["task"], additionalProperties: false },
+		output: {
+			type: "object",
+			properties: { value: { type: "string", maxLength: 100 } },
+			required: ["value"],
+			additionalProperties: false,
+		},
+		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
+	};
+	const envelope = await manager.handle(
+		{ action: "add", manifest, scope: "user", replace: true },
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(envelope.status, "ok", JSON.stringify(envelope));
+	const loaded = await readManifestFile(path.join(agentDir, "tools", "named_agent_tool", "TOOL.json"));
+	assert.ok(loaded.manifest);
+	const resolved = await resolveAgent({
+		tool: loaded.manifest!,
+		cwd: path.join(tempRoot, "named-project"),
+		agentDir,
+		projectTrusted: true,
+		allowCreateProject: true,
+	});
+	assert.equal(resolved.agent?.name, "named_agent_tool");
+	assert.equal(resolved.agent?.tool, "named_agent_tool");
+});
+
+test("an agent file whose name differs from the tool name is rejected", async () => {
+	const { resolveAgent } = await import("../src/agents/resolver.ts");
+	const agentDir = path.join(tempRoot, "mismatch-agent");
+	const toolDir = path.join(tempRoot, "mismatch-tool");
+	await fs.mkdir(path.join(agentDir, "agents"), { recursive: true });
+	await fs.mkdir(toolDir, { recursive: true });
+	await fs.writeFile(path.join(toolDir, "AGENT.md"), "embedded instructions\n");
+	await fs.writeFile(path.join(toolDir, "WORKFLOW.md"), "1. Work.\n2. Call submit_result.\n");
+	await fs.writeFile(
+		path.join(agentDir, "agents", "mismatch_tool.md"),
+		[
+			"---",
+			"name: other_name",
+			"tool: mismatch_tool",
+			'tools: ["read"]',
+			"workflow: mismatch_tool.workflow.md",
+			"---",
+			"",
+			"user instructions",
+		].join("\n"),
+	);
+	await fs.writeFile(path.join(agentDir, "agents", "mismatch_tool.workflow.md"), "1. Work.\n2. Call submit_result.\n");
+	const tool: ToolManifest = {
+		name: "mismatch_tool",
+		version: "1.0.0",
+		description: "A tool used to check the agent name rule.",
+		whenToUse: ["需要验证名称规则"],
+		kind: "agent",
+		input: { type: "object", properties: { task: { type: "string" } }, required: ["task"] },
+		output: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
+		dir: toolDir,
+	};
+	const resolved = await resolveAgent({
+		tool,
+		cwd: path.join(tempRoot, "mismatch-project"),
+		agentDir,
+		projectTrusted: false,
+		allowCreateProject: false,
+	});
+	assert.equal(resolved.agent?.source, "embedded");
+	assert.equal(resolved.agent?.name, "mismatch_tool");
+	assert.ok(resolved.warnings.some((warning) => warning.includes("must match the tool name")));
+});
+
+test("tool_add applies a plan supplied by its worker", async () => {
+	const { ToolAddManager } = await import("../basic-tools/tool_add/manager.ts");
+	const agentDir = path.join(tempRoot, "apply-agent");
+	const skillDir = path.join(tempRoot, "apply-skill");
+	await fs.mkdir(skillDir, { recursive: true });
+	const skillFile = path.join(skillDir, "SKILL.md");
+	await fs.writeFile(skillFile, "---\nname: apply_demo\ndescription: A skill used by the apply test.\n---\n\nDo the work.\n");
+	const registered: string[] = [];
+	const host = {
+		agentDir,
+		listTools: () => [],
+		getTool: () => undefined,
+		register: (manifest: ToolManifest) => registered.push(manifest.name),
+		setEnabled: async () => {},
+		isReserved: () => false,
+	};
+	const manager = new ToolAddManager(host as never);
+	const plan = {
+		name: "apply_demo",
+		description: "Apply one planned tool and write its files.",
+		whenToUse: ["需要验证计划写入流程"],
+		input: {
+			type: "object",
+			properties: { task: { type: "string", maxLength: 2000, description: "Task to run." } },
+			required: ["task"],
+			additionalProperties: false,
+		},
+		output: {
+			type: "object",
+			properties: { outcome: { type: "string", maxLength: 500, description: "Outcome." } },
+			required: ["outcome"],
+			additionalProperties: false,
+		},
+		agent: {
+			instructions: "You run the planned task and return the outcome. Work on one job at a time and finish with submit_result.",
+			workflow: "1. Read the task.\n2. Do the work.\n3. Return only the outcome field.\n4. Call submit_result.",
+			tools: ["read"],
+		},
+	};
+	const envelope = await manager.handle(
+		{
+			action: "convert_skill",
+			sourcePath: skillFile,
+			scope: "user",
+			replace: true,
+			plan,
+		},
+		{ cwd: tempRoot, isProjectTrusted: () => true },
+	);
+	assert.equal(envelope.status, "ok", JSON.stringify(envelope));
+	assert.deepEqual(registered, ["apply_demo"]);
+	const dir = path.join(agentDir, "tools", "apply_demo");
+	const loaded = await readManifestFile(path.join(dir, "TOOL.json"));
+	assert.equal(loaded.manifest?.whenToUse?.[0], "需要验证计划写入流程");
+	assert.ok((await fs.readFile(path.join(dir, "AGENT.md"), "utf8")).includes("submit_result"));
+	assert.ok((await fs.readFile(path.join(dir, "WORKFLOW.md"), "utf8")).includes("submit_result"));
 });

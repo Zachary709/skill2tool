@@ -289,6 +289,7 @@ export class AgentWorker {
 	private readonly log: (message: string) => void;
 	private readonly onProgress?: WorkerProgressSink;
 	private readonly defaultModel?: string;
+	private readonly extraTools: ToolDefinition[];
 
 	constructor(
 		tool: ToolManifest,
@@ -300,6 +301,7 @@ export class AgentWorker {
 		log: (message: string) => void,
 		onProgress?: WorkerProgressSink,
 		defaultModel?: string,
+		extraTools: ToolDefinition[] = [],
 	) {
 		this.tool = tool;
 		this.agent = agent;
@@ -309,6 +311,7 @@ export class AgentWorker {
 		this.log = log;
 		this.onProgress = onProgress;
 		this.defaultModel = defaultModel;
+		this.extraTools = extraTools;
 		const sessionScope = tool.agent?.sessionScope ?? "project";
 		const memoryScope = tool.agent?.memoryScope ?? "project";
 		this.cwd = sessionScope === "user" ? (tool.dir ?? cwd) : cwd;
@@ -384,6 +387,7 @@ export class AgentWorker {
 				...bashTools,
 				...requested.filter((name) => allowed.has(name)),
 				...(this.tool.services && Object.keys(this.tool.services).length > 0 ? ["service_call"] : []),
+				...this.extraTools.map((tool) => tool.name),
 				"submit_result",
 			]),
 		);
@@ -392,6 +396,7 @@ export class AgentWorker {
 		if (this.tool.services && Object.keys(this.tool.services).length > 0) {
 			customTools.push(createServiceTool(this.tool, this.supervisor));
 		}
+		customTools.push(...this.extraTools);
 
 		const model = modelFromRuntime(this.modelRuntime, this.defaultModel);
 		const { session } = await createAgentSession({

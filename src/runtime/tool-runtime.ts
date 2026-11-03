@@ -12,6 +12,8 @@ import { loadTools, type ToolLoadDiagnostic, type ToolSource } from "../discover
 import { validateValue, envelopeSchema } from "../contracts/schema.ts";
 import { JobManager } from "../jobs/manager.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
+import { AgentWorker } from "../agents/worker.ts";
+import { resolveAgent } from "../agents/resolver.ts";
 import { executeDirectTool } from "./direct-executor.ts";
 import { ToolAddManager } from "../../basic-tools/tool_add/manager.ts";
 import {
@@ -65,7 +67,8 @@ function facadeInputSchema(manifest: ToolManifest) {
 	const properties: Record<string, unknown> = {
 		...(manifest.input.properties ?? {}),
 	};
-	if (manifest.kind === "agent") {
+	const supportsJobs = manifest.kind === "agent" && !manifest.handler && manifest.execution?.asyncByDefault !== false;
+	if (supportsJobs) {
 		properties.mode = {
 			type: "string",
 			enum: ["sync", "start", "wait", "status", "result", "cancel"],
@@ -98,7 +101,13 @@ function formatToolDescription(manifest: ToolManifest): string {
 	if (manifest.whenToUse?.length) lines.push(`Use when: ${manifest.whenToUse.join("; ")}`);
 	if (manifest.notFor?.length) lines.push(`Do not use for: ${manifest.notFor.join("; ")}`);
 	if (manifest.kind === "agent") {
-		lines.push("This tool delegates to a persistent worker. It accepts mode=start to return a job handle.");
+		lines.push(
+			manifest.handler
+				? "This tool runs its worker in process and supports only mode=sync."
+				: manifest.execution?.asyncByDefault === false
+					? "This tool delegates to a persistent worker and runs one job to completion."
+					: "This tool delegates to a persistent worker. It accepts mode=start to return a job handle.",
+		);
 	}
 	return lines.join("\n");
 }
@@ -129,10 +138,6 @@ export class ToolRuntime {
 		});
 		this.toolAdd = new ToolAddManager({
 			agentDir: options.agentDir,
-			cwd: options.cwd,
-			modelRuntime: options.modelRuntime,
-			supervisor: this.supervisor,
-			log: options.log,
 			listTools: () => [...this.tools.values()].map(({ manifest }) => manifest),
 			getTool: (name) => this.tools.get(name)?.manifest,
 			register: (manifest, activate) => {
@@ -241,6 +246,106 @@ export class ToolRuntime {
 		};
 	}
 
+	private async runToolAddAgent(
+		manifest: ToolManifest,
+		input: Record<string, unknown>,
+		mode: ToolMode,
+		signal: AbortSignal | undefined,
+		ctx: {
+			cwd?: string;
+			isProjectTrusted?(): boolean;
+		},
+	): Promise<ToolEnvelope> {
+		if (mode !== "sync") {
+			return {
+				status: "failed",
+				summary: "tool_add manages the live tool registry, so it runs in process and supports only sync mode.",
+			};
+		}
+		const cwd = ctx.cwd ?? this.options.cwd;
+		const resolution = await resolveAgent({
+			tool: manifest,
+			cwd,
+			agentDir: this.options.agentDir,
+			projectTrusted: this.options.projectTrusted,
+			allowCreateProject: manifest.agent?.createProjectIfMissing ?? false,
+		});
+		if (!resolution.agent) {
+			return {
+				status: "failed",
+				summary: resolution.error ?? "No usable agent for tool_add.",
+				warnings: resolution.warnings,
+			};
+		}
+
+		const properties = { ...(manifest.input.properties ?? {}) };
+		properties.plan = {
+			type: "object",
+			description: "Complete tool plan. Required for create_tool; optional for convert_skill.",
+		};
+		const manageTool: ToolDefinition = {
+			name: "tool_add_manage",
+			label: "Manage tools",
+			description:
+				"Run one tool_add management action. For convert_skill and create_tool, pass the complete plan built from the skill or the requirements.",
+			parameters: Type.Unsafe({
+				...manifest.input,
+				type: "object",
+				properties,
+			}),
+			execute: async (_id, params) => {
+				const envelope = await this.toolAdd.handle(params as unknown as ToolAddInput, {
+					cwd,
+					isProjectTrusted: () => this.options.projectTrusted,
+				});
+				const text = [
+					envelope.summary,
+					envelope.warnings?.length ? `Warnings:
+- ${envelope.warnings.join("\n- ")}` : "",
+					envelope.result !== undefined ? JSON.stringify(envelope.result, null, 2) : "",
+				]
+					.filter(Boolean)
+					.join("\n\n");
+				return {
+					content: [{ type: "text" as const, text }],
+					details: envelope,
+					isError: envelope.status === "failed",
+				};
+			},
+		};
+
+		const worker = new AgentWorker(
+			manifest,
+			resolution.agent,
+			cwd,
+			this.options.agentDir,
+			this.options.modelRuntime,
+			this.supervisor,
+			this.options.log,
+			undefined,
+			this.defaultModel(),
+			[manageTool],
+		);
+		try {
+			const result = await worker.run(
+				{
+					task: "Handle this tool_add request and finish with submit_result.",
+					input,
+					context: `Project directory: ${cwd}`,
+				},
+				signal,
+			);
+			return result.envelope;
+		} catch (error) {
+			return {
+				status: "failed",
+				summary: `tool_add worker failed: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		} finally {
+			await worker.dispose();
+		}
+	}
+
 	private defaultModel(): string | undefined {
 		try {
 			this.settingsManager ??= SettingsManager.create(this.options.cwd, this.options.agentDir);
@@ -311,14 +416,12 @@ export class ToolRuntime {
 		delete jobInput.timeoutMs;
 		delete jobInput.jobId;
 
+		if (manifest.handler === "tool_add") {
+			const envelope = await this.runToolAddAgent(manifest, jobInput, mode, signal, ctx);
+			return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
+		}
+
 		if (manifest.kind === "direct") {
-			if (manifest.handler === "tool_add") {
-				const envelope = await this.toolAdd.handle(jobInput as unknown as ToolAddInput, {
-					cwd: ctx.cwd ?? this.options.cwd,
-					isProjectTrusted: () => this.options.projectTrusted,
-				});
-				return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
-			}
 			const envelope = await executeDirectTool(manifest, jobInput, this.supervisor);
 			return this.toolResult(envelope, manifest, undefined, envelope.status === "failed");
 		}

@@ -1,11 +1,10 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { parseFrontmatter, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { readManifestFile } from "../../src/discovery/manifest.ts";
-import { validateManifest } from "../../src/contracts/schema.ts";
-import type { ServiceSupervisor } from "../../src/services/supervisor.ts";
+import { validateManifest, validateValue } from "../../src/contracts/schema.ts";
 import type { JsonSchema, ToolAddInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
-import { runSkillConverter, planErrors, type SkillConverterPlan } from "./skill-converter/converter.ts";
+import { TOOL_PLAN_SCHEMA, planErrors, type ToolPlan } from "./plan.ts";
 import {
 	atomicWrite,
 	defaultAgentInstructions,
@@ -17,10 +16,6 @@ import {
 
 export interface ToolAddHost {
 	agentDir: string;
-	cwd: string;
-	modelRuntime: ModelRuntime;
-	supervisor: ServiceSupervisor;
-	log(message: string): void;
 	listTools(): ToolManifest[];
 	getTool(name: string): ToolManifest | undefined;
 	register(manifest: ToolManifest, activate: boolean): void;
@@ -128,6 +123,8 @@ export class ToolAddManager {
 				return this.add(input, ctx);
 			case "convert_skill":
 				return this.convertSkill(input, ctx);
+			case "create_tool":
+				return this.createTool(input, ctx);
 			case "disable":
 			case "enable":
 				return this.setEnabled(input);
@@ -200,8 +197,8 @@ export class ToolAddManager {
 				return { status: "failed", summary: "Manifest validation failed.", warnings: result.errors };
 			}
 			manifest = result.manifest;
-		} else if (input.source?.path) {
-			const absolute = path.resolve(input.source.path);
+		} else if (input.sourcePath) {
+			const absolute = path.resolve(input.sourcePath);
 			const stats = await fs.stat(absolute).catch(() => undefined);
 			if (!stats) return { status: "failed", summary: `Source not found: ${absolute}` };
 			const manifestPath = stats.isDirectory() ? path.join(absolute, "TOOL.json") : absolute;
@@ -212,7 +209,7 @@ export class ToolAddManager {
 			}
 			manifest = result.manifest;
 		} else {
-			return { status: "failed", summary: "manifest or source.path is required for add." };
+			return { status: "failed", summary: "manifest or sourcePath is required for add." };
 		}
 
 		const scope = input.scope ?? "project";
@@ -262,8 +259,8 @@ export class ToolAddManager {
 	}
 
 	private async convertSkill(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
-		const skillPath = input.source?.path;
-		if (!skillPath) return { status: "failed", summary: "source.path is required for convert_skill." };
+		const skillPath = input.sourcePath;
+		if (!skillPath) return { status: "failed", summary: "sourcePath is required for convert_skill." };
 		const absolute = path.resolve(skillPath);
 		let content: string;
 		try {
@@ -278,27 +275,20 @@ export class ToolAddManager {
 		}
 
 		const warnings: string[] = [];
-		let plan: SkillConverterPlan | undefined;
-		try {
-			const candidate = await runSkillConverter({
-				skillDir: path.dirname(absolute),
-				skillFile: absolute,
-				content,
-				cwd: ctx.cwd,
-				agentDir: this.host.agentDir,
-				modelRuntime: this.host.modelRuntime,
-				supervisor: this.host.supervisor,
-				log: this.host.log,
-			});
-			const errors = planErrors(candidate);
+		let plan: ToolPlan | undefined;
+		if (input.plan !== undefined) {
+			plan = input.plan as ToolPlan;
+			if (input.name) plan.name = safeToolName(input.name);
+			const errors = this.validatePlan(plan);
 			if (errors.length > 0) {
-				throw new Error(`converter plan is incomplete:\n${errors.join("\n")}`);
+				return {
+					status: "failed",
+					summary: "The supplied tool plan is invalid. Correct the plan and call tool_add_manage again.",
+					warnings: errors,
+				};
 			}
-			plan = candidate;
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			warnings.push(`converter agent failed; using deterministic conversion: ${message}`);
-			this.host.log(warnings[warnings.length - 1]);
+		} else {
+			warnings.push("no plan supplied; using deterministic conversion");
 		}
 
 		const frontmatterName =
@@ -327,7 +317,7 @@ export class ToolAddManager {
 		let manifest = built.manifest;
 		let validation = validateManifest(manifest, dir);
 		if (plan && (!validation.manifest || validation.errors.length > 0)) {
-			warnings.push(`converter plan produced an invalid manifest; using deterministic conversion: ${validation.errors.join("; ")}`);
+			warnings.push(`builder plan produced an invalid manifest; using deterministic conversion: ${validation.errors.join("; ")}`);
 			const fallback = this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
 			built.files = fallback.files;
 			manifest = fallback.manifest;
@@ -346,7 +336,7 @@ export class ToolAddManager {
 		this.host.register(validation.manifest, input.activate ?? true);
 		return {
 			status: "ok",
-			summary: `Skill ${absolute} converted to tool ${name} using the ${usedPlan ? "converter agent" : "deterministic fallback"}.`,
+			summary: `Skill ${absolute} converted to tool ${name} using the ${usedPlan ? "builder agent" : "deterministic fallback"}.`,
 			result: {
 				action: "convert_skill",
 				name,
@@ -356,14 +346,92 @@ export class ToolAddManager {
 				scope,
 				source: absolute,
 				conversionMode: usedPlan ? "agent" : "deterministic",
-				converterAgent: usedPlan ? path.join(this.host.agentDir, "agents", "skill_converter.md") : "",
 			},
 			warnings: [...warnings, ...validation.warnings],
 		};
 	}
 
+	private async createTool(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+		const name = input.name ? safeToolName(input.name) : "";
+		if (!name) return { status: "failed", summary: "name is required for create_tool." };
+		const requirements = input.requirements?.trim() ?? "";
+		if (requirements.length < 20) {
+			return {
+				status: "failed",
+				summary:
+					"requirements must state what the tool does, its inputs, its outputs, and any service or path it uses.",
+			};
+		}
+		if (this.host.isReserved(name)) {
+			return { status: "failed", summary: `Tool name "${name}" is reserved by the runtime.` };
+		}
+		const scope = input.scope ?? "project";
+		if (scope === "project" && !ctx.isProjectTrusted()) {
+			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
+		}
+		const dir = path.join(this.scopeRoot(scope, ctx), name);
+		if (!input.replace) {
+			try {
+				await fs.access(dir);
+				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+			} catch {
+				// expected
+			}
+		}
+
+		if (input.plan === undefined) {
+			return {
+				status: "failed",
+				summary: "create_tool requires a plan produced by the tool_add worker.",
+			};
+		}
+		const plan = input.plan as ToolPlan;
+		plan.name = name;
+		const planValidation = this.validatePlan(plan);
+		if (planValidation.length > 0) {
+			return {
+				status: "failed",
+				summary: "The supplied tool plan is invalid. Correct the plan and call tool_add_manage again.",
+				warnings: planValidation,
+			};
+		}
+		const warnings: string[] = [];
+		const built = this.manifestFromPlan(plan, name, scope, dir);
+		const validation = validateManifest(built.manifest, dir);
+		if (!validation.manifest || validation.errors.length > 0) {
+			return {
+				status: "failed",
+				summary: "Built tool failed validation.",
+				warnings: [...warnings, ...validation.errors],
+			};
+		}
+		await fs.mkdir(dir, { recursive: true });
+		await writeToolArtifacts(dir, validation.manifest, built.files);
+		this.host.register(validation.manifest, input.activate ?? true);
+		return {
+			status: "ok",
+			summary: `Built tool ${name}.`,
+			result: {
+				action: "create_tool",
+				name,
+				version: "0.1.0",
+				kind: "agent",
+				dir,
+				scope,
+				conversionMode: "agent",
+			},
+			warnings: [...warnings, ...validation.warnings],
+		};
+	}
+
+	private validatePlan(plan: ToolPlan): string[] {
+		const schemaErrors = validateValue(TOOL_PLAN_SCHEMA, plan);
+		if (schemaErrors.length > 0) return schemaErrors;
+		return planErrors(plan);
+	}
+
 	private manifestFromPlan(
-		plan: SkillConverterPlan,
+		plan: ToolPlan,
 		name: string,
 		scope: "project" | "user",
 		dir: string,

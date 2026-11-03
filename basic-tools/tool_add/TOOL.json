@@ -2,8 +2,9 @@
   "name": "tool_add",
   "version": "1.0.0",
   "contractVersion": "1.0.0",
-  "description": "管理 pi-tool-runtime 的工具：列出、检查、校验、添加工具，把技能目录转换成工具，启用或停用已注册的工具。需要创建新工具、查看现有工具的契约、或判断一个清单是否可用时使用。",
+  "description": "管理 pi-tool-runtime 的工具：列出、检查、校验、添加工具，把技能目录转换成工具，按名称和需求生成新工具，启用或停用已注册的工具。需要创建新工具、查看现有工具的契约、或判断一个清单是否可用时使用。",
   "whenToUse": [
+    "需要按名称和需求生成一个新工具",
     "需要把一个技能目录转换成可用的工具",
     "需要查看已注册工具的名称、种类与说明",
     "需要检查某个工具的输入输出契约与 agent 文件",
@@ -13,41 +14,45 @@
     "需要直接执行某个工具的业务逻辑",
     "需要修改运行时源码或服务监督逻辑"
   ],
-  "kind": "direct",
+  "kind": "agent",
   "handler": "tool_add",
   "input": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["list", "inspect", "validate", "add", "convert_skill", "disable", "enable"],
-        "description": "要执行的管理动作。"
+        "enum": [
+          "list",
+          "inspect",
+          "validate",
+          "add",
+          "convert_skill",
+          "create_tool",
+          "disable",
+          "enable"
+        ],
+        "description": "要执行的管理动作。create_tool 按名称和需求生成新工具。"
       },
       "name": {
         "type": "string",
-        "description": "工具名称，用于 inspect、disable、enable，或在添加时覆盖清单中的名称。"
+        "description": "工具名称。create_tool 必填，用作新工具名；inspect、disable、enable 用它定位工具；添加时可覆盖清单中的名称。"
+      },
+      "requirements": {
+        "type": "string",
+        "maxLength": 8000,
+        "description": "调用方整理好的完整需求，而不是对话原文：工具要做什么、输入是什么、结果给谁用、涉及哪些脚本、服务或路径。create_tool 必填。"
       },
       "scope": {
         "type": "string",
-        "enum": ["project", "user"],
+        "enum": [
+          "project",
+          "user"
+        ],
         "description": "写入位置：project 写入项目 .pi/tools，user 写入 agent 目录的 tools。默认 project。"
       },
-      "source": {
-        "type": "object",
-        "properties": {
-          "type": {
-            "type": "string",
-            "enum": ["manifest", "skill", "script"],
-            "description": "来源类型。"
-          },
-          "path": {
-            "type": "string",
-            "description": "来源路径。convert_skill 指向 SKILL.md，add 指向 TOOL.json 或工具目录。"
-          }
-        },
-        "required": ["type"],
-        "additionalProperties": false,
-        "description": "添加或转换的来源。"
+      "sourcePath": {
+        "type": "string",
+        "description": "来源路径。add 指向 TOOL.json 或工具目录，convert_skill 指向 SKILL.md。"
       },
       "manifest": {
         "type": "object",
@@ -74,7 +79,9 @@
         "description": "写入后是否立即加入 pi 的可用工具列表。默认 true。"
       }
     },
-    "required": ["action"],
+    "required": [
+      "action"
+    ],
     "additionalProperties": false
   },
   "output": {
@@ -82,33 +89,119 @@
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["list", "inspect", "validate", "add", "convert_skill", "disable", "enable"]
+        "enum": [
+          "list",
+          "inspect",
+          "validate",
+          "add",
+          "convert_skill",
+          "create_tool",
+          "disable",
+          "enable"
+        ]
       },
-      "name": { "type": "string", "maxLength": 64 },
-      "version": { "type": "string", "maxLength": 32 },
-      "kind": { "type": "string", "enum": ["direct", "agent"] },
-      "scope": { "type": "string", "enum": ["project", "user", "package"] },
-      "dir": { "type": "string", "maxLength": 1000 },
-      "description": { "type": "string", "maxLength": 2000 },
-      "source": { "type": "string", "maxLength": 1000 },
-      "conversionMode": { "type": "string", "enum": ["agent", "deterministic"] },
-      "converterAgent": { "type": "string", "maxLength": 1000 },
-      "enabled": { "type": "boolean" },
-      "whenToUse": { "type": "array", "items": { "type": "string", "maxLength": 500 }, "maxItems": 20 },
-      "notFor": { "type": "array", "items": { "type": "string", "maxLength": 500 }, "maxItems": 20 },
+      "name": {
+        "type": "string",
+        "maxLength": 64
+      },
+      "version": {
+        "type": "string",
+        "maxLength": 32
+      },
+      "kind": {
+        "type": "string",
+        "enum": [
+          "direct",
+          "agent"
+        ]
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "project",
+          "user",
+          "package"
+        ]
+      },
+      "dir": {
+        "type": "string",
+        "maxLength": 1000
+      },
+      "description": {
+        "type": "string",
+        "maxLength": 2000
+      },
+      "source": {
+        "type": "string",
+        "maxLength": 1000
+      },
+      "conversionMode": {
+        "type": "string",
+        "enum": [
+          "agent",
+          "deterministic"
+        ]
+      },
+      "enabled": {
+        "type": "boolean"
+      },
+      "whenToUse": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "maxItems": 20
+      },
+      "notFor": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "maxItems": 20
+      },
       "tools": {
         "type": "array",
         "maxItems": 200,
         "items": {
           "type": "object",
           "properties": {
-            "name": { "type": "string", "maxLength": 64 },
-            "version": { "type": "string", "maxLength": 32 },
-            "kind": { "type": "string", "enum": ["direct", "agent"] },
-            "scope": { "type": "string", "enum": ["project", "user", "package"] },
-            "description": { "type": "string", "maxLength": 2000 }
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "version": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "direct",
+                "agent"
+              ]
+            },
+            "scope": {
+              "type": "string",
+              "enum": [
+                "project",
+                "user",
+                "package"
+              ]
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 2000
+            }
           },
-          "required": ["name", "version", "kind", "scope", "description"],
+          "required": [
+            "name",
+            "version",
+            "kind",
+            "scope",
+            "description"
+          ],
           "additionalProperties": false
         }
       },
@@ -118,13 +211,34 @@
         "items": {
           "type": "object",
           "properties": {
-            "name": { "type": "string", "maxLength": 64 },
-            "type": { "type": "string", "enum": ["script", "daemon"] },
-            "protocol": { "type": "string", "maxLength": 64 },
-            "lifecycle": { "type": "string", "maxLength": 32 },
-            "start": { "type": "string", "maxLength": 32 }
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "script",
+                "daemon"
+              ]
+            },
+            "protocol": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "lifecycle": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "start": {
+              "type": "string",
+              "maxLength": 32
+            }
           },
-          "required": ["name", "type"],
+          "required": [
+            "name",
+            "type"
+          ],
           "additionalProperties": false
         }
       },
@@ -134,12 +248,27 @@
         "items": {
           "type": "object",
           "properties": {
-            "name": { "type": "string", "maxLength": 64 },
-            "type": { "type": "string", "maxLength": 32 },
-            "required": { "type": "boolean" },
-            "description": { "type": "string", "maxLength": 1000 }
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "required": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 1000
+            }
           },
-          "required": ["name", "type", "required"],
+          "required": [
+            "name",
+            "type",
+            "required"
+          ],
           "additionalProperties": false
         }
       },
@@ -149,35 +278,86 @@
         "items": {
           "type": "object",
           "properties": {
-            "name": { "type": "string", "maxLength": 64 },
-            "type": { "type": "string", "maxLength": 32 },
-            "required": { "type": "boolean" },
-            "description": { "type": "string", "maxLength": 1000 }
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "type": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "required": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 1000
+            }
           },
-          "required": ["name", "type", "required"],
+          "required": [
+            "name",
+            "type",
+            "required"
+          ],
           "additionalProperties": false
         }
       },
       "agentFiles": {
         "type": "object",
         "properties": {
-          "instructions": { "type": "string", "maxLength": 200 },
-          "workflow": { "type": "string", "maxLength": 200 },
-          "examples": { "type": "string", "maxLength": 200 },
-          "tools": { "type": "array", "items": { "type": "string", "maxLength": 32 }, "maxItems": 20 }
+          "instructions": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "workflow": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "examples": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "maxItems": 20
+          }
         },
-        "required": ["instructions", "workflow", "tools"],
+        "required": [
+          "instructions",
+          "workflow",
+          "tools"
+        ],
         "additionalProperties": false
       },
-      "errors": { "type": "array", "items": { "type": "string", "maxLength": 2000 }, "maxItems": 50 },
-      "warnings": { "type": "array", "items": { "type": "string", "maxLength": 2000 }, "maxItems": 50 }
+      "errors": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "maxItems": 50
+      },
+      "warnings": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "maxItems": 50
+      }
     },
-    "required": ["action"],
+    "required": [
+      "action"
+    ],
     "additionalProperties": false
   },
   "permissions": {
     "read": true,
-    "write": true,
+    "write": false,
     "bash": false,
     "network": false
   },
@@ -188,8 +368,27 @@
   },
   "execution": {
     "defaultMode": "sync",
-    "notifyOnIdle": false
+    "notifyOnIdle": false,
+    "asyncByDefault": false
   },
   "exposure": "direct",
-  "namespace": "tool"
+  "namespace": "tool",
+  "agent": {
+    "instructions": "agent/AGENT.md",
+    "workflow": "agent/WORKFLOW.md",
+    "examples": "agent/EXAMPLES.md",
+    "tools": [
+      "read",
+      "grep",
+      "find",
+      "ls"
+    ],
+    "maxTurns": 30,
+    "sessionScope": "project",
+    "memoryScope": "project",
+    "resolution": "user-first",
+    "createProjectIfMissing": false,
+    "requireProjectTrust": false,
+    "contractRange": "^1.0.0"
+  }
 }

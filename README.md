@@ -46,15 +46,17 @@ project is trusted.
 `basic-tools/` holds the tools this package needs itself. They are ordinary tool
 directories, so they also appear in the pi tool list:
 
-- `basic-tools/tool_add/` — management tool. Its manifest declares
-  `"handler": "tool_add"`, which runs the in-process manager instead of a
-  service. The manager and the artifact writer live in this directory, and the
-  skill converter lives in `basic-tools/tool_add/skill-converter/`.
+- `basic-tools/tool_add/` — agent tool. Its own worker prompt lives in
+  `basic-tools/tool_add/agent/`; `manager.ts`, `plan.ts`, and `artifacts.ts`
+  implement the in-process management action the worker calls. The manifest
+  declares `"handler": "tool_add"`, so the worker runs in process and can
+  register tools in the live registry.
 - `basic-tools/service_keeper/` — agent tool that checks and recovers services
   registered in the agent directory's `services/registry.json`.
 
-A packaged tool runs with the `package` scope. Its daemons are user-level, its
-state stays under the agent directory, and it needs no project trust.
+A packaged tool runs with the `package` scope. Its daemons start in the tool
+directory, its state stays under the agent directory, and it needs no project
+trust.
 
 ## TOOL.json
 
@@ -118,7 +120,7 @@ state stays under the agent directory, and it needs no project trust.
 
 - `direct` runs a declared service synchronously.
 - `agent` creates a persistent worker and can call declared services through `service_call`.
-- A packaged tool that must run inside the runtime declares `"handler": "tool_add"` instead of a service. `tool_add` uses this, because the manager needs the live tool registry.
+- A packaged agent tool may declare `"handler": "tool_add"`. The runtime then runs its worker in process instead of a detached job, because the management action changes the live tool registry. `tool_add` uses this and supports only `mode: "sync"`.
 
 ## Services
 
@@ -159,32 +161,24 @@ to `persistent` and `eager`, so the daemon starts with the tool and keeps
 serving jobs. A persistent daemon that uses a Unix socket or HTTP is left
 running when the session closes and is attached again on the next start.
 
-### Service levels
+### Service placement
 
-Every service declares `level`, which is `user` or `project`. When it is
-omitted, it follows the tool's discovery scope: a user tool gets user services
-and a project tool gets project services. A service can override that per
-entry.
+Every service starts in the tool directory and keeps its state under
+`~/.pi/agent/services/<tool>/<service>`. Its daemon key is
+`user:<tool>:<service>`, so every project shares one handle. When a Unix
+socket or HTTP endpoint is already reachable, the runtime attaches to it
+instead of spawning another process.
 
-| | `user` | `project` |
-| --- | --- | --- |
-| default cwd | tool directory | project directory |
-| state directory | `~/.pi/agent/services/<tool>/<service>` | `<project>/.pi/services/<tool>/<service>` |
-| daemon key | `user:<tool>:<service>` | `project:<project>:<tool>:<service>` |
-| reuse | a reachable Unix socket or HTTP endpoint is attached instead of spawned | always spawned for the current project |
-
-Each spawn writes `state.json` with the level, process id, cwd, and start time
-under the state directory. The same directory receives `PI_SERVICE_STATE_DIR`,
-and the child environment carries `PI_TOOL_NAME`, `PI_SERVICE_NAME`, and
-`PI_SERVICE_LEVEL`.
+Each spawn writes `state.json` with the process id, cwd, and start time under
+the state directory. The same directory receives `PI_SERVICE_STATE_DIR`, and
+the child environment carries `PI_TOOL_NAME` and `PI_SERVICE_NAME`.
 
 ```json
 {
   "type": "daemon",
   "command": "node",
   "args": ["services/server.mjs"],
-  "protocol": "unix-jsonl",
-  "level": "user"
+  "protocol": "unix-jsonl"
 }
 ```
 
@@ -194,7 +188,7 @@ select a model. The job record keeps the resolved model as `provider/id`, so
 every job states which model its worker used. When settings set no default, the
 runtime default applies.
 
-Workers use the same two level names. `agent.sessionScope` is `project` by
+Workers use the scope names `user` and `project`. `agent.sessionScope` is `project` by
 default and fixes the worker key to the project directory, so every project gets
 its own session. With `user`, the key drops the project path: one worker session
 is shared by every project, and its working directory is the tool directory.
@@ -239,7 +233,7 @@ Result:
   its string values still pass the size and log limits. The loader warns about
   any `type: "object"` output field without `properties`.
 
-The converter requires typed fields, `required`, and
+The builder requires typed fields, `required`, and
 `"additionalProperties": false` on both sides, and rejects a catch-all
 `result`, `details`, `notes`, or `output` object in the plan it produces. It
 also requires a selection description with at least one `whenToUse` entry, a
@@ -320,11 +314,20 @@ Resolution order:
 
 Project agents are skipped when the project is not trusted. Project agents may declare `override: true` to take precedence over user agents.
 
+`agent.instructions`, `agent.workflow`, and `agent.examples` are relative to the
+tool directory, so an agent tool may keep its prompt files under `agent/`.
+
+An agent file must carry the tool name in both `name` and `tool`. A file whose
+`name` differs from the tool name is rejected with a warning and the next
+candidate is used. Generated project agents and embedded agents are written
+with the tool name, so every tool, including a newly created one, resolves a
+worker agent whose name matches the tool.
+
 Agent file:
 
 ```markdown
 ---
-name: repair-shop
+name: repair_shop
 tool: repair_shop
 version: 1.0.0
 contract: "^1.0.0"
@@ -359,7 +362,15 @@ Worker files live under:
 
 ## tool_add
 
-`tool_add` is both a Pi tool and a management entry point.
+`tool_add` is an agent tool. One job handles one management request: the worker
+reads the skill or the stated requirement, builds a complete tool plan, and
+applies it through an in-process management action. Because it changes the live
+tool registry, it runs in process and supports only `mode: "sync"`.
+
+The worker uses the prompt files in `basic-tools/tool_add/agent/`, and the
+read-only tools plus `tool_add_manage`. `tool_add_manage` is the in-process
+action backed by `manager.ts`; the worker is the only caller that supplies a
+`plan`.
 
 Actions:
 
@@ -368,6 +379,7 @@ Actions:
 - `validate`
 - `add`
 - `convert_skill`
+- `create_tool`
 - `disable`
 - `enable`
 
@@ -382,29 +394,44 @@ Convert a skill:
 }
 ```
 
-Conversion uses a user-level converter agent:
+The worker reads the skill and its supporting files, designs one plan from the
+skill's actual behavior, and calls `tool_add_manage` with the plan. The manager
+validates the plan, writes `TOOL.json`, `AGENT.md`, `WORKFLOW.md`, and optional
+`EXAMPLES.md`, then registers the tool. The worker finishes with
+`submit_result`, carrying only the management result.
 
-```text
-~/.pi/agent/agents/skill_converter.md
-~/.pi/agent/agents/skill_converter.workflow.md
+Create a tool from a name and a requirement stated by the caller:
+
+```json
+{
+  "action": "create_tool",
+  "name": "log_tail_summary",
+  "requirements": "汇总一个日志文件里最近的错误行。输入是日志路径和行数，结果是错误总数与每个错误码的次数。",
+  "scope": "project",
+  "activate": true
+}
 ```
 
-The runtime installs these from `basic-tools/tool_add/skill-converter/` on the first conversion. The converter agent reads the skill and its supporting files, then returns a complete plan through `submit_result`. The runtime validates the plan, writes `TOOL.json`, `AGENT.md`, `WORKFLOW.md`, and optional `EXAMPLES.md`, then registers the tool.
+The calling agent states the requirement; `tool_add` does not read the chat
+history. The requirement is the complete brief: what the tool does, the input,
+the result, and any script, service, or path the tool must use. The worker
+designs the plan and applies it the same way as a conversion.
 
-A converted tool must carry:
+A generated tool must carry:
 
 - a selection description and at least one `whenToUse` entry;
 - a closed input schema with typed, described fields and a non-empty `required` list;
 - a closed result schema with typed, described fields, `maxLength` on every string, and `maxItems` on every array;
 - a worker system prompt and a workflow that ends with `submit_result`;
-- services only when the skill already has a matching script or server. Daemons are declared with `lifecycle: "persistent"` and `start: "eager"`, so they run continuously and are started with the tool.
+- services only when the skill or the requirement names a matching script or server. Daemons are declared with `lifecycle: "persistent"` and `start: "eager"`, so they run continuously and are started with the tool.
 
-The runtime rejects a plan that misses any of these and falls back to the
-deterministic generator.
+The manager rejects a plan that misses any of these and returns the exact
+problems, so the worker can correct the plan and call `tool_add_manage` again.
+When `convert_skill` is called without a plan, the manager falls back to the
+deterministic generator. `create_tool` requires a plan.
 
-If the converter agent is unavailable or returns an invalid or incomplete plan, conversion falls back to the deterministic generator. The fallback writes the same set of files with a closed `task`/`context` input, a typed `outcome`/`facts` result, a generated system prompt, and a generated workflow.
-
-The converted tool uses the permissions proposed by the converter. The converter defaults to read-only; edit `TOOL.json` to allow `bash`, `edit`, or `write`.
+The generated tool uses the permissions proposed by the plan. The plan defaults
+to read-only; edit `TOOL.json` to allow `bash`, `edit`, or `write`.
 
 `add` accepts `instructions`, `workflow`, and `examples` strings. If an agent tool's files are missing, `tool_add` writes safe defaults. A source path may point to a directory containing `TOOL.json`; the whole directory is copied.
 

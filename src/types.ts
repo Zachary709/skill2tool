@@ -26,8 +26,6 @@ export interface ServiceDefinition {
 	command?: string;
 	args?: string[];
 	cwd?: string;
-	/** Ownership level. Defaults to the level of the tool that declares it. */
-	level?: "user" | "project";
 	protocol?: "json-stdin-stdout" | "jsonl-stdio" | "unix-jsonl" | "http-json";
 	/** Unix socket path for unix-jsonl services. */
 	socket?: string;
@@ -167,14 +165,14 @@ export interface JobRecord {
 }
 
 export interface ToolAddInput {
-	action: "list" | "inspect" | "validate" | "add" | "convert_skill" | "disable" | "enable";
+	action: "list" | "inspect" | "validate" | "add" | "convert_skill" | "create_tool" | "disable" | "enable";
 	name?: string;
+	requirements?: string;
 	scope?: "project" | "user";
-	source?: {
-		type: "manifest" | "skill" | "script";
-		path?: string;
-	};
+	sourcePath?: string;
 	manifest?: unknown;
+	/** Full tool plan produced by the tool_add worker. */
+	plan?: unknown;
 	instructions?: string;
 	workflow?: string;
 	examples?: string;
