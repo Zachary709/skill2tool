@@ -74,10 +74,10 @@ Never start or repair them from here.
 ## Result
 
 Return only the declared result fields: a `services` array. Each entry carries
-`service`, `unit`, `healthy`, `before`, `after`, and, when an action ran,
-`action` and `policy`. Put evidence such as status codes and the exact command
-in those fields. Compress logs and command output to one line; never paste raw
-multi-line output.
+`service`, `healthy`, `state`, `action`, and an optional `message`. Put the
+current unit state in `state`, the action you ran in `action` (`none` when no
+action ran), and evidence such as status codes, the exact command, or a
+one-line log tail in `message`. Never paste raw multi-line output.
 
 Finish with `submit_result`. Write the summary in Chinese, state whether any
 action was taken, and keep it to one or two sentences.

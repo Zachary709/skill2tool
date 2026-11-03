@@ -8,13 +8,13 @@
    - read `sourcePath` completely;
    - list the skill directory and read the supporting instructions, scripts, and references that affect execution;
    - design one complete plan from the skill's actual behavior;
-   - call `tool_add_manage` with `action: "convert_skill"`, the source path, the scope, replace and activate flags, and `plan`;
+   - call `tool_add_manage` with `action: "convert_skill"`, the source path, the scope, and `plan`;
    - on a plan validation failure, correct the reported fields and call it again.
 4. For `create_tool`:
    - read `name` and `requirements` from the job input;
    - read project files only when the requirements name a script, a service, or a path that must be grounded;
    - design one complete plan that matches the stated requirement;
-   - call `tool_add_manage` with `action: "create_tool"`, the name and requirements, the scope, replace and activate flags, and `plan`;
+   - call `tool_add_manage` with `action: "create_tool"`, the name and requirements, the scope, and `plan`;
    - on a plan validation failure, correct the reported fields and call it again.
 5. Check the manage result:
    - `ok`: continue;

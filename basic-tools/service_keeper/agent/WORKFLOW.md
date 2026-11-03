@@ -1,6 +1,6 @@
 # Workflow
 
-1. Read `task`, `service`, `allowRepair`, and `context`. Read the service registry at
+1. Read `task`, `service`, and `allowRepair`. Read the service registry at
    `<Agent directory>/services/registry.json`, using the Agent directory from
    the system prompt's Runtime paths block.
 2. Resolve the target services. With no `service`, take every registered
@@ -27,5 +27,5 @@
 11. Collect the registered `logs` output, compressed to one line, when the
     service is still unhealthy.
 12. Write `<Agent directory>/services/state.json` when an action was taken.
-13. Submit `ok` or `failed` with the `services` array: `before` and `after`
-    states, the `action`, the `policy` state, and `logTail` when present.
+13. Submit `ok` or `failed` with the `services` array: `service`, `healthy`,
+    `state`, `action`, and `message` when there is evidence to report.

@@ -99,29 +99,19 @@ export async function writeToolArtifacts(
  * examples are generated from the manifest so every agent tool ships the
  * system prompt and the execution steps its worker needs.
  */
-export async function ensureAgentFiles(
-	dir: string,
-	manifest: ToolManifest,
-	input: { instructions?: string; workflow?: string; examples?: string },
-): Promise<void> {
+export async function ensureAgentFiles(dir: string, manifest: ToolManifest): Promise<void> {
 	if (manifest.kind !== "agent") return;
 	const agentPath = path.join(dir, manifest.agent?.instructions ?? "AGENT.md");
 	const workflowPath = path.join(dir, manifest.agent?.workflow ?? "WORKFLOW.md");
 	const examplesPath = path.join(dir, manifest.agent?.examples ?? "EXAMPLES.md");
 	const exists = (filePath: string) => fs.access(filePath).then(() => true).catch(() => false);
-	if (input.instructions !== undefined) {
-		await atomicWrite(agentPath, `${input.instructions.trim()}\n`);
-	} else if (!(await exists(agentPath))) {
+	if (!(await exists(agentPath))) {
 		await atomicWrite(agentPath, `${defaultAgentInstructions(manifest)}\n`);
 	}
-	if (input.workflow !== undefined) {
-		await atomicWrite(workflowPath, `${input.workflow.trim()}\n`);
-	} else if (!(await exists(workflowPath))) {
+	if (!(await exists(workflowPath))) {
 		await atomicWrite(workflowPath, `${defaultWorkflow(manifest)}\n`);
 	}
-	if (input.examples !== undefined) {
-		await atomicWrite(examplesPath, `${input.examples.trim()}\n`);
-	} else if (manifest.agent?.examples && !(await exists(examplesPath))) {
+	if (manifest.agent?.examples && !(await exists(examplesPath))) {
 		await atomicWrite(examplesPath, `${defaultExamples(manifest)}\n`);
 	}
 }

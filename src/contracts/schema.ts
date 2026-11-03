@@ -95,9 +95,19 @@ function walkResultSchema(
 		const record = value as Record<string, unknown>;
 		const properties = schema.properties;
 		if (properties) {
-			for (const key of Object.keys(record)) {
-				if (!(key in properties)) {
+			const extras = Object.keys(record).filter((key) => !(key in properties));
+			if (schema.additionalProperties === false || schema.additionalProperties === undefined) {
+				for (const key of extras) {
 					errors.push(`${path}.${key}: not declared by the tool output contract; remove it`);
+				}
+			} else if (schema.additionalProperties === true) {
+				// Open objects still go through the value-size and log limits.
+				for (const key of extras) {
+					walkResultSchema({}, record[key], `${path}.${key}`, errors);
+				}
+			} else if (typeof schema.additionalProperties === "object") {
+				for (const key of extras) {
+					walkResultSchema(schema.additionalProperties as JsonSchema, record[key], `${path}.${key}`, errors);
 				}
 			}
 			for (const [key, sub] of Object.entries(properties)) {
@@ -247,7 +257,10 @@ export function validateManifest(raw: unknown, dir?: string): {
 			}
 			for (const [key, property] of Object.entries(output.properties ?? {})) {
 				const shape = property as JsonSchema;
-				if (shape.type === "object" && !shape.properties) {
+				// An explicit `additionalProperties: true` is an open object the author
+				// intends to fill at runtime; only an object with no declared shape at
+				// all is treated as an accidental bag.
+				if (shape.type === "object" && !shape.properties && shape.additionalProperties !== true) {
 					warnings.push(
 						`output.${key} is an untyped object bag; declare explicit typed fields instead`,
 					);

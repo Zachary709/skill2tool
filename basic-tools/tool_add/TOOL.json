@@ -31,16 +31,11 @@
           "disable",
           "enable"
         ],
-        "description": "要执行的管理动作。create_tool 按名称和需求生成新工具。"
+        "description": "要执行的管理动作。"
       },
       "name": {
         "type": "string",
-        "description": "工具名称。create_tool 必填，用作新工具名；inspect、disable、enable 用它定位工具；添加时可覆盖清单中的名称。"
-      },
-      "requirements": {
-        "type": "string",
-        "maxLength": 8000,
-        "description": "调用方整理好的完整需求，而不是对话原文：工具要做什么、输入是什么、结果给谁用、涉及哪些脚本、服务或路径。create_tool 必填。"
+        "description": "工具名称。inspect、enable、disable 用它定位工具，create_tool 用作新工具名。"
       },
       "scope": {
         "type": "string",
@@ -48,7 +43,7 @@
           "project",
           "user"
         ],
-        "description": "写入位置：project 写入项目 .pi/tools，user 写入 agent 目录的 tools。默认 project。"
+        "description": "写入位置。默认 project。"
       },
       "sourcePath": {
         "type": "string",
@@ -56,27 +51,12 @@
       },
       "manifest": {
         "type": "object",
-        "description": "要校验或添加的完整工具清单对象。"
+        "description": "validate 或 add 使用的完整工具清单。"
       },
-      "instructions": {
+      "requirements": {
         "type": "string",
-        "description": "agent 工具的系统提示内容，写入 AGENT.md。"
-      },
-      "workflow": {
-        "type": "string",
-        "description": "agent 工具的执行流程，写入 WORKFLOW.md。"
-      },
-      "examples": {
-        "type": "string",
-        "description": "可选示例，写入 EXAMPLES.md。"
-      },
-      "replace": {
-        "type": "boolean",
-        "description": "目标目录已存在时是否覆盖。默认 false。"
-      },
-      "activate": {
-        "type": "boolean",
-        "description": "写入后是否立即加入 pi 的可用工具列表。默认 true。"
+        "maxLength": 8000,
+        "description": "create_tool 的完整需求：做什么、输入、输出、涉及的脚本或服务。"
       }
     },
     "required": [
@@ -100,67 +80,6 @@
           "enable"
         ]
       },
-      "name": {
-        "type": "string",
-        "maxLength": 64
-      },
-      "version": {
-        "type": "string",
-        "maxLength": 32
-      },
-      "kind": {
-        "type": "string",
-        "enum": [
-          "direct",
-          "agent"
-        ]
-      },
-      "scope": {
-        "type": "string",
-        "enum": [
-          "project",
-          "user",
-          "package"
-        ]
-      },
-      "dir": {
-        "type": "string",
-        "maxLength": 1000
-      },
-      "description": {
-        "type": "string",
-        "maxLength": 2000
-      },
-      "source": {
-        "type": "string",
-        "maxLength": 1000
-      },
-      "conversionMode": {
-        "type": "string",
-        "enum": [
-          "agent",
-          "deterministic"
-        ]
-      },
-      "enabled": {
-        "type": "boolean"
-      },
-      "whenToUse": {
-        "type": "array",
-        "items": {
-          "type": "string",
-          "maxLength": 500
-        },
-        "maxItems": 20
-      },
-      "notFor": {
-        "type": "array",
-        "items": {
-          "type": "string",
-          "maxLength": 500
-        },
-        "maxItems": 20
-      },
       "tools": {
         "type": "array",
         "maxItems": 200,
@@ -171,183 +90,35 @@
               "type": "string",
               "maxLength": 64
             },
-            "version": {
-              "type": "string",
-              "maxLength": 32
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "direct",
-                "agent"
-              ]
-            },
-            "scope": {
-              "type": "string",
-              "enum": [
-                "project",
-                "user",
-                "package"
-              ]
-            },
             "description": {
               "type": "string",
               "maxLength": 2000
+            },
+            "input": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "inspect 时的输入 JSON Schema。"
+            },
+            "output": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "inspect 时的输出 JSON Schema。"
             }
           },
           "required": [
             "name",
-            "version",
-            "kind",
-            "scope",
             "description"
           ],
           "additionalProperties": false
         }
       },
-      "services": {
+      "errors": {
         "type": "array",
         "maxItems": 50,
         "items": {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string",
-              "maxLength": 64
-            },
-            "type": {
-              "type": "string",
-              "enum": [
-                "script",
-                "daemon"
-              ]
-            },
-            "protocol": {
-              "type": "string",
-              "maxLength": 64
-            },
-            "lifecycle": {
-              "type": "string",
-              "maxLength": 32
-            },
-            "start": {
-              "type": "string",
-              "maxLength": 32
-            }
-          },
-          "required": [
-            "name",
-            "type"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "inputFields": {
-        "type": "array",
-        "maxItems": 100,
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string",
-              "maxLength": 64
-            },
-            "type": {
-              "type": "string",
-              "maxLength": 32
-            },
-            "required": {
-              "type": "boolean"
-            },
-            "description": {
-              "type": "string",
-              "maxLength": 1000
-            }
-          },
-          "required": [
-            "name",
-            "type",
-            "required"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "outputFields": {
-        "type": "array",
-        "maxItems": 100,
-        "items": {
-          "type": "object",
-          "properties": {
-            "name": {
-              "type": "string",
-              "maxLength": 64
-            },
-            "type": {
-              "type": "string",
-              "maxLength": 32
-            },
-            "required": {
-              "type": "boolean"
-            },
-            "description": {
-              "type": "string",
-              "maxLength": 1000
-            }
-          },
-          "required": [
-            "name",
-            "type",
-            "required"
-          ],
-          "additionalProperties": false
-        }
-      },
-      "agentFiles": {
-        "type": "object",
-        "properties": {
-          "instructions": {
-            "type": "string",
-            "maxLength": 200
-          },
-          "workflow": {
-            "type": "string",
-            "maxLength": 200
-          },
-          "examples": {
-            "type": "string",
-            "maxLength": 200
-          },
-          "tools": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "maxLength": 32
-            },
-            "maxItems": 20
-          }
-        },
-        "required": [
-          "instructions",
-          "workflow",
-          "tools"
-        ],
-        "additionalProperties": false
-      },
-      "errors": {
-        "type": "array",
-        "items": {
           "type": "string",
           "maxLength": 2000
-        },
-        "maxItems": 50
-      },
-      "warnings": {
-        "type": "array",
-        "items": {
-          "type": "string",
-          "maxLength": 2000
-        },
-        "maxItems": 50
+        }
       }
     },
     "required": [

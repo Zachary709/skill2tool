@@ -173,11 +173,6 @@ export interface ToolAddInput {
 	manifest?: unknown;
 	/** Full tool plan produced by the tool_add worker. */
 	plan?: unknown;
-	instructions?: string;
-	workflow?: string;
-	examples?: string;
-	replace?: boolean;
-	activate?: boolean;
 }
 
 export interface JobToolInput {

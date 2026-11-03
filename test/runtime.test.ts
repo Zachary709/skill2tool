@@ -490,6 +490,19 @@ test("result shape rejects unknown keys, oversized strings, and log dumps", () =
 			error.includes("exceeds 4000"),
 		),
 	);
+
+	const open = {
+		type: "object",
+		properties: { count: { type: "number" } },
+		required: ["count"],
+		additionalProperties: true,
+	};
+	assert.deepEqual(validateResultShape(open, { count: 3, extra: "short" }), []);
+	assert.ok(
+		validateResultShape(open, { count: 3, extra: "x".repeat(5000) }).some((error) =>
+			error.includes("exceeds 4000"),
+		),
+	);
 });
 
 test("summary stays short and single paragraph", () => {
@@ -506,13 +519,20 @@ test("manifest validation warns about loose input and output contracts", () => {
 		description: "A tool with a catch-all output bag.",
 		kind: "agent",
 		input: { type: "object", properties: { task: { type: "string" } }, required: ["task"] },
-		output: { type: "object", properties: { result: { type: "object" } } },
+		output: {
+			type: "object",
+			properties: {
+				result: { type: "object" },
+				open: { type: "object", additionalProperties: true },
+			},
+		},
 		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
 	});
 	assert.deepEqual(result.errors, []);
 	assert.ok(result.warnings.some((warning) => warning.includes("additionalProperties")));
 	assert.ok(result.warnings.some((warning) => warning.includes("required")));
 	assert.ok(result.warnings.some((warning) => warning.includes("untyped object bag")));
+	assert.ok(!result.warnings.some((warning) => warning.includes("output.open")));
 });
 
 test("package tools load from basic-tools with the package scope", async () => {
@@ -658,7 +678,7 @@ test("adding an agent tool writes AGENT.md and WORKFLOW.md", async () => {
 		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
 	};
 	const envelope = await manager.handle(
-		{ action: "add", manifest, scope: "user", replace: true },
+		{ action: "add", manifest, scope: "user" },
 		{ cwd: tempRoot, isProjectTrusted: () => true },
 	);
 	assert.equal(envelope.status, "ok", JSON.stringify(envelope));
@@ -713,7 +733,8 @@ test("runtime registers packaged tools and tool_add lists them", async () => {
 		assert.ok(keeper);
 		assert.equal(toolAdd!.parameters.properties?.mode, undefined);
 		assert.equal(toolAdd!.parameters.properties?.jobId, undefined);
-		assert.ok(keeper!.parameters.properties?.mode);
+		assert.equal(keeper!.parameters.properties?.mode, undefined);
+		assert.equal(keeper!.parameters.properties?.jobId, undefined);
 		assert.ok(keeper!.parameters.properties?.allowRepair);
 		const startResponse = (await toolAdd!.execute(
 			"call-start",
@@ -837,7 +858,7 @@ test("a newly added tool resolves to an agent named after the tool", async () =>
 		agent: { instructions: "AGENT.md", workflow: "WORKFLOW.md", tools: ["read"] },
 	};
 	const envelope = await manager.handle(
-		{ action: "add", manifest, scope: "user", replace: true },
+		{ action: "add", manifest, scope: "user" },
 		{ cwd: tempRoot, isProjectTrusted: () => true },
 	);
 	assert.equal(envelope.status, "ok", JSON.stringify(envelope));
@@ -943,7 +964,6 @@ test("tool_add applies a plan supplied by its worker", async () => {
 			action: "convert_skill",
 			sourcePath: skillFile,
 			scope: "user",
-			replace: true,
 			plan,
 		},
 		{ cwd: tempRoot, isProjectTrusted: () => true },

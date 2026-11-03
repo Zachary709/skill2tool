@@ -66,45 +66,20 @@ function stringArray(value: unknown): string[] | undefined {
 	return Array.isArray(value) && value.every((item) => typeof item === "string") ? (value as string[]) : undefined;
 }
 
-function fieldSummary(schema: JsonSchema): Array<{ name: string; type: string; required: boolean; description?: string }> {
-	const required = new Set(Array.isArray(schema.required) ? schema.required : []);
-	return Object.entries(schema.properties ?? {}).map(([name, shape]) => ({
-		name,
-		type: typeof (shape as JsonSchema).type === "string" ? String((shape as JsonSchema).type) : "unknown",
-		required: required.has(name),
-		description: typeof (shape as JsonSchema).description === "string" ? (shape as JsonSchema).description : undefined,
-	}));
+function toolSummary(manifest: ToolManifest) {
+	return { name: manifest.name, description: manifest.description };
 }
 
 function inspectResult(manifest: ToolManifest) {
-	const services = Object.entries(manifest.services ?? {}).map(([name, service]) => ({
-		name,
-		type: service.type,
-		protocol: service.protocol ?? "",
-		lifecycle: service.lifecycle ?? "",
-		start: service.start ?? "",
-	}));
 	return {
 		action: "inspect" as const,
-		name: manifest.name,
-		version: manifest.version,
-		kind: manifest.kind,
-		scope: manifest.scope ?? "project",
-		dir: manifest.dir ?? "",
-		description: manifest.description,
-		whenToUse: manifest.whenToUse ?? [],
-		notFor: manifest.notFor ?? [],
-		services,
-		inputFields: fieldSummary(manifest.input),
-		outputFields: fieldSummary(manifest.output),
-		agentFiles: manifest.agent
-			? {
-					instructions: manifest.agent.instructions ?? "AGENT.md",
-					workflow: manifest.agent.workflow ?? "WORKFLOW.md",
-					examples: manifest.agent.examples ?? "",
-					tools: manifest.agent.tools ?? [],
-				}
-			: undefined,
+		tools: [
+			{
+				...toolSummary(manifest),
+				input: manifest.input,
+				output: manifest.output,
+			},
+		],
 	};
 }
 
@@ -134,13 +109,7 @@ export class ToolAddManager {
 	}
 
 	private list(): ToolEnvelope {
-		const tools = this.host.listTools().map((manifest) => ({
-			name: manifest.name,
-			version: manifest.version,
-			kind: manifest.kind,
-			scope: manifest.scope ?? "project",
-			description: manifest.description,
-		}));
+		const tools = this.host.listTools().map((manifest) => toolSummary(manifest));
 		return {
 			status: "ok",
 			summary: `${tools.length} tool(s) registered.`,
@@ -160,7 +129,7 @@ export class ToolAddManager {
 		return {
 			status: result.errors.length ? "failed" : "ok",
 			summary: result.errors.length ? "Manifest validation failed." : "Manifest is valid.",
-			result: { action: "validate", errors: result.errors, warnings: result.warnings },
+			result: { action: "validate", errors: result.errors },
 			warnings: result.warnings,
 		};
 	}
@@ -174,11 +143,11 @@ export class ToolAddManager {
 				summary: `Tool ${manifest.name} ships with the runtime and cannot be disabled or enabled.`,
 			};
 		}
-		await this.host.setEnabled(manifest.name, input.action === "enable", input.activate ?? true);
+		await this.host.setEnabled(manifest.name, input.action === "enable", true);
 		return {
 			status: "ok",
 			summary: `Tool ${manifest.name} ${input.action === "enable" ? "enabled" : "disabled"}.`,
-			result: { action: input.action, name: manifest.name, enabled: input.action === "enable" },
+			result: { action: input.action, tools: [toolSummary(manifest)] },
 		};
 	}
 
@@ -220,13 +189,11 @@ export class ToolAddManager {
 			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
 		}
 		const dir = path.join(this.scopeRoot(scope, ctx), manifest.name);
-		if (!input.replace) {
-			try {
-				await fs.access(dir);
-				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
-			} catch {
-				// expected
-			}
+		try {
+			await fs.access(dir);
+			return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+		} catch {
+			// the directory does not exist yet
 		}
 		await fs.mkdir(dir, { recursive: true });
 		if (sourceDir && path.resolve(sourceDir) !== path.resolve(dir)) {
@@ -235,25 +202,18 @@ export class ToolAddManager {
 		const persisted = { ...manifest };
 		delete persisted.dir;
 		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
-		await ensureAgentFiles(dir, manifest, input);
+		await ensureAgentFiles(dir, manifest);
 		manifest.dir = dir;
 		manifest.scope = scope;
 		const validation = validateManifest(manifest, dir);
 		if (!validation.manifest || validation.errors.length > 0) {
 			return { status: "failed", summary: "Generated tool failed validation.", warnings: validation.errors };
 		}
-		this.host.register(validation.manifest, input.activate ?? true);
+		this.host.register(validation.manifest, true);
 		return {
 			status: "ok",
 			summary: `Tool ${manifest.name} added.`,
-			result: {
-				action: "add",
-				name: manifest.name,
-				version: manifest.version,
-				kind: manifest.kind,
-				dir,
-				scope,
-			},
+			result: { action: "add", tools: [toolSummary(manifest)] },
 			warnings: validation.warnings,
 		};
 	}
@@ -299,13 +259,11 @@ export class ToolAddManager {
 			return { status: "failed", summary: `Tool name "${name}" is reserved by the runtime.` };
 		}
 		const dir = path.join(this.scopeRoot(scope, ctx), name);
-		if (!input.replace) {
-			try {
-				await fs.access(dir);
-				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
-			} catch {
-				// expected
-			}
+		try {
+			await fs.access(dir);
+			return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+		} catch {
+			// the directory does not exist yet
 		}
 
 		const built = plan
@@ -333,20 +291,11 @@ export class ToolAddManager {
 		}
 
 		await writeToolArtifacts(dir, validation.manifest, built.files);
-		this.host.register(validation.manifest, input.activate ?? true);
+		this.host.register(validation.manifest, true);
 		return {
 			status: "ok",
 			summary: `Skill ${absolute} converted to tool ${name} using the ${usedPlan ? "builder agent" : "deterministic fallback"}.`,
-			result: {
-				action: "convert_skill",
-				name,
-				version: "0.1.0",
-				kind: "agent",
-				dir,
-				scope,
-				source: absolute,
-				conversionMode: usedPlan ? "agent" : "deterministic",
-			},
+			result: { action: "convert_skill", tools: [toolSummary(validation.manifest)] },
 			warnings: [...warnings, ...validation.warnings],
 		};
 	}
@@ -370,13 +319,11 @@ export class ToolAddManager {
 			return { status: "needs_input", summary: "Project is not trusted; cannot create a project tool." };
 		}
 		const dir = path.join(this.scopeRoot(scope, ctx), name);
-		if (!input.replace) {
-			try {
-				await fs.access(dir);
-				return { status: "failed", summary: `Tool directory already exists: ${dir}` };
-			} catch {
-				// expected
-			}
+		try {
+			await fs.access(dir);
+			return { status: "failed", summary: `Tool directory already exists: ${dir}` };
+		} catch {
+			// the directory does not exist yet
 		}
 
 		if (input.plan === undefined) {
@@ -407,19 +354,11 @@ export class ToolAddManager {
 		}
 		await fs.mkdir(dir, { recursive: true });
 		await writeToolArtifacts(dir, validation.manifest, built.files);
-		this.host.register(validation.manifest, input.activate ?? true);
+		this.host.register(validation.manifest, true);
 		return {
 			status: "ok",
 			summary: `Built tool ${name}.`,
-			result: {
-				action: "create_tool",
-				name,
-				version: "0.1.0",
-				kind: "agent",
-				dir,
-				scope,
-				conversionMode: "agent",
-			},
+			result: { action: "create_tool", tools: [toolSummary(validation.manifest)] },
 			warnings: [...warnings, ...validation.warnings],
 		};
 	}
