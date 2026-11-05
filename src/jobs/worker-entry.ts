@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { EnvHttpProxyAgent, install, setGlobalDispatcher } from "undici";
 import { AgentWorker } from "../agents/worker.ts";
 import { resolveAgent } from "../agents/resolver.ts";
 import { readManifestFile } from "../discovery/manifest.ts";
@@ -28,6 +29,8 @@ async function update(
 async function main(): Promise<void> {
 	const jobPath = process.argv[2];
 	if (!jobPath) throw new Error("usage: worker-entry.ts <job.json>");
+	setGlobalDispatcher(new EnvHttpProxyAgent());
+	install();
 	const absoluteJobPath = path.resolve(jobPath);
 	const root = jobRootFromPath(absoluteJobPath);
 	const jobId = path.basename(path.dirname(absoluteJobPath));

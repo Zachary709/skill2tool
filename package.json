@@ -35,6 +35,9 @@
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
+  "dependencies": {
+    "undici": "8.12.3"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
