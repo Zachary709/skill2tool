@@ -1,42 +1,31 @@
 {
   "name": "service_keeper",
-  "version": "1.0.0",
-  "contractVersion": "1.0.0",
-  "description": "检查并恢复控制器上已登记的服务和工具声明的 daemon：读服务登记表，探测健康与就绪接口，确认 systemd 用户单元状态，单元停止或健康检查失败时按登记表执行一次启动或重启；工具声明的 daemon 通过运行时查看并重启。当工具或任务依赖的本地服务不可用、需要判断谁在运行、或服务需要一次受控恢复时使用。",
+  "version": "2.0.0",
+  "contractVersion": "2.0.0",
+  "description": "检查并恢复已登记的本地服务和工具 daemon。",
   "whenToUse": [
-    "已登记的本地服务无响应",
-    "工具声明的 daemon 进程退出或端点不可达",
-    "需要确认某个服务是否在运行、是否就绪",
-    "服务单元处于 inactive 或 failed，需要执行一次启动或重启",
-    "需要查看服务最近的日志而不改动任何状态"
+    "本地服务异常、就绪检查或日志查询"
   ],
   "notFor": [
-    "需要修改服务登记表、单元文件或端口配置",
-    "需要启动既未登记也未由工具声明的进程",
-    "需要 sudo、需要改动 tailscale serve 发布规则",
-    "需要维护远程集群节点上的服务"
+    "未登记的进程或远程服务",
+    "修改服务配置、安装软件或执行 sudo"
   ],
   "kind": "agent",
   "input": {
     "type": "object",
     "properties": {
-      "task": {
+      "request": {
         "type": "string",
         "maxLength": 8000,
-        "description": "要检查或恢复什么，以及为什么。"
-      },
-      "service": {
-        "type": "string",
-        "maxLength": 128,
-        "description": "登记表里的服务名称，或工具 daemon 的 <tool>/<service>。省略时检查全部已登记服务和工具 daemon。"
+        "description": "要检查的服务及操作。"
       },
       "allowRepair": {
         "type": "boolean",
-        "description": "是否允许按登记表执行一次启动或重启。默认 false，只做只读检查。"
+        "description": "允许一次启动或重启，默认 false。"
       }
     },
     "required": [
-      "task"
+      "request"
     ],
     "additionalProperties": false
   },
@@ -52,16 +41,16 @@
             "service": {
               "type": "string",
               "maxLength": 128,
-              "description": "登记表里的服务名称。"
+              "description": "服务名称。"
             },
             "healthy": {
               "type": "boolean",
-              "description": "结束时该服务是否健康。"
+              "description": "是否健康。"
             },
             "state": {
               "type": "string",
               "maxLength": 64,
-              "description": "当前单元状态，例如 active、inactive、failed。"
+              "description": "当前状态。"
             },
             "action": {
               "type": "string",
@@ -70,12 +59,12 @@
                 "start",
                 "restart"
               ],
-              "description": "本次执行的动作。"
+              "description": "执行的动作。"
             },
             "message": {
               "type": "string",
               "maxLength": 500,
-              "description": "一句话结果；仍不健康时说明原因。"
+              "description": "结果或失败原因。"
             }
           },
           "required": [
@@ -111,7 +100,7 @@
     "resolution": "user-first",
     "createProjectIfMissing": true,
     "requireProjectTrust": true,
-    "contractRange": "^1.0.0"
+    "contractRange": "^2.0.0"
   },
   "permissions": {
     "read": true,

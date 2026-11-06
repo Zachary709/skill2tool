@@ -202,6 +202,12 @@ Daemon 持续运行。省略 `lifecycle` 和 `start` 时，默认值分别是 `p
 
 ### 工具 daemon 维护
 
+`service_keeper` 接收 `request` 和可选的 `allowRepair`，服务名称和操作写在请求中。`allowRepair` 默认 false，只检查状态或读取日志；只有显式传入 true 才允许启动或重启一次。
+
+```json
+{ "request": "检查 adaptive-service，必要时恢复一次。", "allowRepair": true }
+```
+
 工具注册时，它的 daemon 服务会立即启动。协议客户端由运行时持有，因此重启必须在运行时内部完成。`service_keeper` 的 worker 因此在当前进程里运行，并额外获得一个 `service_keeper_manage` 工具：
 
 | 动作 | 参数 | 结果 |
@@ -388,22 +394,19 @@ Worker 每完成一步，都会向 `<project>/.pi/jobs/<jobId>/progress.jsonl` �
 
 ## tool_add
 
-`tool_add` 是一个 agent 工具。一个任务处理一个管理请求：worker 读取技能或给定的需求，生成完整工具方案，并通过进程内管理动作应用这个方案。由于它会改动正在使用的工具注册表，它在当前进程里运行，只支持 `mode: "sync"`。
+`tool_add` 只接收一个自然语言 `request` 参数，工具名称、来源路径、需求和作用域都写在请求中。Worker 提取内部管理动作并执行，作用域默认 `project`，请求明确指定时使用 `user`。它在当前进程里同步运行。
 
 Worker 使用 `basic-tools/tool_add/agent/` 中的提示词文件，以及只读工具和 `tool_add_manage`。`tool_add_manage` 是由 `manager.ts` 实现的进程内动作；只有 worker 会提供 `plan` 调用它。
 
-### 动作
+### 内部动作
 
-`list`、`inspect`、`validate`、`add`、`convert_skill`、`create_tool`、`disable`、`enable`。
+Worker 将 `request` 转换为 `list`、`inspect`、`validate`、`add`、`convert_skill`、`create_tool`、`disable` 或 `enable`，并通过 `tool_add_manage` 执行。
 
 ### 转换技能
 
 ```json
 {
-  "action": "convert_skill",
-  "source": { "type": "skill", "path": "/path/to/SKILL.md" },
-  "scope": "project",
-  "activate": true
+  "request": "把 /path/to/SKILL.md 转换成项目工具。"
 }
 ```
 
@@ -413,29 +416,29 @@ Worker 读取技能和它的附属文件，根据技能的实际行为设计一�
 
 ```json
 {
-  "action": "create_tool",
-  "name": "log_tail_summary",
-  "requirements": "汇总一个日志文件里最近的错误行。输入是日志路径和行数，结果是错误总数与每个错误码的次数。",
-  "scope": "project",
-  "activate": true
+  "request": "创建项目工具 log_tail_summary，汇总日志文件最近的错误行。输入是日志路径和行数，返回错误总数与各错误码次数。"
 }
 ```
 
-需求由调用方 agent 给出；`tool_add` 不读取聊天记录。需求就是完整说明：工具做什么、输入是什么、结果是什么，以及工具必须使用的脚本、服务或路径。Worker 设计方案，并按与转换相同的方式应用。
+调用方在 `request` 中给出完整需求；`tool_add` 不读取聊天记录。需求就是完整说明：工具做什么、输入是什么、结果是什么，以及工具必须使用的脚本、服务或路径。Worker 设计方案，并按与转换相同的方式应用。
+
+创建和转换工具时，描述使用一句简短的能力说明，参数只保留调用方必须提供或独立控制的信息。通用 worker 优先使用一个自然语言 `request` 或 `task` 参数，任务和必要背景一起传入；只需要路径的工具可以直接使用 `path`。参数说明保持简短，必要的校验和授权字段保留。操作步骤、脚本选项、环境配置和示例写入工具内部的 `AGENT.md`、`WORKFLOW.md`、`EXAMPLES.md`。`whenToUse` 只保留必要的选择场景，`notFor` 只说明实际的歧义或安全边界。
+
+新生成的工具默认同步执行，不附加 `mode`、`timeoutMs` 和 `jobId`。技能行为或需求确实需要后台执行时，在方案中设置 `execution.asyncByDefault: true`，由运行时添加任务控制参数。
 
 生成的工具必须包含：
 
-- 用于选择工具的说明，且 `whenToUse` 至少有一项；
-- 封闭的输入 schema，字段有类型和说明，`required` 非空；
+- 简短的能力说明，且 `whenToUse` 至少有一项；
+- 封闭的输入 schema，只保留必要字段，字段有类型和简短说明，`required` 非空；
 - 封闭的结果 schema，字段有类型和说明，每个字符串都有 `maxLength`，每个数组都有 `maxItems`；
 - worker 系统提示词，以及以 `submit_result` 结束的工作流；
 - 只有在技能或需求给出对应的脚本或服务器时，才声明服务。Daemon 以 `lifecycle: "persistent"` 和 `start: "eager"` 声明，因此持续运行并随工具启动。
 
-方案缺少任何一项时，管理器会拒绝它并返回具体问题，worker 可以修正方案后再次调用 `tool_add_manage`。调用 `convert_skill` 时没有提供方案，管理器会退回到确定性生成器。`create_tool` 必须提供方案。
+方案缺少任何一项时，管理器会拒绝它并返回具体问题，worker 可以修正方案后再次调用 `tool_add_manage`。调用 `convert_skill` 时没有提供方案，管理器会退回到确定性生成器，输入只保留 `task`，默认同步执行。`create_tool` 必须提供方案。
 
 生成的工具使用方案建议的权限。方案默认只读；要允许 `bash`、`edit` 或 `write`，请修改 `TOOL.json`。
 
-`add` 接受 `instructions`、`workflow` 和 `examples` 字符串。如果 agent 工具的文件缺失，`tool_add` 会写入安全的默认内容。来源路径可以指向包含 `TOOL.json` 的目录，整个目录会被复制。
+添加工具时，在 `request` 中提供 TOOL.json 或工具目录的路径。整个来源目录会被复制；agent 工具缺失的说明文档由管理器补齐。校验工具时，worker 读取指定 TOOL.json 并将清单对象交给管理器。
 
 ## 安全
 

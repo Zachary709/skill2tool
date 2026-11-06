@@ -165,6 +165,10 @@ export interface JobRecord {
 }
 
 export interface ToolAddInput {
+	request: string;
+}
+
+export interface ToolAddManageInput {
 	action: "list" | "inspect" | "validate" | "add" | "convert_skill" | "create_tool" | "disable" | "enable";
 	name?: string;
 	requirements?: string;

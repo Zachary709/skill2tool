@@ -1,66 +1,27 @@
 {
   "name": "tool_add",
-  "version": "1.0.0",
-  "contractVersion": "1.0.0",
-  "description": "管理 pi-tool-runtime 的工具：列出、检查、校验、添加工具，把技能目录转换成工具，按名称和需求生成新工具，启用或停用已注册的工具。需要创建新工具、查看现有工具的契约、或判断一个清单是否可用时使用。",
+  "version": "2.0.0",
+  "contractVersion": "2.0.0",
+  "description": "按需求创建、转换和管理 pi 工具。",
   "whenToUse": [
-    "需要按名称和需求生成一个新工具",
-    "需要把一个技能目录转换成可用的工具",
-    "需要查看已注册工具的名称、种类与说明",
-    "需要检查某个工具的输入输出契约与 agent 文件",
-    "需要添加、启用或停用一个工具"
+    "需要生成工具、转换技能或维护工具注册表"
   ],
   "notFor": [
-    "需要直接执行某个工具的业务逻辑",
-    "需要修改运行时源码或服务监督逻辑"
+    "执行工具业务或修改运行时源码"
   ],
   "kind": "agent",
   "handler": "tool_add",
   "input": {
     "type": "object",
     "properties": {
-      "action": {
-        "type": "string",
-        "enum": [
-          "list",
-          "inspect",
-          "validate",
-          "add",
-          "convert_skill",
-          "create_tool",
-          "disable",
-          "enable"
-        ],
-        "description": "要执行的管理动作。"
-      },
-      "name": {
-        "type": "string",
-        "description": "工具名称。inspect、enable、disable 用它定位工具，create_tool 用作新工具名。"
-      },
-      "scope": {
-        "type": "string",
-        "enum": [
-          "project",
-          "user"
-        ],
-        "description": "写入位置。默认 project。"
-      },
-      "sourcePath": {
-        "type": "string",
-        "description": "来源路径。add 指向 TOOL.json 或工具目录，convert_skill 指向 SKILL.md。"
-      },
-      "manifest": {
-        "type": "object",
-        "description": "validate 或 add 使用的完整工具清单。"
-      },
-      "requirements": {
+      "request": {
         "type": "string",
         "maxLength": 8000,
-        "description": "create_tool 的完整需求：做什么、输入、输出、涉及的脚本或服务。"
+        "description": "用自然语言说明要创建、转换或管理什么工具。"
       }
     },
     "required": [
-      "action"
+      "request"
     ],
     "additionalProperties": false
   },
@@ -97,12 +58,12 @@
             "input": {
               "type": "object",
               "additionalProperties": true,
-              "description": "inspect 时的输入 JSON Schema。"
+              "description": "输入 JSON Schema。"
             },
             "output": {
               "type": "object",
               "additionalProperties": true,
-              "description": "inspect 时的输出 JSON Schema。"
+              "description": "输出 JSON Schema。"
             }
           },
           "required": [
@@ -160,6 +121,6 @@
     "resolution": "user-first",
     "createProjectIfMissing": false,
     "requireProjectTrust": false,
-    "contractRange": "^1.0.0"
+    "contractRange": "^2.0.0"
   }
 }

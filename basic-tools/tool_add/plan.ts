@@ -7,6 +7,7 @@ export interface ToolPlan {
 	notFor?: string[];
 	input: JsonSchema;
 	output: JsonSchema;
+	execution?: { asyncByDefault?: boolean };
 	agent: {
 		instructions: string;
 		workflow: string;
@@ -42,15 +43,28 @@ export const TOOL_PLAN_SCHEMA: JsonSchema = {
 	required: ["name", "description", "whenToUse", "input", "output", "agent"],
 	properties: {
 		name: { type: "string", description: "Tool name in lowercase underscores." },
-		description: { type: "string", description: "What the tool does and when to use it." },
+		description: { type: "string", description: "One short sentence stating the tool's capability." },
 		whenToUse: {
 			type: "array",
 			items: { type: "string" },
-			description: "One line per situation in which the main agent should choose this tool.",
+			description: "Only the brief situations needed to select this tool; avoid repeating the description.",
 		},
-		notFor: { type: "array", items: { type: "string" } },
-		input: { type: "object", description: "JSON Schema for tool input." },
-		output: { type: "object", description: "JSON Schema for the business result." },
+		notFor: { type: "array", items: { type: "string" }, description: "Only necessary exclusions." },
+		input: {
+			type: "object",
+			description: "Closed JSON Schema with the fewest necessary fields; prefer one request or task string.",
+		},
+		output: { type: "object", description: "Closed JSON Schema for only the business result the caller needs." },
+		execution: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				asyncByDefault: {
+					type: "boolean",
+					description: "Default false. Enable only when the task needs background execution and job control.",
+				},
+			},
+		},
 		agent: {
 			type: "object",
 			required: ["instructions", "workflow"],
@@ -129,8 +143,8 @@ function checkObjectSchema(schema: JsonSchema, side: "input" | "output", errors:
 		if (!shape.type) {
 			errors.push(`${side}.${key}: must declare a type`);
 		}
-		if (!shape.description || String(shape.description).trim().length < 4) {
-			errors.push(`${side}.${key}: needs a description so the field is unambiguous`);
+		if (typeof shape.description !== "string" || !shape.description.trim()) {
+			errors.push(`${side}.${key}: needs a concise description so the field is unambiguous`);
 		}
 		if (side === "output") {
 			if (shape.type === "object" && !isRecord(shape.properties)) {
@@ -204,8 +218,8 @@ export function validateToolPlan(plan: ToolPlan): string[] {
 		errors.push("name: must match ^[a-z][a-z0-9_]*$ and be at most 64 characters");
 	}
 	if (!plan.name || plan.name.length > 64) errors.push("name: must be at most 64 characters");
-	if (!plan.description || plan.description.trim().length < 20) {
-		errors.push("description: must explain what the tool does and when the main agent should choose it");
+	if (!plan.description || plan.description.trim().length < 12) {
+		errors.push("description: must briefly state what the tool does, at least 12 characters");
 	}
 	if (!Array.isArray(plan.whenToUse) || plan.whenToUse.length === 0) {
 		errors.push("whenToUse: must list at least one situation for the main agent to choose this tool");

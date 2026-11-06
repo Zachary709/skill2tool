@@ -4,8 +4,7 @@
 
 调用参数：
 
-- `task`: 看一下资源看板服务是否正常，只检查不要重启。
-- `service`: `adaptive-service`
+- `request`: 检查 adaptive-service 是否正常，只检查不要重启。
 - `allowRepair`: false
 
 预期行为：读取登记表，运行 `systemctl --user is-active`，探测 `/healthz` 与
@@ -16,8 +15,7 @@ true，`state` 为 `active`，`action` 为 `none`，不写 `state.json`。
 
 调用参数：
 
-- `task`: 资源看板服务没响应了，检查一下，必要时执行登记表里的启动命令。
-- `service`: `adaptive-service`
+- `request`: adaptive-service 没响应，检查并在必要时恢复一次。
 - `allowRepair`: true
 
 预期行为：单元为 `inactive`，两个检查失败，冷却与当日次数都允许，执行一次
@@ -29,8 +27,7 @@ true，`message` 里放命令和复查后的状态码。
 
 调用参数：
 
-- `task`: 再重启一次资源看板服务。
-- `service`: `adaptive-service`
+- `request`: 再检查并恢复一次 adaptive-service。
 - `allowRepair`: true
 
 预期行为：`state.json` 里上次动作距今小于 `cooldownSeconds`，不执行任何命令，
@@ -40,8 +37,7 @@ true，`message` 里放命令和复查后的状态码。
 
 调用参数：
 
-- `task`: 把资源看板服务重启一下。
-- `service`: `adaptive-service`
+- `request`: 把 adaptive-service 重启一下。
 - `allowRepair`: true
 
 预期行为：单元 active、两个检查都通过。按登记的恢复规则，健康状态下不执行重启，
@@ -51,7 +47,7 @@ true，`message` 里放命令和复查后的状态码。
 
 调用参数：
 
-- `task`: 检查 `repair_shop` 工具的 `panel` 服务，必要时重启。
+- `request`: 检查 repair_shop/panel，必要时重启一次。
 - `allowRepair`: true
 
 预期行为：调用 `service_keeper_manage` 的 `action: "list"`，找到

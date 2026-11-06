@@ -616,11 +616,14 @@ test("package tools load from basic-tools with the package scope", async () => {
 	const toolAdd = result.tools.find((entry) => entry.manifest.name === "tool_add")?.manifest;
 	assert.equal(toolAdd?.handler, "tool_add");
 	assert.equal(toolAdd?.kind, "agent");
+	assert.equal(toolAdd?.contractVersion, "2.0.0");
 	assert.equal(toolAdd?.agent?.instructions, "agent/AGENT.md");
 	assert.ok(toolAdd?.whenToUse?.length);
 	const keeper = result.tools.find((entry) => entry.manifest.name === "service_keeper")?.manifest;
 	assert.equal(keeper?.kind, "agent");
 	assert.equal(keeper?.handler, "service_keeper");
+	assert.equal(keeper?.contractVersion, "2.0.0");
+	assert.deepEqual(keeper?.input.required, ["request"]);
 	assert.equal(keeper?.agent?.instructions, "agent/AGENT.md");
 	assert.ok((keeper?.output.required as string[]).includes("services"));
 });
@@ -648,17 +651,17 @@ test("converter plan validation requires a selection intro and a closed typed re
 	const { validateToolPlan } = await import("../basic-tools/tool_add/plan.ts");
 	const plan = {
 		name: "word_count",
-		description: "Count words in one text and return the number.",
+		description: "统计文本中的英文单词数量。",
 		whenToUse: ["需要统计一段文本的词数"],
 		input: {
 			type: "object",
-			properties: { text: { type: "string", description: "Text to count." } },
+			properties: { text: { type: "string", description: "文本" } },
 			required: ["text"],
 			additionalProperties: false,
 		},
 		output: {
 			type: "object",
-			properties: { count: { type: "number", description: "Word count." } },
+			properties: { count: { type: "number", description: "词数" } },
 			required: ["count"],
 			additionalProperties: false,
 		},
@@ -706,14 +709,15 @@ test("deterministic fallback produces a closed contract and agent files", async 
 		manifestFromFallback(
 			frontmatter: Record<string, unknown>,
 			body: string,
-			absolute: string,
 			name: string,
 			scope: "project" | "user",
 			dir: string,
 		): { manifest: ToolManifest; files: { instructions: string; workflow: string } };
-	}).manifestFromFallback({}, "Do the thing.", "/skills/demo/SKILL.md", "demo_skill", "user", "/skills/demo");
+	}).manifestFromFallback({}, "Do the thing.", "demo_skill", "user", "/skills/demo");
 	assert.ok(built.manifest.whenToUse?.length);
 	assert.equal(built.manifest.input.additionalProperties, false);
+	assert.deepEqual(Object.keys(built.manifest.input.properties ?? {}), ["task"]);
+	assert.deepEqual(built.manifest.execution, { defaultMode: "sync", notifyOnIdle: false, asyncByDefault: false });
 	assert.equal(built.manifest.output.additionalProperties, false);
 	assert.ok((built.manifest.output.required as string[]).includes("outcome"));
 	assert.ok(built.files.instructions.includes("Do the thing."));
@@ -765,7 +769,7 @@ test("adding an agent tool writes AGENT.md and WORKFLOW.md", async () => {
 	assert.equal(loaded.manifest?.name, "added_agent");
 });
 
-test("runtime registers packaged tools and tool_add lists them", async () => {
+test("runtime registers compact packaged tools and keeps management actions internal", async () => {
 	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
 	const cwd = path.join(tempRoot, "integration");
 	await fs.mkdir(cwd, { recursive: true });
@@ -809,10 +813,22 @@ test("runtime registers packaged tools and tool_add lists them", async () => {
 		assert.equal(toolAdd!.parameters.properties?.jobId, undefined);
 		assert.equal(keeper!.parameters.properties?.mode, undefined);
 		assert.equal(keeper!.parameters.properties?.jobId, undefined);
-		assert.ok(keeper!.parameters.properties?.allowRepair);
+		assert.deepEqual(Object.keys(toolAdd!.parameters.properties ?? {}), ["request"]);
+		assert.deepEqual(Object.keys(keeper!.parameters.properties ?? {}), ["request", "allowRepair"]);
+		assert.ok(!toolAdd!.description.includes("mode=sync"));
+		assert.ok(!keeper!.description.includes("mode=sync"));
+		const manage = (runtime as unknown as {
+			toolAddManageTool(cwd: string): { execute: Function };
+		}).toolAddManageTool(cwd);
+		const managed = await manage.execute("call-manage", { action: "list" });
+		assert.equal(managed.details.status, "ok");
+		assert.deepEqual(
+			managed.details.result.tools.map((tool: { name: string }) => tool.name).sort(),
+			["service_keeper", "tool_add"],
+		);
 		const startResponse = (await toolAdd!.execute(
 			"call-start",
-			{ action: "list", mode: "start" },
+			{ request: "列出已注册的工具。", mode: "start" },
 			undefined,
 			undefined,
 			{ isIdle: () => true, cwd, hasUI: false },
@@ -821,7 +837,7 @@ test("runtime registers packaged tools and tool_add lists them", async () => {
 		assert.ok(startResponse.structuredContent.summary.includes("does not match"));
 		const syncResponse = (await toolAdd!.execute(
 			"call-sync",
-			{ action: "list" },
+			{ request: "列出已注册的工具。" },
 			undefined,
 			undefined,
 			{ isIdle: () => true, cwd, hasUI: false },
@@ -871,14 +887,17 @@ test("create_tool validates the name and requirements before calling the builder
 	assert.ok(noPlan.summary.includes("plan"));
 });
 
-test("tool_add manifest exposes the create_tool action and requirements field", async () => {
+test("tool_add keeps its public request separate from the management schema", async () => {
 	const { loadTools } = await import("../src/discovery/manifest.ts");
+	const { TOOL_ADD_MANAGE_SCHEMA } = await import("../basic-tools/tool_add/manager.ts");
 	const { tools } = await loadTools([{ root: "basic-tools", scope: "package" }]);
-	const toolAdd = tools.find((entry) => entry.manifest.name === "tool_add")?.manifest;
-	const input = toolAdd?.input as { properties?: Record<string, { enum?: string[] }>; required?: string[] };
-	assert.ok(input.properties?.action.enum?.includes("create_tool"));
-	assert.ok(input.properties?.requirements);
-	assert.deepEqual(input.required, ["action"]);
+	const toolAdd = tools.find((entry) => entry.manifest.name === "tool_add")!.manifest;
+	assert.deepEqual(toolAdd.input.required, ["request"]);
+	assert.equal(toolAdd.input.properties?.action, undefined);
+	assert.ok(TOOL_ADD_MANAGE_SCHEMA.properties?.action.enum?.includes("create_tool"));
+	assert.ok(TOOL_ADD_MANAGE_SCHEMA.properties?.requirements);
+	assert.ok(TOOL_ADD_MANAGE_SCHEMA.properties?.plan);
+	assert.deepEqual(TOOL_ADD_MANAGE_SCHEMA.required, ["action"]);
 });
 
 test("tool_add resolves its packaged agent without a user install", async () => {
@@ -895,6 +914,7 @@ test("tool_add resolves its packaged agent without a user install", async () => 
 	});
 	assert.equal(resolved.agent?.source, "embedded");
 	assert.equal(resolved.agent?.name, "tool_add");
+	assert.equal(resolved.agent?.contract, "^2.0.0");
 	assert.ok(resolved.agent?.instructions.includes("tool_add_manage"));
 	assert.ok(resolved.agent?.workflow.includes("submit_result"));
 });
@@ -1061,6 +1081,7 @@ test("tool_add applies a plan supplied by its worker", async () => {
 	const dir = path.join(agentDir, "tools", "apply_demo");
 	const loaded = await readManifestFile(path.join(dir, "TOOL.json"));
 	assert.equal(loaded.manifest?.whenToUse?.[0], "需要验证计划写入流程");
+	assert.deepEqual(loaded.manifest?.execution, { defaultMode: "sync", notifyOnIdle: false, asyncByDefault: false });
 	assert.ok((await fs.readFile(path.join(dir, "AGENT.md"), "utf8")).includes("submit_result"));
 	assert.ok((await fs.readFile(path.join(dir, "WORKFLOW.md"), "utf8")).includes("submit_result"));
 	const bundled = await fs.readdir(path.join(dir, "skill"));

@@ -15,7 +15,7 @@ import { ServiceSupervisor } from "../services/supervisor.ts";
 import { AgentWorker } from "../agents/worker.ts";
 import { resolveAgent } from "../agents/resolver.ts";
 import { executeDirectTool } from "./direct-executor.ts";
-import { ToolAddManager } from "../../basic-tools/tool_add/manager.ts";
+import { TOOL_ADD_MANAGE_SCHEMA, ToolAddManager } from "../../basic-tools/tool_add/manager.ts";
 import {
 	InlineProgress,
 	ProgressWatcher,
@@ -29,7 +29,7 @@ import {
 import type {
 	JobRecord,
 	JobToolInput,
-	ToolAddInput,
+	ToolAddManageInput,
 	ToolEnvelope,
 	ToolManifest,
 	ToolMode,
@@ -109,13 +109,11 @@ function formatToolDescription(manifest: ToolManifest): string {
 	const lines = [manifest.description.trim()];
 	if (manifest.whenToUse?.length) lines.push(`Use when: ${manifest.whenToUse.join("; ")}`);
 	if (manifest.notFor?.length) lines.push(`Do not use for: ${manifest.notFor.join("; ")}`);
-	if (manifest.kind === "agent") {
+	if (manifest.kind === "agent" && !manifest.handler) {
 		lines.push(
-			manifest.handler
-				? "This tool runs its worker in process and supports only mode=sync."
-				: manifest.execution?.asyncByDefault === false
-					? "This tool delegates to a persistent worker and runs one job to completion."
-					: "This tool delegates to a persistent worker. It accepts mode=start to return a job handle.",
+			manifest.execution?.asyncByDefault === false
+				? "This tool delegates to a persistent worker and runs one job to completion."
+				: "This tool delegates to a persistent worker. It accepts mode=start to return a job handle.",
 		);
 	}
 	return lines.join("\n");
@@ -329,16 +327,7 @@ export class ToolRuntime {
 	}
 
 	private toolAddManageTool(cwd: string): ToolDefinition {
-		const properties = { ...(this.tools.get("tool_add")?.manifest.input.properties ?? {}) };
-		properties.plan = {
-			type: "object",
-			description: "Complete tool plan. Required for create_tool; optional for convert_skill.",
-		};
-		const parameters = Type.Unsafe({
-			...this.tools.get("tool_add")?.manifest.input,
-			type: "object",
-			properties,
-		});
+		const parameters = Type.Unsafe(TOOL_ADD_MANAGE_SCHEMA);
 		return {
 			name: "tool_add_manage",
 			label: "Manage tools",
@@ -373,7 +362,7 @@ export class ToolRuntime {
 						isError: true,
 					};
 				}
-				const envelope = await this.toolAdd.handle(request as unknown as ToolAddInput, {
+				const envelope = await this.toolAdd.handle(request as unknown as ToolAddManageInput, {
 					cwd,
 					isProjectTrusted: () => this.options.projectTrusted,
 				});

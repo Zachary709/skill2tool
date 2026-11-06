@@ -202,6 +202,12 @@ Each spawn writes `state.json` with the process id, cwd, and start time under th
 
 ### Tool daemon maintenance
 
+`service_keeper` accepts `request` and optional `allowRepair`; name the service and operation in the request. `allowRepair` defaults to false for state and log inspection. Only an explicit true permits one start or restart.
+
+```json
+{ "request": "检查 adaptive-service，必要时恢复一次。", "allowRepair": true }
+```
+
 A tool's daemon services start eagerly when the tool is registered. The runtime owns the protocol client, so a restart must run inside the runtime. The `service_keeper` worker therefore runs in process and receives an extra `service_keeper_manage` tool:
 
 | Action | Arguments | Result |
@@ -388,22 +394,19 @@ A packaged tool runs with the `package` scope. Its daemons start in the tool dir
 
 ## tool_add
 
-`tool_add` is an agent tool. One job handles one management request: the worker reads the skill or the stated requirement, builds a complete tool plan, and applies it through an in-process management action. Because it changes the live tool registry, it runs in process and supports only `mode: "sync"`.
+`tool_add` accepts one natural language `request` containing the tool name, source path, requirements, and scope. The worker extracts and executes the internal management action. Scope defaults to `project`; use `user` only when explicitly requested. It runs synchronously in the current process.
 
 The worker uses the prompt files in `basic-tools/tool_add/agent/`, and the read-only tools plus `tool_add_manage`. `tool_add_manage` is the in-process action backed by `manager.ts`; the worker is the only caller that supplies a `plan`.
 
-### Actions
+### Internal actions
 
-`list`, `inspect`, `validate`, `add`, `convert_skill`, `create_tool`, `disable`, `enable`.
+The worker maps `request` to `list`, `inspect`, `validate`, `add`, `convert_skill`, `create_tool`, `disable`, or `enable`, then calls `tool_add_manage`.
 
 ### Convert a skill
 
 ```json
 {
-  "action": "convert_skill",
-  "source": { "type": "skill", "path": "/path/to/SKILL.md" },
-  "scope": "project",
-  "activate": true
+  "request": "把 /path/to/SKILL.md 转换成项目工具。"
 }
 ```
 
@@ -413,29 +416,29 @@ The worker reads the skill and its supporting files, designs one plan from the s
 
 ```json
 {
-  "action": "create_tool",
-  "name": "log_tail_summary",
-  "requirements": "汇总一个日志文件里最近的错误行。输入是日志路径和行数，结果是错误总数与每个错误码的次数。",
-  "scope": "project",
-  "activate": true
+  "request": "创建项目工具 log_tail_summary，汇总日志文件最近的错误行。输入是日志路径和行数，返回错误总数与各错误码次数。"
 }
 ```
 
-The calling agent states the requirement; `tool_add` does not read the chat history. The requirement is the complete brief: what the tool does, the input, the result, and any script, service, or path the tool must use. The worker designs the plan and applies it the same way as a conversion.
+The caller states the complete requirement in `request`; `tool_add` does not read the chat history. The requirement is the complete brief: what the tool does, the input, the result, and any script, service, or path the tool must use. The worker designs the plan and applies it the same way as a conversion.
+
+Creation and conversion keep the public interface small: one short capability sentence and only the inputs the caller must supply or control independently. General workers prefer one natural language `request` or `task` field containing the task and necessary background; a tool that only needs a path can expose `path` directly. Parameter descriptions stay brief, and necessary validation and authorization fields remain explicit. Procedures, script options, environment configuration, and examples belong in the tool's internal `AGENT.md`, `WORKFLOW.md`, and `EXAMPLES.md`. Keep `whenToUse` to necessary selection situations and use `notFor` only for a real ambiguity or safety boundary.
+
+Newly generated tools run synchronously by default, without `mode`, `timeoutMs`, or `jobId`. When the skill's behavior or the requirement needs background execution, set `execution.asyncByDefault: true` in the plan and let the runtime add the job control parameters.
 
 A generated tool must carry:
 
-- a selection description and at least one `whenToUse` entry;
-- a closed input schema with typed, described fields and a non-empty `required` list;
+- a short capability description and at least one `whenToUse` entry;
+- a closed input schema with only necessary, typed, briefly described fields and a non-empty `required` list;
 - a closed result schema with typed, described fields, `maxLength` on every string, and `maxItems` on every array;
 - a worker system prompt and a workflow that ends with `submit_result`;
 - services only when the skill or the requirement names a matching script or server. Daemons are declared with `lifecycle: "persistent"` and `start: "eager"`, so they run continuously and are started with the tool.
 
-The manager rejects a plan that misses any of these and returns the exact problems, so the worker can correct the plan and call `tool_add_manage` again. When `convert_skill` is called without a plan, the manager falls back to the deterministic generator. `create_tool` requires a plan.
+The manager rejects a plan that misses any of these and returns the exact problems, so the worker can correct the plan and call `tool_add_manage` again. When `convert_skill` is called without a plan, the manager falls back to the deterministic generator with only a `task` input and synchronous execution. `create_tool` requires a plan.
 
 The generated tool uses the permissions proposed by the plan. The plan defaults to read-only; edit `TOOL.json` to allow `bash`, `edit`, or `write`.
 
-`add` accepts `instructions`, `workflow`, and `examples` strings. If an agent tool's files are missing, `tool_add` writes safe defaults. A source path may point to a directory containing `TOOL.json`; the whole directory is copied.
+To add a tool, give its TOOL.json or tool directory path in `request`. The source directory is copied, and the manager supplies missing agent documentation. To validate a tool, the worker reads the named TOOL.json and passes the manifest object to the manager.
 
 ## Security
 

@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { readManifestFile } from "../../src/discovery/manifest.ts";
 import { validateManifest, validateValue } from "../../src/contracts/schema.ts";
-import type { JsonSchema, ToolAddInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
+import type { JsonSchema, ToolAddManageInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
 import { TOOL_PLAN_SCHEMA, planErrors, type ToolPlan } from "./plan.ts";
 import { registerExternalServices } from "./registry.ts";
 import {
@@ -24,6 +24,25 @@ export interface ToolAddHost {
 	isReserved(name: string): boolean;
 }
 
+export const TOOL_ADD_MANAGE_SCHEMA: JsonSchema = {
+	type: "object",
+	properties: {
+		action: {
+			type: "string",
+			enum: ["list", "inspect", "validate", "add", "convert_skill", "create_tool", "disable", "enable"],
+			description: "管理动作。",
+		},
+		name: { type: "string", description: "工具名称。" },
+		scope: { type: "string", enum: ["project", "user"], description: "写入位置，默认 project。" },
+		sourcePath: { type: "string", description: "TOOL.json、工具目录或 SKILL.md 路径。" },
+		manifest: { type: "object", description: "validate 或 add 使用的工具清单。" },
+		requirements: { type: "string", maxLength: 8000, description: "创建工具的完整需求。" },
+		plan: { type: "object", description: "完整工具方案；create_tool 必填，convert_skill 可选。" },
+	},
+	required: ["action"],
+	additionalProperties: false,
+};
+
 type AddContext = { cwd: string; isProjectTrusted(): boolean };
 
 const DEFAULT_INPUT: JsonSchema = {
@@ -32,12 +51,7 @@ const DEFAULT_INPUT: JsonSchema = {
 		task: {
 			type: "string",
 			maxLength: 8000,
-			description: "The task for the worker, including everything it needs to start.",
-		},
-		context: {
-			type: "string",
-			maxLength: 4000,
-			description: "Optional background from the caller, such as an error message.",
+			description: "要完成的任务及必要背景。",
 		},
 	},
 	required: ["task"],
@@ -105,7 +119,7 @@ async function copySkillBundle(sourceDir: string, targetDir: string): Promise<vo
 export class ToolAddManager {
 	constructor(private readonly host: ToolAddHost) {}
 
-	async handle(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+	async handle(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
 		switch (input.action) {
 			case "list":
 				return this.list();
@@ -136,13 +150,13 @@ export class ToolAddManager {
 		};
 	}
 
-	private inspect(input: ToolAddInput): ToolEnvelope {
+	private inspect(input: ToolAddManageInput): ToolEnvelope {
 		const manifest = input.name ? this.host.getTool(input.name) : undefined;
 		if (!manifest) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
 		return { status: "ok", summary: `Tool ${manifest.name}.`, result: inspectResult(manifest) };
 	}
 
-	private validate(input: ToolAddInput): ToolEnvelope {
+	private validate(input: ToolAddManageInput): ToolEnvelope {
 		if (!input.manifest) return { status: "failed", summary: "manifest is required for validate." };
 		const result = validateManifest(input.manifest);
 		return {
@@ -153,7 +167,7 @@ export class ToolAddManager {
 		};
 	}
 
-	private async setEnabled(input: ToolAddInput): Promise<ToolEnvelope> {
+	private async setEnabled(input: ToolAddManageInput): Promise<ToolEnvelope> {
 		const manifest = input.name ? this.host.getTool(input.name) : undefined;
 		if (!manifest) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
 		if (manifest.scope === "package") {
@@ -176,7 +190,7 @@ export class ToolAddManager {
 			: path.join(ctx.cwd, ".pi", "tools");
 	}
 
-	private async add(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+	private async add(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
 		let manifest: ToolManifest;
 		let sourceDir: string | undefined;
 		if (input.manifest) {
@@ -237,7 +251,7 @@ export class ToolAddManager {
 		};
 	}
 
-	private async convertSkill(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+	private async convertSkill(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
 		const skillPath = input.sourcePath;
 		if (!skillPath) return { status: "failed", summary: "sourcePath is required for convert_skill." };
 		const absolute = path.resolve(skillPath);
@@ -306,7 +320,7 @@ export class ToolAddManager {
 
 		const built = plan
 			? this.manifestFromPlan(plan, name, scope, dir)
-			: this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
+			: this.manifestFromFallback(parsed.frontmatter, parsed.body, name, scope, dir);
 		let usedPlan = Boolean(plan);
 		await fs.mkdir(dir, { recursive: true });
 		const sourceRoot = path.dirname(path.dirname(absolute));
@@ -323,7 +337,7 @@ export class ToolAddManager {
 		let validation = validateManifest(manifest, dir);
 		if (plan && (!validation.manifest || validation.errors.length > 0)) {
 			warnings.push(`builder plan produced an invalid manifest; using deterministic conversion: ${validation.errors.join("; ")}`);
-			const fallback = this.manifestFromFallback(parsed.frontmatter, parsed.body, absolute, name, scope, dir);
+			const fallback = this.manifestFromFallback(parsed.frontmatter, parsed.body, name, scope, dir);
 			built.files = fallback.files;
 			manifest = fallback.manifest;
 			usedPlan = false;
@@ -353,7 +367,7 @@ export class ToolAddManager {
 		};
 	}
 
-	private async createTool(input: ToolAddInput, ctx: AddContext): Promise<ToolEnvelope> {
+	private async createTool(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
 		const name = input.name ? safeToolName(input.name) : "";
 		if (!name) return { status: "failed", summary: "name is required for create_tool." };
 		const requirements = input.requirements?.trim() ?? "";
@@ -434,6 +448,7 @@ export class ToolAddManager {
 		scope: "project" | "user",
 		dir: string,
 	): { manifest: ToolManifest; files: { instructions: string; workflow: string; examples?: string } } {
+		const asyncByDefault = plan.execution?.asyncByDefault ?? false;
 		const manifest: ToolManifest = {
 			name,
 			version: "0.1.0",
@@ -464,7 +479,11 @@ export class ToolAddManager {
 				network: plan.permissions?.network ?? false,
 			},
 			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
-			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
+			execution: {
+				defaultMode: asyncByDefault ? "start" : "sync",
+				notifyOnIdle: asyncByDefault,
+				asyncByDefault,
+			},
 			exposure: "direct",
 			namespace: "tool",
 			dir,
@@ -486,7 +505,6 @@ export class ToolAddManager {
 	private manifestFromFallback(
 		frontmatter: Record<string, unknown>,
 		body: string,
-		absolute: string,
 		name: string,
 		scope: "project" | "user",
 		dir: string,
@@ -495,9 +513,9 @@ export class ToolAddManager {
 		files: { instructions: string; workflow: string };
 	} {
 		const frontmatterDescription =
-			typeof frontmatter.description === "string" && frontmatter.description.trim().length >= 20
+			typeof frontmatter.description === "string" && frontmatter.description.trim().length >= 12
 				? frontmatter.description.trim()
-				: `Skill-backed tool converted from ${absolute}. Use when the task matches the original skill description.`;
+				: `Run the bundled ${name} skill.`;
 		const whenToUse = stringArray(frontmatter.whenToUse);
 		const notFor = stringArray(frontmatter.notFor);
 		const manifest: ToolManifest = {
@@ -527,7 +545,7 @@ export class ToolAddManager {
 			},
 			permissions: { read: true, write: false, bash: false, network: false },
 			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
-			execution: { defaultMode: "start", notifyOnIdle: true, asyncByDefault: true },
+			execution: { defaultMode: "sync", notifyOnIdle: false, asyncByDefault: false },
 			exposure: "direct",
 			namespace: "tool",
 			dir,

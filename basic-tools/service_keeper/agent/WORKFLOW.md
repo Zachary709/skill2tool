@@ -1,13 +1,13 @@
 # Workflow
 
-1. Decide the target kind:
+1. Read `request` and `allowRepair`. Extract the target and decide its kind:
    - a tool daemon declared by an installed tool;
    - an external service in `<Agent directory>/services/registry.json`.
-   When the request does not name a known service, start with
-   `service_keeper_manage` `action: "list"` and compare the names.
-2. For an external service, read `task`, `service`, and `allowRepair`, then read
-   the registry. With no `service`, take every registered service. Unknown name:
-   submit `needs_input` with the registered names.
+   Use `service_keeper_manage` `action: "list"` and the registry to match the
+   named target. An unknown or ambiguous name requires `needs_input`.
+2. For an external service, read the registry and select the target named in
+   `request`. With no named target, check all registered services and tool
+   daemons. Only an explicit `allowRepair: true` permits recovery actions.
 3. For an external service, collect read-only state:
    - the registered `status` command and its exit code;
    - the two registered HTTP checks with
