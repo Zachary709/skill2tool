@@ -30,7 +30,9 @@ Apply these rules to both `convert_skill` and `create_tool`:
 - Expose the fewest input fields that preserve the requested behavior. For a general worker, prefer one natural language `request` or `task` string containing the task and necessary background, as in `ssh_manager` and `tailscale_manager`.
 - A tool that only needs a file path or another precise value can expose that value directly. Add separate fields only when the caller must control them independently or when validation or explicit authorization needs them. Preserve required safety controls.
 - Resolve known paths, environment settings, service configuration, and script options inside the worker. Do not copy the skill's command line options into the public schema. Do not add generic `context`, `config`, or `options` fields that duplicate the request, or require serialized JSON inside a request string.
-- Keep each parameter description to a short phrase that makes the value unambiguous. Keep output fields limited to what the caller needs.
+- For a natural language `request` or `task`, use the parameter description `直接写用户任务及必要条件，不扩写工具规则。`. When the user's task is complete, callers pass that task sentence directly. Add only necessary context the worker cannot obtain; preserve explicit business requirements, paths, and authorization limits. Do not expand the task into an operating guide or invent extra scope, verification, or output requirements. Complex user requirements remain complete.
+- Keep configured procedures, strategies, verification, output conventions, and safety rules inside the worker instructions. A concise request does not need to repeat them. Show this division in the generated examples; do not add a request rewriting model or shorten the actual input text.
+- Keep other parameter descriptions to a short phrase that makes the value unambiguous. Keep output fields limited to what the caller needs.
 - Generated tools run synchronously by default. Set `execution.asyncByDefault: true` only when the requirement or the skill's actual behavior needs background execution and job control. The runtime adds `mode`, `timeoutMs`, and `jobId` for that case; never duplicate those fields in `input`.
 - Before applying the plan, remove any field or sentence whose removal leaves the tool usable, correctly selectable, and safe. Preserve the complete skill behavior in the worker instructions and supporting files.
 
@@ -48,6 +50,9 @@ The plan is a JSON object with these fields:
 - `agent.instructions`: the worker system prompt for the new tool;
 - `agent.workflow`: ordered steps that end with `submit_result`, at least 80 characters;
 - `agent.tools`: the worker tools, a subset of read, grep, find, ls, edit, write, bash;
+- `agent.thinkingLevel`: optional preferred thinking level; unsupported preferences use the caller's settings;
+- `agent.concurrency`: `serial` by default; use `parallel` for independent requests that may safely overlap, such as read-only searches;
+- `agent.context`: optional `budgetTokens` and `keepRecentTokens`; omitted settings use 272000 and 6000. Keep recent tokens smaller than the budget, and change the default budget only when the requirements explicitly request it. Parallel jobs start from completed history and publish their result when done; active job transcripts remain isolated;
 - `agent.examples`: optional examples text;
 - `services`: optional runtime services, only from an existing script or server;
 - `externalServices`: optional systemd user units the skill depends on but does not contain;

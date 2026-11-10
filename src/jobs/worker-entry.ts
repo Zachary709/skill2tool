@@ -8,7 +8,7 @@ import { readManifestFile } from "../discovery/manifest.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import type { JobRecord, ToolEnvelope } from "../types.ts";
 import { appendJobEvent, atomicWrite, jobDir, readJobRecord, writeJobRecord, writeJobResult } from "./store.ts";
-import { acquireWorkerLock } from "./lock.ts";
+import { acquireWorkerLock, type WorkerLock } from "./lock.ts";
 
 function jobRootFromPath(jobPath: string): string {
 	return path.dirname(path.dirname(jobPath));
@@ -77,9 +77,13 @@ async function main(): Promise<void> {
 
 	let envelope: ToolEnvelope;
 	let usage: Record<string, unknown> | undefined;
-	let releaseLock: (() => Promise<void>) | undefined;
+	let sessionFile: string | undefined;
+	let sessionId: string | undefined;
+	let releaseLock: WorkerLock | undefined;
 	try {
-		releaseLock = await acquireWorkerLock(record.cwd, manifest.name, controller.signal);
+		if (manifest.agent?.concurrency !== "parallel") {
+			releaseLock = await acquireWorkerLock(path.join(root, ".locks", manifest.name), controller.signal);
+		}
 		const resolution = await resolveAgent({
 			tool: manifest,
 			cwd: record.cwd,
@@ -118,6 +122,9 @@ async function main(): Promise<void> {
 					void fs.appendFile(progressPath, `${JSON.stringify(entry)}\n`).catch(() => {});
 				},
 				initial.model,
+				[],
+				{},
+				initial.thinkingLevel,
 			);
 			try {
 				const params = record.input as {
@@ -131,10 +138,12 @@ async function main(): Promise<void> {
 						input: params.input,
 						context: params.context,
 					},
-					controller.signal,
+					releaseLock?.signal ?? controller.signal,
 				);
 				envelope = result.envelope;
 				usage = result.usage;
+				sessionFile = result.sessionFile;
+				sessionId = result.sessionId;
 				if (result.warnings.length > 0) {
 					envelope.warnings = [...(envelope.warnings ?? []), ...result.warnings];
 				}
@@ -151,7 +160,7 @@ async function main(): Promise<void> {
 		process.removeListener("SIGTERM", abort);
 		process.removeListener("SIGINT", abort);
 		await supervisor.close();
-		await releaseLock?.();
+		await releaseLock?.release();
 	}
 
 	const state =
@@ -167,6 +176,8 @@ async function main(): Promise<void> {
 			state,
 			result: { ...envelope, jobId },
 			usage,
+			sessionFile,
+			sessionId,
 			artifacts: envelope.artifacts,
 			message: envelope.summary,
 			error: state === "failed" ? envelope.summary : undefined,

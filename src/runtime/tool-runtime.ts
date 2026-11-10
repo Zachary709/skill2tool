@@ -10,6 +10,7 @@ import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadTools, type ToolLoadDiagnostic, type ToolSource } from "../discovery/manifest.ts";
 import { validateValue, envelopeSchema } from "../contracts/schema.ts";
+import { callerPromptGuidelines, compactTaskInputSchema } from "../contracts/caller.ts";
 import { JobManager } from "../jobs/manager.ts";
 import { ServiceSupervisor } from "../services/supervisor.ts";
 import { AgentWorker } from "../agents/worker.ts";
@@ -27,6 +28,7 @@ import {
 	type ProgressUpdateSink,
 } from "../observability/progress.ts";
 import type {
+	AgentConfig,
 	JobRecord,
 	JobToolInput,
 	ToolAddManageInput,
@@ -67,8 +69,9 @@ function packageToolsRoot(): string {
 }
 
 function facadeInputSchema(manifest: ToolManifest) {
+	const input = manifest.kind === "agent" ? compactTaskInputSchema(manifest.input) : manifest.input;
 	const properties: Record<string, unknown> = {
-		...(manifest.input.properties ?? {}),
+		...(input.properties ?? {}),
 	};
 	const supportsJobs = manifest.kind === "agent" && !manifest.handler && manifest.execution?.asyncByDefault !== false;
 	if (supportsJobs) {
@@ -88,7 +91,7 @@ function facadeInputSchema(manifest: ToolManifest) {
 		};
 	}
 	const schema: Record<string, unknown> = {
-		...manifest.input,
+		...input,
 		type: "object",
 		properties,
 	};
@@ -234,7 +237,7 @@ export class ToolRuntime {
 			label: manifest.name,
 			description: formatToolDescription(manifest),
 			promptSnippet: manifest.description,
-			promptGuidelines: manifest.whenToUse ?? [],
+			promptGuidelines: callerPromptGuidelines(manifest),
 			parameters: Type.Unsafe(facadeInputSchema(manifest)),
 			outputSchema: envelopeSchema(manifest.output),
 			exposure: manifest.exposure ?? "direct",
@@ -262,6 +265,8 @@ export class ToolRuntime {
 			cwd?: string;
 			isProjectTrusted?(): boolean;
 			ui?: ProgressUi;
+			model?: { provider: string; id: string };
+			thinkingLevel?: AgentConfig["thinkingLevel"];
 		},
 		extraTools: ToolDefinition[],
 	): Promise<ToolEnvelope> {
@@ -302,8 +307,10 @@ export class ToolRuntime {
 				}
 				this.options.log(`[${manifest.name}] ${entry.kind}: ${entry.text.slice(0, 300)}`);
 			},
-			this.defaultModel(),
+			this.callerSettings(ctx).model,
 			extraTools,
+			{},
+			this.callerSettings(ctx).thinkingLevel,
 		);
 		try {
 			const result = await worker.run(
@@ -314,7 +321,11 @@ export class ToolRuntime {
 				},
 				signal,
 			);
-			return result.envelope;
+			return {
+				...result.envelope,
+				usage: result.usage,
+				...(result.warnings.length ? { warnings: [...(result.envelope.warnings ?? []), ...result.warnings] } : {}),
+			};
 		} catch (error) {
 			return {
 				status: "failed",
@@ -478,6 +489,23 @@ export class ToolRuntime {
 		}
 	}
 
+	private callerSettings(ctx: {
+		model?: { provider: string; id: string };
+		thinkingLevel?: AgentConfig["thinkingLevel"];
+	}) {
+		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : this.defaultModel();
+		let thinkingLevel: AgentConfig["thinkingLevel"] = ctx.thinkingLevel ?? this.options.pi.getThinkingLevel?.();
+		if (thinkingLevel === undefined) {
+			this.settingsManager ??= SettingsManager.create(this.options.cwd, this.options.agentDir);
+			const slash = model?.indexOf("/") ?? -1;
+			thinkingLevel = model && slash >= 0
+				? this.settingsManager.getModelThinkingLevel(model.slice(0, slash), model.slice(slash + 1))
+				: undefined;
+			thinkingLevel ??= this.settingsManager.getDefaultThinkingLevel();
+		}
+		return { model, thinkingLevel };
+	}
+
 	private progressRoot(): string {
 		return path.join(this.options.cwd, ".pi", "jobs");
 	}
@@ -512,6 +540,8 @@ export class ToolRuntime {
 			cwd?: string;
 			ui?: ProgressUi;
 			hasUI?: boolean;
+			model?: { provider: string; id: string };
+			thinkingLevel?: AgentConfig["thinkingLevel"];
 		},
 		onUpdate?: ProgressUpdateSink,
 	) {
@@ -601,7 +631,7 @@ export class ToolRuntime {
 			cwd: ctx.cwd ?? this.options.cwd,
 			projectTrusted: this.options.projectTrusted,
 			requester: { sessionId: ctx.sessionManager?.getSessionId?.(), idle: ctx.isIdle() },
-			model: this.defaultModel(),
+			...this.callerSettings(ctx),
 		});
 		this.watchProgress(job.id, ctx.ui, onUpdate);
 

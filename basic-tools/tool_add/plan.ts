@@ -1,4 +1,5 @@
-import type { JsonSchema, ServiceDefinition } from "../../src/types.ts";
+import type { AgentConfig, AgentContextConfig, JsonSchema, ServiceDefinition } from "../../src/types.ts";
+import { AGENT_CONTEXT_SCHEMA } from "../../src/agents/policy.ts";
 
 export interface ToolPlan {
 	name: string;
@@ -14,6 +15,9 @@ export interface ToolPlan {
 		examples?: string;
 		tools?: string[];
 		maxTurns?: number;
+		thinkingLevel?: AgentConfig["thinkingLevel"];
+		concurrency?: AgentConfig["concurrency"];
+		context?: AgentContextConfig;
 	};
 	services?: Record<string, ServiceDefinition>;
 	externalServices?: ExternalServiceSpec[];
@@ -52,7 +56,7 @@ export const TOOL_PLAN_SCHEMA: JsonSchema = {
 		notFor: { type: "array", items: { type: "string" }, description: "Only necessary exclusions." },
 		input: {
 			type: "object",
-			description: "Closed JSON Schema with the fewest necessary fields; prefer one request or task string.",
+			description: "Closed JSON Schema; request/task describes the goal and necessary conditions. Keep configured procedures in worker instructions and preserve explicit requirements and authorization.",
 		},
 		output: { type: "object", description: "Closed JSON Schema for only the business result the caller needs." },
 		execution: {
@@ -74,6 +78,9 @@ export const TOOL_PLAN_SCHEMA: JsonSchema = {
 				examples: { type: "string" },
 				tools: { type: "array", items: { type: "string" } },
 				maxTurns: { type: "number" },
+				thinkingLevel: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] },
+				concurrency: { type: "string", enum: ["serial", "parallel"] },
+				context: AGENT_CONTEXT_SCHEMA,
 			},
 		},
 		services: { type: "object" },

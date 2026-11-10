@@ -220,16 +220,20 @@ A tool's daemon services start eagerly when the tool is registered. The runtime 
 
 ## Worker model
 
-A worker uses the default model from pi settings (`defaultProvider` and `defaultModel`) and nothing else. Tool manifests and agent files no longer select a model. The job record keeps the resolved model as `provider/id`, so every job states which model its worker used. When settings set no default, the runtime default applies.
+A worker uses the caller's current model and thinking level. When the caller has no session model, the runtime reads `defaultProvider` and `defaultModel` from Pi settings. Tool manifests and agent files do not select another model. Job records store the caller's model and thinking level; usage records include the worker's effective thinking level and any fallback reason.
+
+`agent.thinkingLevel` sets a tool's preferred level. `web_search` prefers `low`. If model capabilities exclude that level, it uses the caller's settings immediately. If the API explicitly rejects `low`, the worker continues the same job once with the caller's thinking setting, preserving completed operations. Authentication, network, and unrelated request errors do not trigger this fallback.
 
 Workers use the scope names `user` and `project`.
 
 | Setting | Default | `project` | `user` |
 | --- | --- | --- | --- |
-| `agent.sessionScope` | `project` | Worker key is fixed to the project directory, so every project gets its own session. | The key drops the project path: one worker session is shared by every project, with the tool directory as working directory. |
+| `agent.sessionScope` | `project` | Worker history is keyed by project directory. | The key drops the project path: all projects share worker history, with the tool directory as working directory. |
 | `agent.memoryScope` | `project` | Memory stays at `tool-workers/<key>/memory.md`. | Memory is shared at `~/.pi/agent/tool-memory/<tool>.md`. |
 
 The older value `global` is still accepted and reads as `user`, with a deprecation warning.
+
+`agent.concurrency` defaults to `serial`. A tool with `"concurrency": "parallel"` starts each request in an independent session from a snapshot containing completed tasks. An active request does not enter another request's snapshot. Completion immediately appends the task, typed result, source evidence, optional handoff, and archive reference to shared history. Locks cover snapshot creation and publication only; model requests run concurrently. Each request gets its own intermediate directory. Tools that manage live runtime state require serial execution.
 
 ## Input and result contracts
 
@@ -239,6 +243,16 @@ Both sides are closed by default.
 
 - The facade rejects any key that the manifest does not declare, in addition to JSON Schema validation. A caller can send only the declared fields.
 - `"additionalProperties": false` keeps the contract explicit; the loader warns when it is missing.
+- For natural language `request` and `task` fields, pass a complete user task directly. Add only necessary context the worker cannot obtain, preserving explicit user requirements, paths, and authorization limits. Do not expand the task into an operating guide or invent extra scope, verification, output, or safety requirements. Keep complex user requirements complete.
+- The builder normalizes these parameter descriptions. Registration adds caller `promptGuidelines` that name the tool. Request text is neither truncated nor rewritten, no rewriting model is called, and authorization fields and existing validation remain unchanged.
+
+A search request can simply be:
+
+```json
+{"request":"查询英雄联盟 S16 当前赛况。"}
+```
+
+The worker applies its existing search, verification, and result instructions.
 
 ### Result
 
@@ -246,13 +260,13 @@ Both sides are closed by default.
 
 - keys not declared in a typed object are rejected;
 - a string field without `maxLength` is limited to 4000 characters;
-- more than 8 newlines in a short string field is treated as a log dump;
+- multiline answers, lists, tables, and quotations are allowed within the string length limits;
 - arrays are limited to 50 items unless `maxItems` says otherwise;
 - `summary` is at most 300 characters and at most three lines.
 
-On violation the worker receives the exact errors and must resubmit a compressed result. Process narration, thinking, tool transcripts, commands, and logs therefore cannot reach the caller through a result field.
+On violation the worker receives the exact errors and must resubmit a result that conforms to the contract. Worker instructions require conclusions and supporting facts; process narration, thinking, tool transcripts, commands, and logs stay in the worker session and progress records.
 
-An untyped object property is treated as a bag: its keys are not checked, but its string values still pass the size and log limits. The loader warns about any `type: "object"` output field without `properties`.
+An untyped object property is treated as a bag: its keys are not checked, but its string values still pass the size limits. The loader warns about any `type: "object"` output field without `properties`.
 
 ### Builder requirements
 
@@ -344,21 +358,35 @@ The worker system prompt includes the tool contract, `AGENT.md`, and `WORKFLOW.m
 
 ## Worker context
 
-Workers use Pi's automatic compaction. Compaction is threshold-based, not per job.
+Workers use Pi's automatic compaction with a per-tool budget:
 
-```text
-reserveTokens: 20000
-keepRecentTokens: 30000
+```json
+{
+  "agent": {
+    "context": {
+      "budgetTokens": 272000,
+      "keepRecentTokens": 6000
+    }
+  }
+}
 ```
 
-On compaction, the summary is written to the worker memory file. Each job also appends a short record to `journal.jsonl`. The fixed system prompt is never rewritten by compaction.
+These are the defaults for omitted settings. `budgetTokens` is the input-context threshold; `keepRecentTokens` controls the recent history retained with the summary and must be smaller than the budget. The runtime derives `reserveTokens` for each model so compaction starts at the tool budget, while leaving the model's physical context window unchanged. A single large tool response can temporarily cross the threshold; Pi compacts before the next assistant turn.
+
+Packaged tools use a threshold of 272000 tokens, retaining 4000 recent tokens for `service_keeper` and 8000 for `tool_add`. Tools installed at user scope use the same threshold and keep their existing recent history retention settings. Models with smaller context windows use their own physical limit. Each tool can configure its budget in `TOOL.json`.
+
+A completed handoff can compact history without another model request. Reaching the budget triggers compaction regardless of predicted cache reuse. Usage records report the budget, token estimates, compaction usage, effective thinking, and shared-history publication. Once the final result is accepted, the task finishes and publishes history without a trailing summarization request.
+
+Parallel shared history contains completed results and source observation times. Full intermediate transcripts stay in independent run archives. A summary can replace only the shared prefix covered by its snapshot; newer completions remain present. A stale summary cannot replace a newer shared compaction. Serial tools continue their existing worker session. Compaction preserves the fixed system prompt, and each job appends a short record to `journal.jsonl`.
 
 Worker files live under:
 
 ```text
 ~/.pi/agent/tool-workers/<worker-key>/
 ├── memory.md
-└── journal.jsonl
+├── journal.jsonl
+├── shared.jsonl     # completed history for parallel tools
+└── runs/            # independent request archives
 ```
 
 ## Progress display
@@ -422,7 +450,7 @@ The worker reads the skill and its supporting files, designs one plan from the s
 
 The caller states the complete requirement in `request`; `tool_add` does not read the chat history. The requirement is the complete brief: what the tool does, the input, the result, and any script, service, or path the tool must use. The worker designs the plan and applies it the same way as a conversion.
 
-Creation and conversion keep the public interface small: one short capability sentence and only the inputs the caller must supply or control independently. General workers prefer one natural language `request` or `task` field containing the task and necessary background; a tool that only needs a path can expose `path` directly. Parameter descriptions stay brief, and necessary validation and authorization fields remain explicit. Procedures, script options, environment configuration, and examples belong in the tool's internal `AGENT.md`, `WORKFLOW.md`, and `EXAMPLES.md`. Keep `whenToUse` to necessary selection situations and use `notFor` only for a real ambiguity or safety boundary.
+Creation and conversion keep the public interface small: one short capability sentence and only the inputs the caller must supply or control independently. General workers prefer one natural language `request` or `task` field containing the task and necessary background; a tool that only needs a path can expose `path` directly. Descriptions for `request` and `task` use `直接写用户任务及必要条件，不扩写工具规则。`, and examples state concise goals. Other parameter descriptions stay brief, and necessary validation and authorization fields remain explicit. Procedures, script options, environment configuration, source verification, output conventions, and safety rules belong in the tool's internal `AGENT.md`, `WORKFLOW.md`, and `EXAMPLES.md`. Keep `whenToUse` to necessary selection situations and use `notFor` only for a real ambiguity or safety boundary.
 
 Newly generated tools run synchronously by default, without `mode`, `timeoutMs`, or `jobId`. When the skill's behavior or the requirement needs background execution, set `execution.asyncByDefault: true` in the plan and let the runtime add the job control parameters.
 

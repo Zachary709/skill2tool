@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { JobRecord, JobToolInput, ToolEnvelope, ToolManifest, ToolMode } from "../types.ts";
+import type { AgentConfig, JobRecord, JobToolInput, ToolEnvelope, ToolManifest, ToolMode } from "../types.ts";
 import {
 	appendJobEvent,
 	atomicWrite,
@@ -72,6 +72,7 @@ export class JobManager {
 		projectTrusted: boolean;
 		requester?: JobRecord["requester"];
 		model?: string;
+		thinkingLevel?: AgentConfig["thinkingLevel"];
 	}): Promise<JobRecord> {
 		const record: JobRecord = {
 			id: newJobId(options.manifest.name),
@@ -88,6 +89,8 @@ export class JobManager {
 			createdAt: new Date().toISOString(),
 			requester: options.requester,
 			model: options.model,
+			thinkingLevel: options.thinkingLevel,
+			concurrency: options.manifest.agent?.concurrency ?? "serial",
 		};
 		await this.persist(record);
 		await appendJobEvent(this.options.root, record, { state: "queued" });
@@ -101,7 +104,7 @@ export class JobManager {
 	}
 
 	private enqueue(record: JobRecord): void {
-		const queueKey = `${record.tool}:${record.cwd}`;
+		const queueKey = record.concurrency === "parallel" ? record.id : `${record.tool}:${record.cwd}`;
 		const previous = this.queues.get(queueKey) ?? Promise.resolve();
 		let next: Promise<void>;
 		next = previous

@@ -1,47 +1,37 @@
 import { promises as fs } from "node:fs";
-import * as path from "node:path";
-import { createHash } from "node:crypto";
+import { setTimeout } from "node:timers/promises";
+import lockfile from "proper-lockfile";
 
-interface LockOwner {
-	pid: number;
-	createdAt: string;
+export interface WorkerLock {
+	signal: AbortSignal;
+	release(): Promise<void>;
 }
 
-function isAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-export async function acquireWorkerLock(cwd: string, tool: string, signal?: AbortSignal): Promise<() => Promise<void>> {
-	const key = createHash("sha256").update(`${tool}|${cwd}`).digest("hex").slice(0, 12);
-	const lockDir = path.join(cwd, ".pi", "jobs", ".locks", `${tool}-${key}.lock`);
-	await fs.mkdir(path.dirname(lockDir), { recursive: true });
-
+export async function acquireWorkerLock(directory: string, signal?: AbortSignal): Promise<WorkerLock> {
+	await fs.mkdir(directory, { recursive: true });
+	const controller = new AbortController();
+	const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
 	while (true) {
-		if (signal?.aborted) throw new Error("job aborted while waiting for worker lock");
+		combined.throwIfAborted();
 		try {
-			await fs.mkdir(lockDir);
-			const owner: LockOwner = { pid: process.pid, createdAt: new Date().toISOString() };
-			await fs.writeFile(path.join(lockDir, "owner.json"), `${JSON.stringify(owner)}\n`, "utf8");
-			return async () => {
-				await fs.rm(lockDir, { recursive: true, force: true });
+			const release = await lockfile.lock(directory, {
+				realpath: false,
+				onCompromised: (error) => controller.abort(error),
+			});
+			if (combined.aborted) {
+				await release();
+				combined.throwIfAborted();
+			}
+			return {
+				signal: combined,
+				release: async () => {
+					if (controller.signal.aborted) throw controller.signal.reason;
+					await release();
+				},
 			};
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			const owner = await fs
-				.readFile(path.join(lockDir, "owner.json"), "utf8")
-				.then((text) => JSON.parse(text) as LockOwner)
-				.catch(() => undefined);
-			const stale = !owner || !isAlive(owner.pid);
-			if (stale) {
-				await fs.rm(lockDir, { recursive: true, force: true });
-				continue;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 500));
+			if ((error as NodeJS.ErrnoException).code !== "ELOCKED") throw error;
+			await setTimeout(500, undefined, { signal: combined });
 		}
 	}
 }

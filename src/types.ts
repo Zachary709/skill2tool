@@ -44,12 +44,19 @@ export interface ServiceDefinition {
 	env?: Record<string, string>;
 }
 
+export interface AgentContextConfig {
+	budgetTokens?: number;
+	keepRecentTokens?: number;
+}
+
 export interface AgentConfig {
 	instructions?: string;
 	workflow?: string;
 	examples?: string;
 	tools?: string[];
 	thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	concurrency?: "serial" | "parallel";
+	context?: AgentContextConfig;
 	maxTurns?: number;
 	sessionScope?: "user" | "project";
 	memoryScope?: "user" | "project";
@@ -139,13 +146,17 @@ export interface JobRecord {
 	toolVersion: string;
 	agentId: string;
 	agentSource: AgentSource;
+	sessionFile?: string;
+	sessionId?: string;
 	cwd: string;
 	input: Record<string, unknown>;
 	mode: ToolMode;
 	state: JobState;
 	createdAt: string;
-	/** Resolved worker model as "provider/id", taken from the pi settings default. */
+	/** 调用方当前使用的 provider/model；没有会话模型时使用配置默认值。 */
 	model?: string;
+	thinkingLevel?: AgentConfig["thinkingLevel"];
+	concurrency?: AgentConfig["concurrency"];
 	toolDir?: string;
 	projectTrusted?: boolean;
 	pid?: number;

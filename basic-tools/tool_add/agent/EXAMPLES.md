@@ -11,15 +11,20 @@ For a general management worker, follow the existing `ssh_manager` shape:
 {
   "type": "object",
   "properties": {
-    "request": { "type": "string", "maxLength": 4000, "description": "用自然语言说明要查什么或改什么。" }
+    "request": { "type": "string", "maxLength": 4000, "description": "直接写用户任务及必要条件，不扩写工具规则。" }
   },
   "required": ["request"],
   "additionalProperties": false
 }
 ```
 
-The request includes the target and necessary background. The worker reads its
-configuration and follows the full procedure in its internal instructions.
+A complete user task can be passed directly as the request. Add only necessary
+context the worker cannot obtain, preserving explicit user constraints, paths,
+and authorization limits. Do not invent extra scope or turn the task into an
+operating guide. The worker reads its
+configuration and follows its existing procedures, verification, output, and
+safety rules without requiring the caller to repeat them. Keep genuine business
+requirements complete. A search request can simply say `查询英雄联盟 S16 当前赛况。`.
 Execution defaults to synchronous; no job control fields are exposed. Enable
 `execution.asyncByDefault` only for a tool that needs background execution.
 A focused tool can use a single typed value such as `path` instead.

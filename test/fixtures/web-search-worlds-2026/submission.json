@@ -1,0 +1,37 @@
+{
+  "status": "ok",
+  "summary": "截至2026年11月9日，S16已完成半决赛，GEN与BLG晋级决赛，冠军尚未产生。已用官方赛程、官方赛事指南及新闻正文交叉核实比分与决赛时间。",
+  "result": {
+    "answer": "## 查询时点\n已先核对运行环境的 UTC 时钟：**2026年11月9日07:43 UTC（北京时间15:43）**。以下为此次实际联网取得的 S16／Worlds 2026 信息。\n\n## 最新赛况\n**赛事已开始、尚未结束；半决赛已结束，当前等待决赛。** 官方赛事日期为10月15日至11月14日（美国当地日期）。[1][2]\n\n| 状态 | 比赛 | 已核实结果 |\n|---|---|---|\n| 最新已结束 | BLG vs T1，半决赛（美国当地11月8日／北京时间11月9日） | **BLG 3:1 T1，BLG晋级决赛** |\n| 此前已结束 | GEN vs IG，半决赛（美国当地11月7日） | **GEN 3:0 IG，GEN晋级决赛** |\n| 下一场／预告 | GEN vs BLG，BO5决赛 | **尚未开赛，冠军尚未产生** |\n\n以上比分与决赛对阵直接见官方赛程；BLG淘汰T1的结果另有新闻正文交叉印证。[2][3] 查询时取得的官方赛程未列出正在进行的 Worlds 比赛，不应把赛程预告视为已完成结果。[2]\n\n## 最近一场与下一场时间\n- **最近一场：BLG vs T1半决赛**。官方预定开赛时间为美国中部标准时间 **11月8日16:00 CST（UTC−6）**，即 **11月8日22:00 UTC／北京时间11月9日06:00（UTC+8）**。这是计划开赛时间，**不是已核实的实际结束时间**。[1][2]\n- **下一场：GEN vs BLG决赛**。计划于纽约布鲁克林 **11月14日14:00 EST（UTC−5）** 开始，即 **11月14日19:00 UTC／北京时间11月15日03:00（UTC+8）**。[1][2] 新闻正文也确认决赛为北京时间11月15日、对阵BLG与GEN。[3]\n\n## 实际原文证据与访问时间\n**[1] LoL Esports官方《Worlds 2026 Primer》**\nhttps://lolesports.com/en-US/news/worlds-2026-primer\n访问：2026-11-09 07:43:46 UTC。\n> “Worlds has three stages: the Play-In Stage (October 15-18), the Swiss Stage (October 23-31) and the Knockout Stage (November 3-14).”\n> “Quarterfinals and Semifinals begin at 4 PM CST / 11 PM CET / 6 AM CST (+1) / 7 AM KST (+1)”\n> “Saturday, November 14 (Finals - Brooklyn) - 2 PM EST / 8 PM CET / 3 AM CST (+1) / 4 AM KST (+1)”\n这里官方同时使用两个含义不同的 CST；本文已分别明确为美国中部标准时间与北京时间，避免混淆。\n\n**[2] LoL Esports官方赛程（Worlds筛选）**\nhttps://lolesports.com/en-US/schedule?leagues=worlds\n访问：2026-11-09 07:43:47 UTC。\n> “Saturday Nov 7 … GEN 3 0 IG Worlds • Semifinals Bo5”\n> “Yesterday … BLG 3 1 T1 Worlds • Semifinals Bo5”\n> “Saturday Nov 14 … GEN BLG Worlds • Finals Bo5”\n\n**[3] 澎湃号·媒体：BLG晋级决赛报道**\nhttps://www.thepaper.cn/newsDetail_forward_34437042\n访问：2026-11-09 07:44:12 UTC；页面标示发布于2026-11-09 09:35。\n> “最终，BLG以3比1战胜T1，成功晋级全球总决赛决赛。”\n> “北京时间11月15日，2026全球总决赛决赛将在美国纽约布鲁克林巴克莱中心举行。BLG将与GEN展开最终对决……”",
+    "sources": [
+      {
+        "title": "LoL Esports | Worlds 2026 Primer",
+        "url": "https://lolesports.com/en-US/news/worlds-2026-primer",
+        "evidence": "page_text",
+        "excerpt": "Worlds has three stages: the Play-In Stage (October 15-18), the Swiss Stage (October 23-31) and the Knockout Stage (November 3-14).\nKnockout Stage (Bo5) - Allen, TX, and Brooklyn, NY\nQuarterfinals and Semifinals begin at 4 PM CST / 11 PM CET / 6 AM CST (+1) / 7 AM KST (+1)\nTuesday, November 3 (Quarterfinals)\nWednesday, November 4 (Quarterfinals)\nThursday, November 5 (Quarterfinals)\nFriday, November 6 (Quarterfinals)\nSaturday, November 7 (Semifinals)\nSunday, November 8 (Semifinals)\nSaturday, November 14 (Finals - Brooklyn) - 2 PM EST / 8 PM CET / 3 AM CST (+1) / 4 AM KST (+1)",
+        "publishedAt": "2026-10-05",
+        "accessedAt": "2026-11-09T07:43:46.186633+00:00"
+      },
+      {
+        "title": "LoL Esports | SCHEDULE — Worlds",
+        "url": "https://lolesports.com/en-US/schedule?leagues=worlds",
+        "evidence": "page_text",
+        "excerpt": "INTERNATIONAL Worlds Oct 15 - Nov 14\nSaturday Nov 14 Reveal spoilers 7:00 PM GEN BLG Worlds • Finals Bo5 No More Upcoming Matches Available\nTuesday Nov 3 IG 3 1 TES Worlds • Quarterfinals Bo5\nWednesday Nov 4 GEN 3 0 LYON Worlds • Quarterfinals Bo5\nThursday Nov 5 BLG 3 0 DK Worlds • Quarterfinals Bo5\nFriday Nov 6 T1 3 1 KC Worlds • Quarterfinals Bo5\nSaturday Nov 7 Reveal spoilers GEN 3 0 IG Worlds • Semifinals Bo5\nYesterday Reveal spoilers BLG 3 1 T1 Worlds • Semifinals Bo5",
+        "publishedAt": "",
+        "accessedAt": "2026-11-09T07:43:47.200052+00:00"
+      },
+      {
+        "title": "BLG 3比1淘汰T1，晋级英雄联盟全球总决赛决赛！LPL首次在世界赛BO5中击败T1！—澎湃号·媒体",
+        "url": "https://www.thepaper.cn/newsDetail_forward_34437042",
+        "evidence": "page_text",
+        "excerpt": "2026-11-09 09:35 来源：澎湃新闻·澎湃号·媒体\n11月9日，2026英雄联盟全球总决赛迎来第二场半决赛，来自LPL赛区的BLG与来自LCK赛区的T1展开正面对决。最终，BLG以3比1战胜T1，成功晋级全球总决赛决赛。\n北京时间11月15日，2026全球总决赛决赛将在美国纽约布鲁克林巴克莱中心举行。BLG将与GEN展开最终对决，向S16全球总决赛冠军发起冲击。",
+        "publishedAt": "2026-11-09 09:35（页面未标注时区）",
+        "accessedAt": "2026-11-09T07:44:12.808308+00:00"
+      }
+    ],
+    "limitations": [
+      "未取得最近一场半决赛的实际开赛及结束时间戳；所列开赛时间依据官方公布的赛程，决赛时间仍属预告，可能调整。",
+      "澎湃链接为澎湃号媒体入驻稿，不是澎湃编辑部署名报道；本文以LoL Esports官方赛程为比分和晋级结论的主要依据。"
+    ]
+  }
+}

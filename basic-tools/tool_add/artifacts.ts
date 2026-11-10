@@ -37,6 +37,7 @@ export function defaultAgentInstructions(manifest: ToolManifest): string {
 		`- You may ${allowed || "read files"}.`,
 		"- Work on exactly one job at a time and stay inside the tool directory and the caller's project.",
 		"- Do not ask the user questions. If required information is missing, submit status needs_input with the exact missing field.",
+		"- A concise request may omit configured procedures and defaults. Apply this tool's workflow while preserving explicit task constraints and authorization.",
 		"",
 		"## Result",
 		"- Finish every job with exactly one submit_result call.",

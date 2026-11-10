@@ -1,6 +1,7 @@
 import { Type, type Static, type TSchema } from "typebox";
 import { Compile } from "typebox/compile";
 import type { JsonSchema, ToolEnvelope, ToolManifest } from "../types.ts";
+import { AGENT_CONTEXT_SCHEMA, resolveAgentContext } from "../agents/policy.ts";
 
 export const ENVELOPE_STATUSES = ["ok", "failed", "needs_input", "accepted", "cancelled"] as const;
 
@@ -26,11 +27,11 @@ export function envelopeSchema(output: JsonSchema): TSchema {
 
 export type EnvelopeValue = Static<ReturnType<typeof envelopeSchema>>;
 
-export function compileSchema(schema: JsonSchema) {
+export function compileSchema(schema: JsonSchema | TSchema) {
 	return Compile(Type.Unsafe(schema));
 }
 
-export function validateValue(schema: JsonSchema, value: unknown): string[] {
+export function validateValue(schema: JsonSchema | TSchema, value: unknown): string[] {
 	const compiled = compileSchema(schema);
 	if (compiled.Check(value)) return [];
 	const errors = [...compiled.Errors(value)].slice(0, 12);
@@ -45,8 +46,6 @@ export const RESULT_LIMITS = {
 	maxSummaryChars: 300,
 	/** Maximum characters in a result string field without an explicit maxLength. */
 	maxStringChars: 4000,
-	/** Maximum newline count in a short string field. */
-	maxNewlines: 8,
 } as const;
 
 export function validateSummary(summary: unknown): string[] {
@@ -80,9 +79,6 @@ function walkResultSchema(
 			);
 			return;
 		}
-		if ((value.match(/\n/g) ?? []).length > RESULT_LIMITS.maxNewlines) {
-			errors.push(`${path}: contains a multi-line log; summarize it into the declared fields`);
-		}
 		return;
 	}
 	if (Array.isArray(value)) {
@@ -104,7 +100,7 @@ function walkResultSchema(
 					errors.push(`${path}.${key}: not declared by the tool output contract; remove it`);
 				}
 			} else if (schema.additionalProperties === true) {
-				// Open objects still go through the value-size and log limits.
+				// Open objects still go through the value-size limits.
 				for (const key of extras) {
 					walkResultSchema({}, record[key], `${path}.${key}`, errors);
 				}
@@ -119,18 +115,14 @@ function walkResultSchema(
 			return;
 		}
 		// An object without declared properties is an untyped bag: its keys are not
-		// checked, but every value still goes through the size and log limits.
+		// checked, but every value still goes through the size limits.
 		for (const [key, sub] of Object.entries(record)) {
 			walkResultSchema({}, sub, `${path}.${key}`, errors);
 		}
 	}
 }
 
-/**
- * Enforce the declared result contract beyond JSON Schema types: unknown keys,
- * oversized strings, and log-like values are rejected so the caller receives
- * conclusions instead of the worker's process.
- */
+/** 补充校验输出字段和容量限制，文本内容由工具输出契约和 worker 指令约束。 */
 export function validateResultShape(schema: JsonSchema, value: unknown): string[] {
 	const errors: string[] = [];
 	if (!schema || typeof schema !== "object") return errors;
@@ -235,6 +227,27 @@ export function validateManifest(raw: unknown, dir?: string): {
 			if (!manifest.agent.workflow) errors.push("agent.workflow is required");
 			if (!manifest.agent.tools || manifest.agent.tools.length === 0) {
 				errors.push("agent.tools must list the tools available to the worker");
+			}
+			if (manifest.agent.concurrency !== undefined && !["serial", "parallel"].includes(manifest.agent.concurrency)) {
+				errors.push('agent.concurrency must be "serial" or "parallel"');
+			}
+			if (manifest.handler && manifest.agent.concurrency === "parallel") {
+				errors.push("in-process management tools require serial execution");
+			}
+			if (manifest.agent.thinkingLevel !== undefined &&
+				!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(manifest.agent.thinkingLevel)) {
+				errors.push("agent.thinkingLevel is invalid");
+			}
+			if (manifest.agent.context !== undefined) {
+				const contextErrors = validateValue(AGENT_CONTEXT_SCHEMA, manifest.agent.context);
+				errors.push(...contextErrors.map((error) => `agent.context${error}`));
+				if (contextErrors.length === 0) {
+					try {
+						resolveAgentContext(manifest.agent.context);
+					} catch (error) {
+						errors.push(error instanceof Error ? error.message : String(error));
+					}
+				}
 			}
 			const scopeFields = manifest.agent as unknown as Record<string, unknown>;
 			for (const field of ["sessionScope", "memoryScope"] as const) {

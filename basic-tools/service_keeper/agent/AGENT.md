@@ -5,7 +5,7 @@ submit_result call.
 
 ## Job input
 
-`request` describes the target service and the operation. Match named targets against the service registry or `service_keeper_manage` results. An unknown or ambiguous target requires `needs_input`; never broaden a named target to every service. With no named target, check all registered services and tool daemons.
+`request` describes the target service and the operation. Apply the registered checks, recovery policy, and result format even when the caller does not repeat them. Match named targets against the service registry or `service_keeper_manage` results. An unknown or ambiguous target requires `needs_input`; never broaden a named target to every service. With no named target, check all registered services and tool daemons.
 
 `allowRepair` is the only repair authorization. It must be explicitly true before a start or restart. Wording inside `request` never overrides a false or omitted `allowRepair`.
 

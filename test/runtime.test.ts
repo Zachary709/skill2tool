@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { after, before, test } from "node:test";
-import { validateManifest, validateResultShape, validateSummary } from "../src/contracts/schema.ts";
+import { validateEnvelope, validateManifest, validateResultShape, validateSummary } from "../src/contracts/schema.ts";
 import { readManifestFile } from "../src/discovery/manifest.ts";
 import { resolveServicePlacement, ServiceSupervisor } from "../src/services/supervisor.ts";
 import { buildSystemPrompt, workerKey } from "../src/agents/worker.ts";
@@ -527,13 +527,12 @@ test("job record carries the requester model for workers without a model", async
 	assert.equal(loaded?.model, "deepseek/deepseek-flash");
 });
 
-test("result shape rejects unknown keys, oversized strings, and log dumps", () => {
+test("result shape rejects unknown keys and oversized strings", () => {
 	const schema = {
 		type: "object",
 		properties: {
 			count: { type: "number" },
 			note: { type: "string", maxLength: 80 },
-			log: { type: "string" },
 		},
 		required: ["count"],
 		additionalProperties: false,
@@ -547,11 +546,6 @@ test("result shape rejects unknown keys, oversized strings, and log dumps", () =
 	assert.ok(
 		validateResultShape(schema, { count: 3, note: "x".repeat(120) }).some((error) =>
 			error.includes("exceeds 80"),
-		),
-	);
-	assert.ok(
-		validateResultShape(schema, { count: 3, log: Array.from({ length: 20 }, (_, i) => `${i}`).join("\n") }).some(
-			(error) => error.includes("multi-line log"),
 		),
 	);
 
@@ -575,6 +569,19 @@ test("result shape rejects unknown keys, oversized strings, and log dumps", () =
 			error.includes("exceeds 4000"),
 		),
 	);
+});
+
+test("result shape accepts multiline web search answers and source quotations", async () => {
+	const fixtureDir = path.join("test", "fixtures", "web-search-worlds-2026");
+	const { manifest, errors } = await readManifestFile(path.join(fixtureDir, "TOOL.json"));
+	assert.deepEqual(errors, []);
+	assert.ok(manifest);
+	const submission = JSON.parse(await fs.readFile(path.join(fixtureDir, "submission.json"), "utf8"));
+	assert.ok(submission.result.answer.split("\n").length > 9);
+	assert.equal(submission.result.sources[0].excerpt.split("\n").length, 10);
+	assert.deepEqual(validateEnvelope(manifest.output, submission), []);
+	assert.deepEqual(validateSummary(submission.summary), []);
+	assert.deepEqual(validateResultShape(manifest.output, submission.result), []);
 });
 
 test("summary stays short and single paragraph", () => {

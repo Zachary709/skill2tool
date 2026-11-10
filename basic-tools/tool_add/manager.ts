@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { readManifestFile } from "../../src/discovery/manifest.ts";
 import { validateManifest, validateValue } from "../../src/contracts/schema.ts";
+import { compactTaskInputSchema, TASK_INPUT_DESCRIPTION } from "../../src/contracts/caller.ts";
 import type { JsonSchema, ToolAddManageInput, ToolEnvelope, ToolManifest } from "../../src/types.ts";
 import { TOOL_PLAN_SCHEMA, planErrors, type ToolPlan } from "./plan.ts";
 import { registerExternalServices } from "./registry.ts";
@@ -51,7 +52,7 @@ const DEFAULT_INPUT: JsonSchema = {
 		task: {
 			type: "string",
 			maxLength: 8000,
-			description: "要完成的任务及必要背景。",
+			description: TASK_INPUT_DESCRIPTION,
 		},
 	},
 	required: ["task"],
@@ -232,6 +233,7 @@ export class ToolAddManager {
 		if (sourceDir && path.resolve(sourceDir) !== path.resolve(dir)) {
 			await fs.cp(sourceDir, dir, { recursive: true, force: true });
 		}
+		if (manifest.kind === "agent") manifest.input = compactTaskInputSchema(manifest.input);
 		const persisted = { ...manifest };
 		delete persisted.dir;
 		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
@@ -457,13 +459,16 @@ export class ToolAddManager {
 			whenToUse: plan.whenToUse,
 			notFor: plan.notFor ?? [],
 			kind: "agent",
-			input: plan.input,
+			input: compactTaskInputSchema(plan.input),
 			output: plan.output,
 			agent: {
 				instructions: "AGENT.md",
 				workflow: "WORKFLOW.md",
 				examples: plan.agent.examples ? "EXAMPLES.md" : undefined,
 				tools: plan.agent.tools,
+				thinkingLevel: plan.agent.thinkingLevel,
+				concurrency: plan.agent.concurrency,
+				context: plan.agent.context,
 				maxTurns: plan.agent.maxTurns ?? 30,
 				sessionScope: "project",
 				memoryScope: "project",

@@ -17,7 +17,7 @@
       "request": {
         "type": "string",
         "maxLength": 8000,
-        "description": "用自然语言说明要创建、转换或管理什么工具。"
+        "description": "直接写用户任务及必要条件，不扩写工具规则。"
       }
     },
     "required": [
@@ -115,6 +115,10 @@
       "find",
       "ls"
     ],
+    "context": {
+      "budgetTokens": 272000,
+      "keepRecentTokens": 8000
+    },
     "maxTurns": 30,
     "sessionScope": "project",
     "memoryScope": "project",

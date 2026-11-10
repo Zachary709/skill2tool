@@ -11,13 +11,33 @@ import {
 	type ExtensionAPI,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { validateEnvelope, validateResultShape, validateSummary } from "../contracts/schema.ts";
+import { acquireWorkerLock } from "../jobs/lock.ts";
+import {
+	compactionUsage,
+	DEFAULT_WORKER_CONTEXT_POLICY,
+	HANDOFF_SCHEMA,
+	handoffErrors,
+	usageDelta,
+	WorkerContext,
+	type ContextDecision,
+	type WorkerContextPolicy,
+	type WorkerHandoff,
+} from "./context.ts";
 import type { ServiceSupervisor } from "../services/supervisor.ts";
-import type { ResolvedAgent, ToolEnvelope, ToolManifest } from "../types.ts";
+import type { AgentConfig, ResolvedAgent, ToolEnvelope, ToolManifest } from "../types.ts";
+import { WorkerHistory, type HistorySnapshot, type WorkerJob } from "./history.ts";
+import { compactionForModel, resolveAgentContext } from "./policy.ts";
+import { isUnsupportedThinkingError, resolveWorkerThinking } from "./model-settings.ts";
 
 interface RunState {
 	pending?: ToolEnvelope;
+	handoff?: WorkerHandoff;
+	handoffRequired: boolean;
+	maxHandoffBytes: number;
+	onSubmitted?: () => void;
 }
 
 export interface WorkerRunResult {
@@ -91,6 +111,7 @@ function modelFromRuntime(runtime: ModelRuntime, value: string | undefined) {
 export interface WorkerRuntimePaths {
 	agentDir?: string;
 	projectCwd?: string;
+	jobDirectory?: string;
 }
 
 export function buildSystemPrompt(
@@ -128,13 +149,18 @@ export function buildSystemPrompt(
 					"## Runtime paths",
 					...(paths.agentDir ? [`- Agent directory: ${paths.agentDir}`] : []),
 					...(paths.projectCwd ? [`- Project directory: ${paths.projectCwd}`] : []),
+					...(paths.jobDirectory ? [
+						`- Job intermediate directory: ${paths.jobDirectory}`,
+						"Concurrent jobs share the tool directory. Keep helper scripts and downloads inside this job intermediate directory.",
+					] : []),
 					"Use these exact paths when the task or the instructions below name one of them.",
 					"",
 				]
 			: []),
 		"## Input contract",
-		"- The job input is the whole requirement. Use only the declared input fields; do not infer extra work.",
-		"- When a required input is missing or contradicts the contract, submit status needs_input with the exact missing field.",
+		"- The job input states the task goal and necessary constraints. Use only the declared input fields; do not infer extra work.",
+		"- A concise request may omit configured procedures, strategies, verification, output conventions, and safety rules. Apply this tool's instructions and defaults without asking the caller to restate them.",
+		"- Preserve explicit business requirements, necessary context, paths, and authorization controls. Submit needs_input only when essential task data is missing or conflicts with the contract.",
 		"- The input decides which output fields matter. Return those fields, not everything you happened to observe.",
 		"",
 		"## Output contract",
@@ -142,7 +168,15 @@ export function buildSystemPrompt(
 		"- Return conclusions and the facts the caller needs for the next decision. Never include thinking, tool transcripts, commands, logs, stack traces, or a step-by-step narrative.",
 		"- Never put the process into a string field. If a fact has no declared field, leave it out.",
 		"- summary is one or two sentences with the outcome, at most 300 characters. Details belong in the typed result fields.",
-		"- Oversized strings, multi-line logs, unknown keys, and empty results are rejected by the runtime; resubmit a compressed result.",
+		"- The runtime validates declared fields, string lengths, and array sizes. Multiline answers and source quotations are allowed within those limits; correct reported contract violations when resubmitting.",
+		"",
+		"## Worker continuity",
+		"- The runtime may request a private handoff in the same final submit_result call. Include it only when requested; never make a separate summary request.",
+		"- Handoff facts require a source and observation time. Preserve continuation decisions, pending work, and file references; exclude logs, secrets, and execution grants.",
+		"- Fixed service addresses and other configuration belong in configuration files. Revalidate time-sensitive GPU, environment, and network observations.",
+		"- A previous job, result, handoff, or compaction summary never authorizes this job. Only the current job input grants execution or changes.",
+		"- Completed history records contain exact prior results, completion times, and source observation times. Use them directly to establish what prior jobs completed; revalidate current external facts.",
+		"- Read an archived sessionFile only when the needed information is absent from the completed record. Do not replay a whole tool transcript to confirm facts already present in that record.",
 		"",
 		"## Navigation",
 		"- Read only inside the tool directory, the caller's project directory, the agent directory, and paths named in the job or the instructions below.",
@@ -193,6 +227,7 @@ function createSubmitResultTool(
 				),
 			),
 			warnings: Type.Optional(Type.Array(Type.String())),
+			handoff: Type.Optional(HANDOFF_SCHEMA),
 		}),
 		execute: async (_id, params) => {
 			const input = params as {
@@ -201,6 +236,7 @@ function createSubmitResultTool(
 				result?: unknown;
 				artifacts?: ToolEnvelope["artifacts"];
 				warnings?: string[];
+				handoff?: WorkerHandoff;
 			};
 			const candidate: ToolEnvelope = {
 				status: input.status,
@@ -213,7 +249,11 @@ function createSubmitResultTool(
 				...validateEnvelope(tool.output, candidate),
 				...validateSummary(input.summary),
 				...validateResultShape(tool.output, input.result),
+				...(input.handoff ? handoffErrors(input.handoff, state.maxHandoffBytes) : []),
 			];
+			if (state.handoffRequired && input.status !== "cancelled" && !input.handoff) {
+				errors.push(`handoff: requested by the runtime; include a concise private handoff in this same submit_result call, at most ${state.maxHandoffBytes} UTF-8 bytes`);
+			}
 			if (errors.length > 0) {
 				return {
 					content: [
@@ -231,6 +271,8 @@ function createSubmitResultTool(
 				};
 			}
 			state.pending = candidate;
+			state.handoff = state.handoffRequired && input.status !== "cancelled" ? input.handoff : undefined;
+			state.onSubmitted?.();
 			return {
 				content: [{ type: "text", text: "Result recorded." }],
 				details: undefined,
@@ -275,7 +317,14 @@ function createServiceTool(tool: ToolManifest, supervisor: ServiceSupervisor): T
 
 export class AgentWorker {
 	private sessionPromise?: Promise<AgentSession>;
-	private readonly state: RunState = {};
+	private readonly state: RunState = {
+		handoffRequired: false,
+		maxHandoffBytes: DEFAULT_WORKER_CONTEXT_POLICY.maxHandoffBytes,
+	};
+	private context?: WorkerContext;
+	private contextDecision?: ContextDecision;
+	private readonly maintenanceWarnings: string[] = [];
+	private readonly contextPolicy: Partial<WorkerContextPolicy>;
 	private readonly key: string;
 	private readonly sessionDir: string;
 	private readonly memoryPath: string;
@@ -290,6 +339,12 @@ export class AgentWorker {
 	private readonly onProgress?: WorkerProgressSink;
 	private readonly defaultModel?: string;
 	private readonly extraTools: ToolDefinition[];
+	private readonly callerThinkingLevel?: AgentConfig["thinkingLevel"];
+	private readonly history?: WorkerHistory;
+	private historySnapshot?: HistorySnapshot;
+	private thinkingFallbackReason?: string;
+	private running = false;
+	private jobDirectory?: string;
 
 	constructor(
 		tool: ToolManifest,
@@ -302,6 +357,8 @@ export class AgentWorker {
 		onProgress?: WorkerProgressSink,
 		defaultModel?: string,
 		extraTools: ToolDefinition[] = [],
+		contextPolicy: Partial<WorkerContextPolicy> = {},
+		callerThinkingLevel?: AgentConfig["thinkingLevel"],
 	) {
 		this.tool = tool;
 		this.agent = agent;
@@ -312,6 +369,14 @@ export class AgentWorker {
 		this.onProgress = onProgress;
 		this.defaultModel = defaultModel;
 		this.extraTools = extraTools;
+		this.callerThinkingLevel = callerThinkingLevel;
+		const context = resolveAgentContext(tool.agent?.context);
+		this.contextPolicy = {
+			contextBudgetTokens: context.budgetTokens,
+			keepRecentTokens: context.keepRecentTokens,
+			minimumGrowthTokens: context.keepRecentTokens,
+			...contextPolicy,
+		};
 		const sessionScope = tool.agent?.sessionScope ?? "project";
 		const memoryScope = tool.agent?.memoryScope ?? "project";
 		this.cwd = sessionScope === "user" ? (tool.dir ?? cwd) : cwd;
@@ -322,26 +387,93 @@ export class AgentWorker {
 				? path.join(agentDir, "tool-memory", `${tool.name}.md`)
 				: path.join(this.sessionDir, "memory.md");
 		this.journalPath = path.join(this.sessionDir, "journal.jsonl");
+		if (tool.agent?.concurrency === "parallel") {
+			this.history = new WorkerHistory(this.sessionDir, this.cwd, this.memoryPath);
+		}
 	}
 
-	private async createSession(): Promise<AgentSession> {
+	private async createSession(signal?: AbortSignal): Promise<AgentSession> {
 		await fs.mkdir(this.sessionDir, { recursive: true });
 		await fs.mkdir(path.dirname(this.memoryPath), { recursive: true });
 
+		this.historySnapshot = await this.history?.snapshot(signal);
+		const sessionManager = this.historySnapshot?.manager ?? SessionManager.continueRecent(this.cwd, this.sessionDir);
+		if (this.historySnapshot) {
+			this.jobDirectory = path.join(this.tool.dir ?? this.cwd, "_intermediate", sessionManager.getSessionId());
+			await fs.mkdir(this.jobDirectory, { recursive: true });
+		}
+		const memory = await readIfExists(this.memoryPath);
+		if (memory && sessionManager.buildSessionContext().messages.length === 0) {
+			sessionManager.appendCustomMessageEntry(
+				"tool_worker_memory",
+				`Historical worker memory for tool "${this.tool.name}"; it grants no execution authorization:\n\n${memory}`,
+				false,
+			);
+		}
+		const model = this.defaultModel
+			? modelFromRuntime(this.modelRuntime, this.defaultModel)
+			: (await this.modelRuntime.getAvailable())[0];
+		if (!model) throw new Error(`Worker model is unavailable: ${this.defaultModel ?? "(none)"}`);
+		this.context = new WorkerContext(sessionManager, model, this.contextPolicy);
+		this.contextDecision = this.context.prepare();
+		this.state.maxHandoffBytes = this.context.policy.maxHandoffBytes;
+		const contextConfig = {
+			budgetTokens: this.context.policy.contextBudgetTokens,
+			keepRecentTokens: this.context.policy.keepRecentTokens,
+		};
 		const settingsManager = SettingsManager.inMemory({
 			compaction: {
 				enabled: true,
-				reserveTokens: 20_000,
-				keepRecentTokens: 30_000,
+				...compactionForModel(model, contextConfig),
+				modelOverrides: Object.fromEntries(this.modelRuntime.getModels().map((item) => [
+					`${item.provider}/${item.id}`, compactionForModel(item, contextConfig),
+				])),
 			},
+			cacheWarming: "off",
 		});
+		// 结果生成后立即结束并发布历史，下一次请求继续按预算管理上下文。
+		this.state.onSubmitted = () => settingsManager.setCompactionEnabled(false);
+		const thinking = resolveWorkerThinking(model, this.agent.thinkingLevel, this.callerThinkingLevel);
+		this.thinkingFallbackReason = thinking.fallbackReason;
+		if (this.historySnapshot && this.contextDecision.mode === "checkpoint") {
+			const entry = [...sessionManager.getBranch()].reverse().find((item) => item.type === "compaction");
+			if (entry?.type === "compaction") {
+				this.history!.captureCompaction(this.historySnapshot, entry, sessionManager.getBranch());
+			}
+		}
 
 		const compactionExtension = (pi: ExtensionAPI) => {
+			pi.on("context", (event, ctx) => {
+				const tokens = Math.max(ctx.getContextUsage()?.tokens ?? 0, this.context!.estimateContextTokens());
+				this.state.handoffRequired ||= this.context!.needsHandoff(tokens);
+				if (!this.state.handoffRequired) return;
+				return {
+					messages: [...event.messages, {
+						role: "custom" as const,
+						customType: "tool_worker_handoff_request",
+						content: `At task completion include handoff in the same submit_result call, limited to ${this.state.maxHandoffBytes} UTF-8 bytes of JSON. Update the prior handoff with sourced observations, decisions, pending work and file references. Use empty arrays where appropriate. Do not include logs, secrets, or execution authorizations. Do not make another model call or perform unrelated work for this handoff.`,
+						display: false,
+						timestamp: Date.now(),
+					}],
+				};
+			});
+			pi.on("session_before_compact", (event) => {
+				const compaction = this.context?.reusableCompaction(event.preparation.firstKeptEntryId, event.preparation.tokensBefore);
+				return compaction ? { compaction } : undefined;
+			});
 			pi.on("session_compact", async (event) => {
+				this.context?.didCompact();
+				this.state.handoffRequired = false;
+				if (this.historySnapshot) {
+					this.history!.captureCompaction(this.historySnapshot, event.compactionEntry, sessionManager.getBranch());
+					return;
+				}
 				try {
 					await fs.writeFile(this.memoryPath, event.compactionEntry.summary, "utf8");
 				} catch (error) {
-					this.log(`failed to write worker memory: ${String(error)}`);
+					const warning = `failed to write worker memory: ${String(error)}`;
+					this.maintenanceWarnings.push(warning);
+					this.log(warning);
 				}
 			});
 		};
@@ -360,20 +492,11 @@ export class AgentWorker {
 				buildSystemPrompt(this.tool, this.agent, {
 					agentDir: this.agentDir,
 					projectCwd: this.cwd,
+					jobDirectory: this.jobDirectory,
 				}),
 			appendSystemPromptOverride: () => [],
 		});
 		await loader.reload();
-
-		const sessionManager = SessionManager.continueRecent(this.cwd, this.sessionDir);
-		const memory = await readIfExists(this.memoryPath);
-		if (memory && sessionManager.buildSessionContext().messages.length === 0) {
-			sessionManager.appendCustomMessageEntry(
-				"tool_worker_memory",
-				`Previous worker memory for tool "${this.tool.name}":\n\n${memory}`,
-				false,
-			);
-		}
 
 		const readTools = this.tool.permissions?.read === false ? [] : ["read", "grep", "find", "ls"];
 		const writeTools = this.tool.permissions?.write ? ["edit", "write"] : [];
@@ -398,11 +521,11 @@ export class AgentWorker {
 		}
 		customTools.push(...this.extraTools);
 
-		const model = modelFromRuntime(this.modelRuntime, this.defaultModel);
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
 			agentDir: this.agentDir,
 			model,
+			thinkingLevel: thinking.thinkingLevel,
 			modelRuntime: this.modelRuntime,
 			resourceLoader: loader,
 			settingsManager,
@@ -410,7 +533,12 @@ export class AgentWorker {
 			tools: selectedTools,
 			customTools,
 		});
-		session.subscribe((event) => this.emitProgress(event));
+		session.subscribe((event) => {
+			if (event.type === "message_end" && event.message.role === "assistant") {
+				this.context?.observeResponse(event.message as AssistantMessage);
+			}
+			this.emitProgress(event);
+		});
 		return session;
 	}
 
@@ -429,7 +557,11 @@ export class AgentWorker {
 					} else if (part.type === "text" && part.text) {
 						this.onProgress({ time, kind: "text", text: progressText(part.text, 4000) });
 					} else if (part.type === "toolCall" && part.name) {
-						this.onProgress({ time, kind: "tool", tool: part.name, text: progressText(part.arguments ?? {}, 500) });
+						const args = part.arguments as Record<string, unknown> | undefined;
+						const publicArgs = part.name === "submit_result" && args
+							? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "handoff"))
+							: args;
+						this.onProgress({ time, kind: "tool", tool: part.name, text: progressText(publicArgs ?? {}, 500) });
 					}
 				}
 				return;
@@ -448,18 +580,39 @@ export class AgentWorker {
 		}
 	}
 
-	private async getSession(): Promise<AgentSession> {
-		this.sessionPromise ??= this.createSession();
+	private async getSession(signal?: AbortSignal): Promise<AgentSession> {
+		this.sessionPromise ??= this.createSession(signal);
 		return this.sessionPromise;
 	}
 
-	async run(
-		job: { task: string; input?: Record<string, unknown>; context?: string },
-		signal?: AbortSignal,
-	): Promise<WorkerRunResult> {
+	async run(job: WorkerJob, signal?: AbortSignal): Promise<WorkerRunResult> {
+		if (this.running) throw new Error("Create a separate AgentWorker instance for each concurrent job");
+		this.running = true;
+		try {
+			await this.dispose();
+			this.maintenanceWarnings.length = 0;
+			this.state.pending = undefined;
+			this.state.handoff = undefined;
+			this.state.handoffRequired = false;
+			this.state.onSubmitted = undefined;
+			if (this.history) return await this.runJob(job, signal ?? new AbortController().signal);
+			const lock = await acquireWorkerLock(this.sessionDir, signal);
+			try {
+				return await this.runJob(job, lock.signal);
+			} finally {
+				await lock.release();
+			}
+		} finally {
+			this.running = false;
+		}
+	}
+
+	private async runJob(job: WorkerJob, signal: AbortSignal): Promise<WorkerRunResult> {
 		const warnings: string[] = [];
-		const session = await this.getSession();
-		this.state.pending = undefined;
+		const session = await this.getSession(signal);
+		signal.throwIfAborted();
+		const before = session.getSessionStats();
+		const previousEntries = new Set(this.context!.manager.getEntries().map((entry) => entry.id));
 
 		const abortHandler = () => {
 			void session.abort();
@@ -477,20 +630,54 @@ export class AgentWorker {
 			.filter(Boolean)
 			.join("\n");
 
+		let promptError: unknown;
 		try {
-			await session.prompt(payload);
+			let initialError: unknown;
+			try {
+				await session.prompt(payload);
+			} catch (error) {
+				initialError = error;
+			}
+			let failed = session.messages.at(-1);
+			const failedMessage = initialError instanceof Error ? initialError.message : initialError !== undefined
+				? String(initialError)
+				: failed?.role === "assistant" && failed.stopReason === "error" ? failed.errorMessage ?? "" : "";
+			if (!this.state.pending && this.agent.thinkingLevel === "low" && session.thinkingLevel === "low" &&
+				isUnsupportedThinkingError(failedMessage) &&
+				this.callerThinkingLevel !== undefined && this.callerThinkingLevel !== "low") {
+				this.thinkingFallbackReason = failedMessage;
+				const failedEntry = [...this.context!.manager.getBranch()].reverse().find((entry) =>
+					!previousEntries.has(entry.id) && entry.type === "message" && entry.message.role === "assistant" &&
+					entry.message.stopReason === "error" && isUnsupportedThinkingError(entry.message.errorMessage ?? ""),
+				);
+				if (failedEntry) this.context!.manager.appendContextEdit(failedEntry.id, null);
+				session.setThinkingLevel(this.callerThinkingLevel);
+				await session.prompt(`Continue the same job with the caller's model settings. Preserve completed work and finish with submit_result.\n\n${payload}`);
+				failed = session.messages.at(-1);
+			} else if (initialError !== undefined) {
+				throw initialError;
+			}
+			if (!this.state.pending && failed?.role === "assistant" && failed.stopReason === "error") {
+				throw new Error(failed.errorMessage ?? "Worker model request failed");
+			}
 			if (!this.state.pending) {
 				warnings.push("worker finished without calling submit_result; retrying once");
 				await session.prompt(
 					"You did not call submit_result. Call submit_result now with the final structured result. Do not answer with prose.",
 				);
 			}
+		} catch (error) {
+			promptError = error;
 		} finally {
-			signal?.removeEventListener("abort", abortHandler);
+			signal.removeEventListener("abort", abortHandler);
 		}
 
-		const envelope: ToolEnvelope =
-			this.state.pending ?? {
+		const envelope: ToolEnvelope = promptError
+			? {
+				status: signal.aborted ? "cancelled" : "failed",
+				summary: promptError instanceof Error ? promptError.message : String(promptError),
+			}
+			: this.state.pending ?? {
 				status: "failed",
 				summary: "Worker did not submit a result.",
 				warnings,
@@ -503,13 +690,43 @@ export class AgentWorker {
 		}
 
 		const stats = session.getSessionStats();
-		const usage = stats
-			? {
-					tokens: stats.tokens,
-					cost: stats.cost,
-					contextUsage: stats.contextUsage,
-			  }
+		const delta = usageDelta(before, stats);
+		let checkpointEntryId: string | undefined;
+		if (this.state.handoff && !signal.aborted && envelope.status !== "cancelled" && errors.length === 0) {
+			try {
+				checkpointEntryId = this.context!.saveHandoff(envelope.summary, this.state.handoff);
+			} catch (error) {
+				warnings.push(`failed to persist worker handoff; original history retained: ${String(error)}`);
+			}
+		}
+		const history = this.historySnapshot
+			? await this.history!.complete(this.historySnapshot, job, envelope, this.state.handoff)
 			: undefined;
+		const usage = {
+			...delta,
+			contextUsage: stats.contextUsage,
+			thinking: {
+				preferred: this.agent.thinkingLevel,
+				caller: this.callerThinkingLevel,
+				effective: session.thinkingLevel,
+				fallbackReason: this.thinkingFallbackReason,
+			},
+			history,
+			compaction: compactionUsage(this.context!.manager.getEntries().filter((entry) => !previousEntries.has(entry.id))),
+			contextManagement: {
+				...this.contextDecision,
+				budgetTokens: this.context!.policy.contextBudgetTokens,
+				keepRecentTokens: this.context!.policy.keepRecentTokens,
+				checkpointEntryId,
+				handoffBytes: this.state.handoff ? Buffer.byteLength(JSON.stringify(this.state.handoff), "utf8") : 0,
+			},
+		};
+		warnings.push(...this.maintenanceWarnings);
+		try {
+			this.context!.recordRun(delta, this.contextDecision!, checkpointEntryId);
+		} catch (error) {
+			warnings.push(`failed to persist worker usage metadata: ${String(error)}`);
+		}
 
 		try {
 			await fs.appendFile(
@@ -537,11 +754,9 @@ export class AgentWorker {
 	}
 
 	async dispose(): Promise<void> {
-		try {
-			const session = await this.sessionPromise;
-			session?.dispose();
-		} catch {
-			// ignore
-		}
+		const pending = this.sessionPromise;
+		this.sessionPromise = undefined;
+		const session = await pending;
+		session?.dispose();
 	}
 }
