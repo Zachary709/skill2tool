@@ -31,16 +31,12 @@ export async function readJobRecord(root: string, id: string): Promise<JobRecord
 }
 
 export async function appendJobEvent(root: string, record: JobRecord, event: Record<string, unknown>): Promise<void> {
-	try {
-		await fs.mkdir(jobDir(root, record.id), { recursive: true });
-		await fs.appendFile(
-			path.join(jobDir(root, record.id), "events.jsonl"),
-			`${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`,
-			"utf8",
-		);
-	} catch {
-		// Events are diagnostic. A write failure must not change the job result.
-	}
+	await fs.mkdir(jobDir(root, record.id), { recursive: true });
+	await fs.appendFile(
+		path.join(jobDir(root, record.id), "events.jsonl"),
+		`${JSON.stringify({ time: new Date().toISOString(), ...event })}\n`,
+		"utf8",
+	);
 }
 
 export async function writeJobResult(root: string, record: JobRecord): Promise<void> {

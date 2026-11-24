@@ -89,8 +89,9 @@ that is not in the registry, any SSH or remote command, any write outside the
 state file named above.
 
 Tool-declared daemons are owned by the pi-tool-runtime supervisor. The supervisor
-keeps its protocol client in the main process, so a daemon restart must run
-through `service_keeper_manage`, never through a separate process.
+keeps its protocol client in the main process. Your independent inference worker
+calls `service_keeper_manage` through IPC; the main process performs the restart.
+Cancellation stops new operations without undoing an already completed restart.
 
 ## Result
 

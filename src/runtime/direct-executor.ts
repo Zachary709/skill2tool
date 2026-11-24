@@ -5,7 +5,8 @@ import type { ToolEnvelope, ToolManifest } from "../types.ts";
 export async function executeDirectTool(
 	manifest: ToolManifest,
 	input: Record<string, unknown>,
-	supervisor: ServiceSupervisor,
+	supervisor: Pick<ServiceSupervisor, "call">,
+	signal?: AbortSignal,
 ): Promise<ToolEnvelope> {
 	const serviceNames = Object.keys(manifest.services ?? {});
 	if (serviceNames.length === 0) {
@@ -17,7 +18,7 @@ export async function executeDirectTool(
 	const params = { ...input };
 	delete params.service;
 
-	const serviceResult = await supervisor.call(manifest, serviceName, params);
+	const serviceResult = await supervisor.call(manifest, serviceName, params, signal);
 	if (!serviceResult.ok) {
 		return {
 			status: "failed",

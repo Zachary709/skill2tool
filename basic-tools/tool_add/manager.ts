@@ -21,7 +21,7 @@ export interface ToolAddHost {
 	listTools(): ToolManifest[];
 	getTool(name: string): ToolManifest | undefined;
 	register(manifest: ToolManifest, activate: boolean): void;
-	setEnabled(name: string, enabled: boolean, activate: boolean): Promise<void>;
+	setEnabled(name: string, enabled: boolean, activate: boolean, signal?: AbortSignal): Promise<void>;
 	isReserved(name: string): boolean;
 }
 
@@ -44,7 +44,7 @@ export const TOOL_ADD_MANAGE_SCHEMA: JsonSchema = {
 	additionalProperties: false,
 };
 
-type AddContext = { cwd: string; isProjectTrusted(): boolean };
+type AddContext = { cwd: string; isProjectTrusted(): boolean; signal?: AbortSignal };
 
 const DEFAULT_INPUT: JsonSchema = {
 	type: "object",
@@ -104,12 +104,14 @@ function inspectResult(manifest: ToolManifest) {
  * instructions then resolve from the tool directory, and the tool keeps working
  * after the source checkout moves.
  */
-async function copySkillBundle(sourceDir: string, targetDir: string): Promise<void> {
+async function copySkillBundle(sourceDir: string, targetDir: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	const skip = new Set([".git", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"]);
 	await fs.cp(sourceDir, targetDir, {
 		recursive: true,
 		force: true,
 		filter: (source) => {
+			signal?.throwIfAborted();
 			const relative = path.relative(sourceDir, source);
 			if (!relative) return true;
 			return !relative.split(path.sep).some((part) => skip.has(part));
@@ -121,6 +123,7 @@ export class ToolAddManager {
 	constructor(private readonly host: ToolAddHost) {}
 
 	async handle(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
+		ctx.signal?.throwIfAborted();
 		switch (input.action) {
 			case "list":
 				return this.list();
@@ -136,7 +139,7 @@ export class ToolAddManager {
 				return this.createTool(input, ctx);
 			case "disable":
 			case "enable":
-				return this.setEnabled(input);
+				return this.setEnabled(input, ctx);
 			default:
 				return { status: "failed", summary: `Unsupported action: ${String(input.action)}` };
 		}
@@ -168,7 +171,8 @@ export class ToolAddManager {
 		};
 	}
 
-	private async setEnabled(input: ToolAddManageInput): Promise<ToolEnvelope> {
+	private async setEnabled(input: ToolAddManageInput, ctx: AddContext): Promise<ToolEnvelope> {
+		ctx.signal?.throwIfAborted();
 		const manifest = input.name ? this.host.getTool(input.name) : undefined;
 		if (!manifest) return { status: "failed", summary: `Unknown tool: ${input.name ?? "(none)"}` };
 		if (manifest.scope === "package") {
@@ -177,7 +181,7 @@ export class ToolAddManager {
 				summary: `Tool ${manifest.name} ships with the runtime and cannot be disabled or enabled.`,
 			};
 		}
-		await this.host.setEnabled(manifest.name, input.action === "enable", true);
+		await this.host.setEnabled(manifest.name, input.action === "enable", manifest.defaultActive ?? false, ctx.signal);
 		return {
 			status: "ok",
 			summary: `Tool ${manifest.name} ${input.action === "enable" ? "enabled" : "disabled"}.`,
@@ -229,22 +233,25 @@ export class ToolAddManager {
 		} catch {
 			// the directory does not exist yet
 		}
+		ctx.signal?.throwIfAborted();
 		await fs.mkdir(dir, { recursive: true });
 		if (sourceDir && path.resolve(sourceDir) !== path.resolve(dir)) {
-			await fs.cp(sourceDir, dir, { recursive: true, force: true });
+			await fs.cp(sourceDir, dir, { recursive: true, force: true, filter: () => { ctx.signal?.throwIfAborted(); return true; } });
 		}
+		ctx.signal?.throwIfAborted();
 		if (manifest.kind === "agent") manifest.input = compactTaskInputSchema(manifest.input);
 		const persisted = { ...manifest };
 		delete persisted.dir;
 		await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
-		await ensureAgentFiles(dir, manifest);
+		await ensureAgentFiles(dir, manifest, ctx.signal);
 		manifest.dir = dir;
 		manifest.scope = scope;
 		const validation = validateManifest(manifest, dir);
 		if (!validation.manifest || validation.errors.length > 0) {
 			return { status: "failed", summary: "Generated tool failed validation.", warnings: validation.errors };
 		}
-		this.host.register(validation.manifest, true);
+		ctx.signal?.throwIfAborted();
+		this.host.register(validation.manifest, validation.manifest.defaultActive ?? false);
 		return {
 			status: "ok",
 			summary: `Tool ${manifest.name} added.`,
@@ -324,14 +331,15 @@ export class ToolAddManager {
 			? this.manifestFromPlan(plan, name, scope, dir)
 			: this.manifestFromFallback(parsed.frontmatter, parsed.body, name, scope, dir);
 		let usedPlan = Boolean(plan);
+		ctx.signal?.throwIfAborted();
 		await fs.mkdir(dir, { recursive: true });
 		const sourceRoot = path.dirname(path.dirname(absolute));
-		await copySkillBundle(path.dirname(absolute), path.join(dir, "skill"));
+		await copySkillBundle(path.dirname(absolute), path.join(dir, "skill"), ctx.signal);
 		for (const name of ["service", "services"]) {
 			const serviceRoot = path.join(sourceRoot, name);
 			const exists = await fs.access(serviceRoot).then(() => true).catch(() => false);
 			if (exists && content.includes(`${name}/`)) {
-				await copySkillBundle(serviceRoot, path.join(dir, name));
+				await copySkillBundle(serviceRoot, path.join(dir, name), ctx.signal);
 			}
 		}
 
@@ -353,8 +361,10 @@ export class ToolAddManager {
 			};
 		}
 
-		await writeToolArtifacts(dir, validation.manifest, built.files);
-		this.host.register(validation.manifest, true);
+		ctx.signal?.throwIfAborted();
+		await writeToolArtifacts(dir, validation.manifest, built.files, ctx.signal);
+		ctx.signal?.throwIfAborted();
+		this.host.register(validation.manifest, validation.manifest.defaultActive ?? false);
 		const registry = await registerExternalServices(
 			this.host.agentDir,
 			name,
@@ -421,9 +431,11 @@ export class ToolAddManager {
 				warnings: [...warnings, ...validation.errors],
 			};
 		}
+		ctx.signal?.throwIfAborted();
 		await fs.mkdir(dir, { recursive: true });
-		await writeToolArtifacts(dir, validation.manifest, built.files);
-		this.host.register(validation.manifest, true);
+		await writeToolArtifacts(dir, validation.manifest, built.files, ctx.signal);
+		ctx.signal?.throwIfAborted();
+		this.host.register(validation.manifest, validation.manifest.defaultActive ?? false);
 		const registry = await registerExternalServices(
 			this.host.agentDir,
 			name,
@@ -458,6 +470,8 @@ export class ToolAddManager {
 			description: plan.description,
 			whenToUse: plan.whenToUse,
 			notFor: plan.notFor ?? [],
+			category: plan.category,
+			tags: plan.tags ?? [],
 			kind: "agent",
 			input: compactTaskInputSchema(plan.input),
 			output: plan.output,
@@ -489,7 +503,7 @@ export class ToolAddManager {
 				notifyOnIdle: asyncByDefault,
 				asyncByDefault,
 			},
-			exposure: "direct",
+			exposure: "deferred",
 			namespace: "tool",
 			dir,
 			scope,
@@ -551,7 +565,7 @@ export class ToolAddManager {
 			permissions: { read: true, write: false, bash: false, network: false },
 			limits: { maxInputBytes: 1_048_576, maxResultBytes: 20_000, jobTimeoutMs: 600_000 },
 			execution: { defaultMode: "sync", notifyOnIdle: false, asyncByDefault: false },
-			exposure: "direct",
+			exposure: "deferred",
 			namespace: "tool",
 			dir,
 			scope,

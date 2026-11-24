@@ -2,6 +2,7 @@ import { Type, type Static, type TSchema } from "typebox";
 import { Compile } from "typebox/compile";
 import type { JsonSchema, ToolEnvelope, ToolManifest } from "../types.ts";
 import { AGENT_CONTEXT_SCHEMA, resolveAgentContext } from "../agents/policy.ts";
+import { TOOL_CATALOG_METADATA_SCHEMA, catalogDefaultActive, toolCategory } from "../discovery/catalog.ts";
 
 export const ENVELOPE_STATUSES = ["ok", "failed", "needs_input", "accepted", "cancelled"] as const;
 
@@ -181,6 +182,11 @@ export function validateManifest(raw: unknown, dir?: string): {
 	}
 
 	const manifest = raw as ToolManifest;
+	const catalogErrors = validateValue(TOOL_CATALOG_METADATA_SCHEMA, manifest);
+	errors.push(...catalogErrors.map((error) => `catalog${error}`));
+	if (manifest.exposure === "hidden" && manifest.defaultActive === true) {
+		errors.push("hidden tools cannot set defaultActive to true");
+	}
 
 	if (typeof manifest.name !== "string" || !/^[a-z][a-z0-9_]*$/.test(manifest.name)) {
 		errors.push("name must match ^[a-z][a-z0-9_]*$");
@@ -356,7 +362,10 @@ export function validateManifest(raw: unknown, dir?: string): {
 			notifyOnIdle: manifest.execution?.notifyOnIdle ?? true,
 			asyncByDefault: manifest.execution?.asyncByDefault ?? manifest.kind === "agent",
 		},
-		exposure: manifest.exposure ?? "direct",
+		category: catalogErrors.length === 0 ? toolCategory(manifest) : undefined,
+		tags: manifest.tags ?? [],
+		defaultActive: catalogDefaultActive(manifest),
+		exposure: manifest.exposure ?? "deferred",
 		namespace: manifest.namespace ?? "tool",
 		dir,
 	};

@@ -1,0 +1,396 @@
+diff --git a/docs/agents/sessions.md b/docs/agents/sessions.md
+index 422ff89..2884a18 100644
+--- a/docs/agents/sessions.md
++++ b/docs/agents/sessions.md
+@@ -113,7 +113,7 @@ A compaction's or branch summary's summarizer retries on the same budget (`summa
+ 
+ ## Tool execution events on the SSE stream
+ - Calls made through `ctx.executeTool()` (a codemode script's) emit `tool_execution_*` with `parentToolCallId` and ids `<parent>/<n>`. `toClientAgentEvent()` sends their start and end slim and drops their updates; test for nesting *before* rebuilding an update, which keeps only `toolCallId`, `toolName` and `partialResult` (a nested update would reach the browser as a top-level tool). `handleAgentEvent` keeps them out of the running-tools phase; `AgentSessionWrapper` never records them for replay, a parent's end forgets every id under `<parent>/`, and `agent_end` clears the replay set.
+-- `tool_execution_end` never carries `result` (up to 1 MiB of bash output): the browser renders the tool result message that follows. A top-level end keeps pi's `durationMs`. A non-assistant `message_start` (that tool result, a delivered user message) goes as `{ role }` only: the loop sends it right before its `message_end`, and the browser builds only an assistant reply from a start, so an image read's base64 went out twice. `entry_appended` is omitted. A codemode update's `details.calls` keeps the newest 200, `omittedCalls` counting the rest.
++- 普通调用的 `tool_execution_end` 携带最终结果的 `content`、`details`、`usage` 和 pi 测量的 `durationMs`，不携带界面不用的 `structuredContent`。浏览器通过 `toolResultFromExecutionEnd()` 将结果放入 `activeToolResults`，立即更新所属工具卡片。正式 `message_end` 到达时移除临时显示数据，由会话消息继续提供同一份结果；不改动 SDK 的消息顺序、模型上下文或会话文件。服务端将已经完成、正式结果消息尚未到达的结束事件保存在 `completedToolEvents` 中，重连时与活动调用一起重放；正式结果消息、运行结束和销毁会清除相应记录。非 assistant 的 `message_start` 只发送 `{ role }`，`entry_appended` 不发送。嵌套调用继续使用简化事件，codemode 更新的 `details.calls` 保留最近 200 项，并用 `omittedCalls` 记录其余数量。
+ - `createAgentEventStream()` coalesces `tool_execution_update` per `toolCallId` (latest wins, `TOOL_UPDATE_COALESCE_MS`) and discards that id's pending update before forwarding its `tool_execution_end` (`agent_end` discards all), or the tool would read as running again. Everything else goes at once, so a pending update can arrive after unrelated events.
+ - A codemode card shows the script in the box any tool's input uses (plain text) and its `details.calls` as rows, never as cards: those calls never reach the model as tool calls. `handleAgentEvent` keeps a running script's progress snapshot in `activeToolResults`, as for shell output, so calls list while they run.
+ - A tool card's time is the result's `durationMs` (pi 1.1: `execute()` measured with a monotonic clock, saved in the session file), formatted as the CLI's "Took" (`formatToolDuration()`), and none under 100 ms. An older result falls back to its timestamp minus the assistant message's, which is when that message's request **started**, so it counts the model's generation too. A thinking block's time likewise prefers the assistant message's own `durationMs`.
+diff --git a/e2e/parallel-tool-results.mjs b/e2e/parallel-tool-results.mjs
+new file mode 100644
+index 0000000..3835db0
+--- /dev/null
++++ b/e2e/parallel-tool-results.mjs
+@@ -0,0 +1,179 @@
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { createHash } from "node:crypto";
++import { once } from "node:events";
++import { promises as fs } from "node:fs";
++import { createServer } from "node:net";
++import * as path from "node:path";
++import { setTimeout as delay } from "node:timers/promises";
++import { fileURLToPath } from "node:url";
++import { getAgentDir } from "@earendil-works/pi-coding-agent";
++
++const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
++const projectRoot = process.env.PI_TOOL_RUNTIME_PROJECT;
++assert.ok(projectRoot, "需要 PI_TOOL_RUNTIME_PROJECT 指向工具运行时项目");
++const provider = process.env.PI_PROVIDER;
++const modelId = process.env.PI_MODEL;
++assert.ok(provider && modelId, "需要沿用当前会话的模型配置");
++const parent = path.join(projectRoot, "_intermediate", "agent-runtime-checks");
++await fs.mkdir(parent, { recursive: true });
++const directory = await fs.mkdtemp(path.join(parent, "web-tool-results-"));
++const temporary = path.join(directory, "intermediate");
++const agentDir = path.join(directory, "agent");
++const project = path.join(directory, "project");
++await Promise.all([temporary, agentDir, project].map((dir) => fs.mkdir(dir, { mode: 0o700 })));
++const currentAgentDir = getAgentDir();
++await fs.copyFile(path.join(currentAgentDir, "auth.json"), path.join(agentDir, "auth.json"));
++await fs.chmod(path.join(agentDir, "auth.json"), 0o600);
++await fs.copyFile(path.join(currentAgentDir, "models.json"), path.join(agentDir, "models.json"));
++await fs.chmod(path.join(agentDir, "models.json"), 0o600);
++await fs.copyFile(path.join(projectRoot, "README.md"), path.join(project, "README.md"));
++process.env.TMPDIR = temporary;
++const { chromium } = await import("playwright");
++const socket = createServer();
++socket.listen(0, "127.0.0.1");
++await once(socket, "listening");
++const port = socket.address().port;
++await new Promise((resolve, reject) => socket.close((error) => error ? reject(error) : resolve()));
++const base = `http://127.0.0.1:${port}`;
++const serverLog = await fs.open(path.join(directory, "server.log"), "a");
++const server = spawn(process.execPath, [path.join(root, "node_modules/next/dist/bin/next"), "start", "-H", "127.0.0.1", "-p", String(port)], {
++  cwd: root,
++  env: { ...process.env, TMPDIR: temporary, PI_CODING_AGENT_DIR: agentDir },
++  stdio: ["ignore", serverLog.fd, serverLog.fd],
++});
++const exited = once(server, "close");
++await serverLog.close();
++let browser;
++let page;
++let sessionId;
++const events = [];
++const pageErrors = [];
++const evidence = { directory, base, model: `${provider}/${modelId}` };
++
++async function until(condition, message) {
++  const deadline = Date.now() + 300000;
++  while (!await condition()) {
++    assert.equal(server.exitCode, null, await fs.readFile(path.join(directory, "server.log"), "utf8"));
++    const error = events.find((event) => event.type === "message_end" && event.message?.role === "assistant" && event.message.stopReason === "error");
++    assert.equal(error, undefined, error?.message?.errorMessage);
++    assert.deepEqual(pageErrors, []);
++    assert.ok(Date.now() < deadline, message);
++    await delay(50);
++  }
++}
++
++try {
++  await until(async () => {
++    try { return (await fetch(`${base}/api/web-auth`)).ok; }
++    catch (error) {
++      if (error.cause?.code === "ECONNREFUSED") return false;
++      throw error;
++    }
++  }, "等待独立 Pi Web 服务启动超时");
++  browser = await chromium.launch({ headless: true });
++  const context = await browser.newContext({ baseURL: base });
++  if (process.env.PI_WEB_PASSWORD) {
++    const login = await context.request.post("/api/web-auth", { data: { password: process.env.PI_WEB_PASSWORD } });
++    assert.ok(login.ok(), await login.text());
++  }
++  const target = path.join(project, "released.md");
++  const ready = path.join(project, "ready");
++  const command = [process.execPath, path.join(projectRoot, "test/fixtures/process-control/wait-file.mjs"), target, ready]
++    .map((value) => `'${value.replaceAll("'", "'\\''")}'`).join(" ");
++  const readInput = { path: path.join(project, "README.md"), offset: 1, limit: 5 };
++  const prompt = `在同一条回复中并行调用两个工具，严格按以下顺序发起。第一个 bash 的 command 是 ${JSON.stringify(command)}；它会等待文件。第二个 read 的输入是 ${JSON.stringify(readInput)}。必须在等待第一个工具之前同时发起第二个工具，不得串行等待，不要改写命令和输入，不调用其他工具。两者完成后简短说明真实结果。`;
++  const created = await context.request.post("/api/agent/new", { data: {
++    cwd: project, type: "prompt", message: prompt, provider, modelId,
++    thinkingLevel: process.env.PI_REASONING_LEVEL, toolNames: ["bash", "read"],
++  } });
++  assert.ok(created.ok(), await created.text());
++  sessionId = (await created.json()).sessionId;
++  assert.ok(sessionId);
++  page = await context.newPage();
++  page.on("pageerror", (error) => pageErrors.push(String(error)));
++  const cdp = await context.newCDPSession(page);
++  await cdp.send("Network.enable");
++  cdp.on("Network.eventSourceMessageReceived", ({ data }) => events.push(JSON.parse(data)));
++  await page.goto(`${base}/?session=${sessionId}`, { waitUntil: "domcontentloaded" });
++  await page.locator(".chat-input-textarea").waitFor();
++  await until(() => events.some((event) => event.type === "connected" && event.sessionId === sessionId), "页面没有连接真实事件流");
++
++  let readEnd;
++  let bashStart;
++  await until(async () => {
++    readEnd = events.find((event) => event.type === "tool_execution_end" && event.toolName === "read");
++    bashStart = events.find((event) => event.type === "tool_execution_start" && event.toolName === "bash");
++    return readEnd && bashStart && (await fs.readdir(project)).includes("ready");
++  }, "没有观察到同一批中的真实 bash 与 read 完成事件");
++  assert.equal(readEnd.isError, false);
++  assert.ok(readEnd.result?.content, "Web 事件必须包含已完成调用的结果内容");
++  assert.equal(events.some((event) => event.type === "tool_execution_end" && event.toolCallId === bashStart.toolCallId), false);
++  assert.equal(events.some((event) => event.type === "message_end" && event.message?.role === "toolResult"), false);
++  const expected = (await fs.readFile(path.join(project, "README.md"), "utf8")).split("\n")[0];
++  const expectedResult = readEnd.result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
++
++  async function checkReadCard() {
++    const header = page.getByRole("button", { name: /^read/ });
++    await header.waitFor();
++    assert.equal(await header.count(), 1);
++    const card = header.locator("..").locator("..");
++    if (!await card.evaluate((element) => element.children.length > 1)) await header.click();
++    await until(async () => (await card.textContent())?.includes(expected), "已完成 read 的原工具卡片没有显示实际文件内容");
++    const text = await card.textContent();
++    assert.ok(text.includes(expected));
++    assert.equal(text.split(expected).length - 1, 1, "原工具卡片中的结果不能重复出现");
++    return text;
++  }
++
++  evidence.cardWhileBashRunning = await checkReadCard();
++  console.log("已验证：慢调用仍在运行时，read 的原工具卡片立即显示真实结果。");
++  const offset = events.length;
++  await page.reload({ waitUntil: "domcontentloaded" });
++  await until(() => events.slice(offset).some((event) => event.type === "tool_execution_end" && event.toolCallId === readEnd.toolCallId && event.result?.content), "刷新后没有重放已经完成的工具结果");
++  evidence.cardAfterReload = await checkReadCard();
++  assert.equal(events.some((event) => event.type === "tool_execution_end" && event.toolCallId === bashStart.toolCallId), false);
++  console.log("已验证：刷新页面后，已完成结果仍在原工具卡片中，慢调用继续运行。");
++  await fs.copyFile(path.join(project, "README.md"), path.join(project, "incoming"));
++  await fs.rename(path.join(project, "incoming"), target);
++  await until(() => events.some((event) => event.type === "agent_settled"), "实际命令完成后会话没有结束");
++  const bashEnd = events.find((event) => event.type === "tool_execution_end" && event.toolCallId === bashStart.toolCallId);
++  assert.ok(bashEnd);
++  const digest = createHash("sha256").update(await fs.readFile(target)).digest("hex");
++  assert.ok(bashEnd.result.content.some((part) => part.type === "text" && part.text.includes(digest)));
++  const canonical = events.filter((event) => event.type === "message_end" && event.message?.role === "toolResult");
++  for (const id of [readEnd.toolCallId, bashStart.toolCallId]) assert.equal(canonical.filter((event) => event.message.toolCallId === id).length, 1);
++  assert.equal(canonical.find((event) => event.message.toolCallId === readEnd.toolCallId).message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n"), expectedResult);
++  const contextReply = await context.request.get(`/api/sessions/${sessionId}/context`);
++  assert.ok(contextReply.ok(), await contextReply.text());
++  const { context: history } = await contextReply.json();
++  for (const id of [readEnd.toolCallId, bashStart.toolCallId]) {
++    assert.equal(history.messages.filter((message) => message.role === "toolResult" && message.toolCallId === id).length, 1);
++  }
++  evidence.status = "passed";
++  evidence.toolCalls = { read: readEnd.toolCallId, bash: bashStart.toolCallId };
++  console.log("已验证：正式结果与提前显示的结果一致，历史中每个调用只保存一次结果。");
++} catch (error) {
++  evidence.error = String(error);
++  if (page && !page.isClosed()) {
++    evidence.pageUrl = page.url();
++    evidence.pageText = await page.locator("body").innerText();
++    evidence.buttons = await page.getByRole("button").allTextContents();
++  }
++  throw error;
++} finally {
++  await browser?.close();
++  try {
++    if (sessionId && server.exitCode === null) {
++      const stopped = await fetch(`${base}/api/agent/${sessionId}`, { method: "POST", headers: { "Content-Type": "application/json",
++        ...(process.env.PI_WEB_PASSWORD ? { Authorization: `Basic ${Buffer.from(`:${process.env.PI_WEB_PASSWORD}`).toString("base64")}` } : {}) }, body: JSON.stringify({ type: "abort" }) });
++      assert.ok(stopped.ok, await stopped.text());
++    }
++  } finally {
++    if (server.exitCode === null) server.kill("SIGTERM");
++    await exited;
++    await fs.rm(agentDir, { recursive: true, force: true });
++    await fs.writeFile(path.join(directory, "verification.json"), JSON.stringify({ ...evidence, events, pageErrors }, null, 2));
++    console.log(`验收证据：${path.join(directory, "verification.json")}`);
++  }
++}
+diff --git a/hooks/useAgentSession.ts b/hooks/useAgentSession.ts
+index ed7ce67..c8630f1 100644
+--- a/hooks/useAgentSession.ts
++++ b/hooks/useAgentSession.ts
+@@ -45,7 +45,7 @@ import { HIDDEN_PAGE_GRACE_MS } from "@/hooks/usePageHidden";
+ import type { DebugClientLease, DebugClientSession, DebugEventConnectionSnapshot, DebugStreamCloseReason } from "@/lib/debug-types";
+ import { pageId, peekPageId, trackEventSource } from "@/lib/page-debug";
+ import type { TranslationParams } from "@/lib/i18n/types";
+-import { AGENT_EVENT_HEARTBEAT_MS, isNestedToolExecutionEvent, isSystemMessageEvent } from "@/lib/agent-event-wire";
++import { AGENT_EVENT_HEARTBEAT_MS, isNestedToolExecutionEvent, isSystemMessageEvent, toolResultFromExecutionEnd } from "@/lib/agent-event-wire";
+ import { runStatePhase } from "@/lib/chat-phase-label";
+ import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
+ import { CODEMODE_TOOL_NAME, getCodemodeProgress } from "@/lib/codemode-view";
+@@ -1878,6 +1878,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
+         }
+         // The replay that follows brings each running call's start with its elapsed time.
+         setToolClocks(endedToolClocks);
++        setActiveToolResults(new Map());
+         if (event.isStreaming === true) {
+           cancelEventStreamGrace();
+           sdkAgentActiveRef.current = true;
+@@ -2064,6 +2065,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
+           if (completed.role === "toolResult") {
+             const callId = (completed as ToolResultMessage).toolCallId;
+             setToolClocks((prev) => withoutToolClock(prev, callId));
++            setActiveToolResults((prev) => {
++              if (!prev.has(callId)) return prev;
++              const next = new Map(prev);
++              next.delete(callId);
++              return next;
++            });
+           }
+           if (completed.role === "assistant") {
+             const sid = sessionIdRef.current;
+@@ -2135,10 +2142,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
+         onToolEnd?.(event.toolName as string);
+         const endedAt = performance.now();
+         setToolClocks((prev) => applyToolClockEvent(prev, event, endedAt));
++        const result = toolResultFromExecutionEnd(event);
+         setActiveToolResults((prev) => {
+-          if (!prev.has(id)) return prev;
++          if (!result && !prev.has(id)) return prev;
+           const next = new Map(prev);
+-          next.delete(id);
++          if (result) next.set(id, result);
++          else next.delete(id);
+           return next;
+         });
+         setAgentPhase((prev) => {
+diff --git a/lib/agent-event-wire.test.mjs b/lib/agent-event-wire.test.mjs
+index 4d72d4e..add2fd4 100644
+--- a/lib/agent-event-wire.test.mjs
++++ b/lib/agent-event-wire.test.mjs
+@@ -1,5 +1,6 @@
+ import assert from "node:assert/strict";
+ import test from "node:test";
++import { readFileSync } from "node:fs";
+ import { createJiti } from "jiti";
+ 
+ const jiti = createJiti(import.meta.url);
+@@ -249,10 +250,9 @@ test("drops the progress updates of nested calls before rebuilding updates", ()
+   }
+ });
+ 
+-test("sends a tool end without its result", () => {
++test("sends display content with a top-level tool end and keeps nested ends slim", () => {
+   const result = {
+-    content: [{ type: "text", text: "x".repeat(4096) }],
+-    details: { structuredContent: { rows: [1, 2, 3] } },
++    content: [{ type: "text", text: readFileSync(new URL("../README.md", import.meta.url), "utf8") }],
+   };
+   const topLevel = toClientAgentEvent({
+     type: "tool_execution_end",
+@@ -266,6 +266,7 @@ test("sends a tool end without its result", () => {
+     toolCallId: "call-bash-1",
+     toolName: "bash",
+     isError: false,
++    result: { content: result.content, details: result.details, usage: undefined },
+   });
+   assert.equal(Object.hasOwn(topLevel, "parentToolCallId"), false);
+ 
+@@ -282,6 +283,7 @@ test("sends a tool end without its result", () => {
+     toolCallId: "call-bash-1",
+     toolName: "bash",
+     isError: false,
++    result: { content: result.content, details: result.details, usage: undefined },
+     durationMs: 4200,
+   });
+ 
+diff --git a/lib/agent-event-wire.ts b/lib/agent-event-wire.ts
+index a8c920b..fbeb197 100644
+--- a/lib/agent-event-wire.ts
++++ b/lib/agent-event-wire.ts
+@@ -1,4 +1,5 @@
+ import type { JsonAgentSessionEvent } from "@earendil-works/pi-coding-agent";
++import type { ToolResultMessage } from "./types";
+ import { withoutContentSignatures, withoutMessageSignatures } from "./message-signatures";
+ 
+ export interface AgentEventLike {
+@@ -81,12 +82,24 @@ function truncateCodemodeSnapshot(partialResult: unknown): unknown {
+   };
+ }
+ 
+-/**
+- * Nested calls travel as a slim start and end, and their progress updates are
+- * dropped. A `tool_execution_end` never carries `result`: the browser only
+- * reads its ids and time and renders the tool result message that follows, while the
+- * raw result can hold up to 1 MiB of bash output in `structuredContent`.
+- */
++export function toolResultFromExecutionEnd(event: AgentEventLike): ToolResultMessage | undefined {
++  if (event.type !== "tool_execution_end" || isNestedToolExecutionEvent(event)
++    || typeof event.toolCallId !== "string" || !isObject(event.result)
++    || !Array.isArray(event.result.content)) return undefined;
++  return {
++    role: "toolResult",
++    toolCallId: event.toolCallId,
++    toolName: typeof event.toolName === "string" ? event.toolName : undefined,
++    content: event.result.content as ToolResultMessage["content"],
++    details: event.result.details,
++    isError: event.isError === true,
++    usage: event.result.usage as ToolResultMessage["usage"],
++    ...(typeof event.durationMs === "number" ? { durationMs: event.durationMs } : {}),
++  };
++}
++
++// 普通调用在结束时交付实际结果；嵌套调用仍由所属工具展示。
++
+ function toClientToolExecutionEvent(event: AgentEventLike): AgentEventLike | null {
+   const nested = isNestedToolExecutionEvent(event);
+   if (event.type === "tool_execution_start") {
+@@ -114,6 +127,11 @@ function toClientToolExecutionEvent(event: AgentEventLike): AgentEventLike | nul
+     toolCallId: event.toolCallId,
+     toolName: event.toolName,
+     isError: event.isError,
++    ...(!nested && isObject(event.result) ? { result: {
++      content: event.result.content,
++      details: event.result.details,
++      usage: event.result.usage,
++    } } : {}),
+     // pi's measured run time: a card shows it before the result message, which
+     // a parallel batch sends only once its last call ends.
+     ...(!nested && typeof event.durationMs === "number" ? { durationMs: event.durationMs } : {}),
+diff --git a/lib/rpc-manager.ts b/lib/rpc-manager.ts
+index 6056897..ad19a30 100644
+--- a/lib/rpc-manager.ts
++++ b/lib/rpc-manager.ts
+@@ -355,6 +355,7 @@ export class AgentSessionWrapper {
+   // next stream miss that same event.
+   private listeners = new Set<EventListener>();
+   private activeToolEvents = new Map<string, ActiveToolEvents>();
++  private completedToolEvents = new Map<string, AgentEvent>();
+   private pendingUiResponses = new Map<string, PendingUiResponse>();
+   private pendingUiRequests = new Map<string, AgentEvent>();
+   private activeCustomUis = new Map<string, ActiveCustomUi>();
+@@ -636,6 +637,7 @@ export class AgentSessionWrapper {
+         invalidateSessionListCache();
+         // Every tool call of the run has finished; nothing is left to replay.
+         this.activeToolEvents.clear();
++        this.completedToolEvents.clear();
+       }
+       // A name from setSessionName(), an extension's included: a title generated
+       // in the background lands after the run's agent_end, a command's with no
+@@ -691,6 +693,11 @@ export class AgentSessionWrapper {
+    * end can still arrive after its parent's, and is ignored like the rest.
+    */
+   private trackActiveToolEvent(event: AgentEvent): void {
++    if (event.type === "message_end") {
++      const message = event.message as { role?: string; toolCallId?: string } | undefined;
++      if (message?.role === "toolResult" && message.toolCallId) this.completedToolEvents.delete(message.toolCallId);
++      return;
++    }
+     const toolCallId = event.toolCallId;
+     if (typeof toolCallId !== "string" || isNestedToolExecutionEvent(event)) return;
+     if (event.type === "tool_execution_start") {
+@@ -699,6 +706,7 @@ export class AgentSessionWrapper {
+       const active = this.activeToolEvents.get(toolCallId);
+       if (active) active.update = event;
+     } else if (event.type === "tool_execution_end") {
++      this.completedToolEvents.set(toolCallId, event);
+       this.activeToolEvents.delete(toolCallId);
+       const nestedPrefix = `${toolCallId}/`;
+       for (const id of this.activeToolEvents.keys()) {
+@@ -1164,6 +1172,7 @@ export class AgentSessionWrapper {
+       listener({ ...start, elapsedMs: Math.max(0, Math.round(now - startedAt)) });
+       if (update) listener(update);
+     }
++    for (const event of this.completedToolEvents.values()) listener(event);
+     for (const event of this.startupNotices ?? []) listener(event);
+     return () => {
+       this.listeners.delete(listener);
+@@ -1939,6 +1948,7 @@ export class AgentSessionWrapper {
+     this.pendingUiResponses.clear();
+     this.pendingUiRequests.clear();
+     this.activeToolEvents.clear();
++    this.completedToolEvents.clear();
+     this.clearExtensionWidgets(false);
+ 
+     const finishDispose = () => {

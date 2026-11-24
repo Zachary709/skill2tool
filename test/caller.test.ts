@@ -44,8 +44,11 @@ test("caller guidelines name each tool and delegate configured procedures to its
 		const tool = await manifestAt(file);
 		const guidelines = callerPromptGuidelines(tool);
 		assert.ok(guidelines.every((rule) => rule.startsWith(tool.name)));
-		assert.ok(guidelines.some((rule) => rule.includes("任务原句") && rule.includes("授权限制")));
-		assert.ok(guidelines.some((rule) => rule.includes("禁止扩写为操作指南")));
-		assert.ok(defaultAgentInstructions(tool).includes("A concise request may omit configured procedures and defaults"));
+		for (const rule of tool.notFor ?? []) assert.ok(guidelines.includes(`${tool.name} 不用于：${rule}`));
+		assert.ok(guidelines.some((rule) => rule.includes("本轮动作") && rule.includes("最少入口")));
+		assert.ok(guidelines.some((rule) => rule.includes("授权限制") && rule.includes("不得新增用户未要求")));
+		assert.ok(guidelines.some((rule) => rule.includes("不复述 worker 已知历史、文件内容或固定参数")));
+		assert.ok(guidelines.some((rule) => rule.includes("任务标识或文件路径引用")));
+		assert.ok(defaultAgentInstructions(tool).includes("Read existing configuration instead of requiring repeated background or parameters"));
 	}
 });

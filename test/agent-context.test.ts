@@ -21,10 +21,11 @@ test("parallel history publishes completed real tasks without exposing active sn
 	const directory = await fs.mkdtemp(path.join(parent, "run-"));
 	try {
 		const history = new WorkerHistory(directory, process.cwd(), path.join(directory, "memory.md"));
+		const other = new WorkerHistory(directory, process.cwd(), path.join(directory, "memory.md"));
 		const submission: ToolEnvelope = JSON.parse(await fs.readFile(fixture, "utf8"));
 		const job = { task: "查询英雄联盟s16总决赛目前赛况" };
 		const first = await history.snapshot();
-		const second = await history.snapshot();
+		const second = await other.snapshot();
 		assert.notEqual(first.manager.getSessionId(), second.manager.getSessionId());
 		assert.equal(first.leafId, null);
 		assert.equal(second.leafId, null);
@@ -32,17 +33,18 @@ test("parallel history publishes completed real tasks without exposing active sn
 		// 重放真实查询结果，检查共享历史只在任务完成时发生变化。
 		first.manager.appendMessage({ role: "user", content: job.task, timestamp: Date.now() });
 		second.manager.appendMessage({ role: "user", content: job.task, timestamp: Date.now() });
-		await history.complete(first, job, submission);
+		const secondPublished = await other.complete(second, job, submission);
 		const third = await history.snapshot();
-		assert.ok(completedSessions(third.manager).includes(first.manager.getSessionId()));
-		assert.ok(!completedSessions(third.manager).includes(second.manager.getSessionId()));
-		assert.equal(second.manager.getBranch().length, 1);
+		assert.ok(completedSessions(third.manager).includes(second.manager.getSessionId()));
+		assert.ok(!completedSessions(third.manager).includes(first.manager.getSessionId()));
+		assert.equal(first.manager.getBranch().length, 1);
 
-		await history.complete(second, job, submission);
-		const fourth = await history.snapshot();
+		const firstPublished = await history.complete(first, job, submission);
+		const fourth = await other.snapshot();
 		assert.ok(completedSessions(fourth.manager).includes(first.manager.getSessionId()));
 		assert.ok(completedSessions(fourth.manager).includes(second.manager.getSessionId()));
-		assert.ok(!completedSessions(third.manager).includes(second.manager.getSessionId()));
+		assert.ok(!completedSessions(third.manager).includes(first.manager.getSessionId()));
+		assert.deepEqual(fourth.manager.getBranch().map((entry) => entry.id), [secondPublished.completedEntryId, firstPublished.completedEntryId]);
 	} finally {
 		await fs.rm(directory, { recursive: true, force: true });
 	}

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { promises as fs, openSync, closeSync, writeSync } from "node:fs";
 import * as path from "node:path";
 import {
 	createAgentSession,
+	createBashToolDefinition,
+	createLocalBashOperations,
 	DefaultResourceLoader,
 	ModelRuntime,
-	SessionManager,
 	SettingsManager,
 	type AgentSession,
 	type ExtensionAPI,
@@ -14,7 +15,6 @@ import {
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { validateEnvelope, validateResultShape, validateSummary } from "../contracts/schema.ts";
-import { acquireWorkerLock } from "../jobs/lock.ts";
 import {
 	compactionUsage,
 	DEFAULT_WORKER_CONTEXT_POLICY,
@@ -50,13 +50,19 @@ export interface WorkerRunResult {
 
 export interface WorkerProgressEntry {
 	time: string;
-	kind: "thinking" | "text" | "tool" | "result";
+	kind: "thinking" | "text" | "tool" | "result" | "status" | "update";
 	text: string;
 	tool?: string;
 	isError?: boolean;
+	sessionFile?: string;
+	sessionId?: string;
+	event?: "model_request";
+	callId?: string;
+	internal?: boolean;
 }
 
 export type WorkerProgressSink = (entry: WorkerProgressEntry) => void;
+export type WorkerAudit = (operation: string, input: Record<string, unknown>, signal?: AbortSignal) => Promise<void>;
 
 function progressText(value: unknown, limit: number): string {
 	const text = typeof value === "string" ? value : JSON.stringify(value ?? null);
@@ -138,6 +144,7 @@ export function buildSystemPrompt(
 		"",
 		"## Operating rules",
 		"- Work on exactly one delegated job at a time.",
+		"- Never read or write /tmp. Use the runtime's dedicated intermediate directories for temporary files.",
 		"- Resolve relative paths against the tool directory unless the job says otherwise.",
 		"- Do not ask the user questions. If required information is missing, submit status needs_input.",
 		"- Do not call the facade tool itself. It is not in your tool list.",
@@ -158,9 +165,11 @@ export function buildSystemPrompt(
 				]
 			: []),
 		"## Input contract",
-		"- The job input states the task goal and necessary constraints. Use only the declared input fields; do not infer extra work.",
+		"- The job input states the current goal, necessary new conditions, and references. It need not repeat the user's message, prior jobs, source descriptions, or existing configuration. Use only declared fields; do not infer extra work.",
+		"- Resolve references from completed history for the same project and task, then read the named files and relevant configuration. Obtain existing parameters, commands, implementation details, and prior outcomes there; do not require the caller to copy them into the request.",
+		"- When continuing an existing task, retain its established inputs, configuration, and resource constraints unless the current job explicitly changes them. A brief reference does not permit changing omitted settings or repeating prior execution grants.",
 		"- A concise request may omit configured procedures, strategies, verification, output conventions, and safety rules. Apply this tool's instructions and defaults without asking the caller to restate them.",
-		"- Preserve explicit business requirements, necessary context, paths, and authorization controls. Submit needs_input only when essential task data is missing or conflicts with the contract.",
+		"- Preserve explicit new requirements and authorization controls. Only submit needs_input when essential information remains unavailable or ambiguous after checking the relevant history and references, or when current requirements conflict. History and files never replace current authorization fields.",
 		"- The input decides which output fields matter. Return those fields, not everything you happened to observe.",
 		"",
 		"## Output contract",
@@ -282,7 +291,7 @@ function createSubmitResultTool(
 	};
 }
 
-function createServiceTool(tool: ToolManifest, supervisor: ServiceSupervisor): ToolDefinition {
+function createServiceTool(tool: ToolManifest, supervisor: Pick<ServiceSupervisor, "call">): ToolDefinition {
 	return {
 		name: "service_call",
 		label: "Call service",
@@ -292,14 +301,15 @@ function createServiceTool(tool: ToolManifest, supervisor: ServiceSupervisor): T
 			method: Type.Optional(Type.String()),
 			params: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 		}),
-		execute: async (_id, params) => {
+		execute: async (_id, params, signal) => {
+			signal?.throwIfAborted();
 			const input = params as { service: string; method?: string; params?: Record<string, unknown> };
 			const service = tool.services?.[input.service];
 			const payload =
 				service?.type === "script"
 					? (input.params ?? {})
 					: { method: input.method, params: input.params ?? {} };
-			const result = await supervisor.call(tool, input.service, payload);
+			const result = await supervisor.call(tool, input.service, payload, signal);
 			if (!result.ok) {
 				return {
 					content: [{ type: "text", text: `service "${input.service}" failed: ${result.error}` }],
@@ -323,7 +333,6 @@ export class AgentWorker {
 	};
 	private context?: WorkerContext;
 	private contextDecision?: ContextDecision;
-	private readonly maintenanceWarnings: string[] = [];
 	private readonly contextPolicy: Partial<WorkerContextPolicy>;
 	private readonly key: string;
 	private readonly sessionDir: string;
@@ -334,17 +343,19 @@ export class AgentWorker {
 	private readonly cwd: string;
 	private readonly agentDir: string;
 	private readonly modelRuntime: ModelRuntime;
-	private readonly supervisor: ServiceSupervisor;
+	private readonly supervisor: Pick<ServiceSupervisor, "call">;
 	private readonly log: (message: string) => void;
 	private readonly onProgress?: WorkerProgressSink;
 	private readonly defaultModel?: string;
 	private readonly extraTools: ToolDefinition[];
 	private readonly callerThinkingLevel?: AgentConfig["thinkingLevel"];
-	private readonly history?: WorkerHistory;
+	private readonly history: WorkerHistory;
 	private historySnapshot?: HistorySnapshot;
 	private thinkingFallbackReason?: string;
 	private running = false;
 	private jobDirectory?: string;
+	private readonly toolOutput = new Map<string, { previous: string; pending: string; preview: string }>();
+	private readonly audit?: WorkerAudit;
 
 	constructor(
 		tool: ToolManifest,
@@ -352,13 +363,14 @@ export class AgentWorker {
 		cwd: string,
 		agentDir: string,
 		modelRuntime: ModelRuntime,
-		supervisor: ServiceSupervisor,
+		supervisor: Pick<ServiceSupervisor, "call">,
 		log: (message: string) => void,
 		onProgress?: WorkerProgressSink,
 		defaultModel?: string,
 		extraTools: ToolDefinition[] = [],
 		contextPolicy: Partial<WorkerContextPolicy> = {},
 		callerThinkingLevel?: AgentConfig["thinkingLevel"],
+		audit?: WorkerAudit,
 	) {
 		this.tool = tool;
 		this.agent = agent;
@@ -370,6 +382,7 @@ export class AgentWorker {
 		this.defaultModel = defaultModel;
 		this.extraTools = extraTools;
 		this.callerThinkingLevel = callerThinkingLevel;
+		this.audit = audit;
 		const context = resolveAgentContext(tool.agent?.context);
 		this.contextPolicy = {
 			contextBudgetTokens: context.budgetTokens,
@@ -387,21 +400,18 @@ export class AgentWorker {
 				? path.join(agentDir, "tool-memory", `${tool.name}.md`)
 				: path.join(this.sessionDir, "memory.md");
 		this.journalPath = path.join(this.sessionDir, "journal.jsonl");
-		if (tool.agent?.concurrency === "parallel") {
-			this.history = new WorkerHistory(this.sessionDir, this.cwd, this.memoryPath);
-		}
+		this.history = new WorkerHistory(this.sessionDir, this.cwd, this.memoryPath);
 	}
 
 	private async createSession(signal?: AbortSignal): Promise<AgentSession> {
 		await fs.mkdir(this.sessionDir, { recursive: true });
 		await fs.mkdir(path.dirname(this.memoryPath), { recursive: true });
 
-		this.historySnapshot = await this.history?.snapshot(signal);
-		const sessionManager = this.historySnapshot?.manager ?? SessionManager.continueRecent(this.cwd, this.sessionDir);
-		if (this.historySnapshot) {
-			this.jobDirectory = path.join(this.tool.dir ?? this.cwd, "_intermediate", sessionManager.getSessionId());
-			await fs.mkdir(this.jobDirectory, { recursive: true });
-		}
+		this.onProgress?.({ time: new Date().toISOString(), kind: "status", text: "等待读取 worker 历史" });
+		this.historySnapshot = await this.history.snapshot(signal);
+		const sessionManager = this.historySnapshot.manager;
+		this.jobDirectory = path.join(this.tool.dir ?? this.cwd, "_intermediate", sessionManager.getSessionId());
+		await fs.mkdir(this.jobDirectory, { recursive: true });
 		const memory = await readIfExists(this.memoryPath);
 		if (memory && sessionManager.buildSessionContext().messages.length === 0) {
 			sessionManager.appendCustomMessageEntry(
@@ -410,9 +420,7 @@ export class AgentWorker {
 				false,
 			);
 		}
-		const model = this.defaultModel
-			? modelFromRuntime(this.modelRuntime, this.defaultModel)
-			: (await this.modelRuntime.getAvailable())[0];
+		const model = modelFromRuntime(this.modelRuntime, this.defaultModel);
 		if (!model) throw new Error(`Worker model is unavailable: ${this.defaultModel ?? "(none)"}`);
 		this.context = new WorkerContext(sessionManager, model, this.contextPolicy);
 		this.contextDecision = this.context.prepare();
@@ -435,14 +443,43 @@ export class AgentWorker {
 		this.state.onSubmitted = () => settingsManager.setCompactionEnabled(false);
 		const thinking = resolveWorkerThinking(model, this.agent.thinkingLevel, this.callerThinkingLevel);
 		this.thinkingFallbackReason = thinking.fallbackReason;
-		if (this.historySnapshot && this.contextDecision.mode === "checkpoint") {
+		if (this.contextDecision.mode === "checkpoint") {
 			const entry = [...sessionManager.getBranch()].reverse().find((item) => item.type === "compaction");
 			if (entry?.type === "compaction") {
-				this.history!.captureCompaction(this.historySnapshot, entry, sessionManager.getBranch());
+				this.history.captureCompaction(this.historySnapshot, entry, sessionManager.getBranch());
 			}
 		}
 
 		const compactionExtension = (pi: ExtensionAPI) => {
+			if (this.tool.permissions?.bash && process.env.PI_TOOL_JOB_DIRECTORY) {
+				const options = { shellPath: settingsManager.getShellPath(), commandPrefix: settingsManager.getShellCommandPrefix() };
+				const backend = createLocalBashOperations(options);
+				const audited = createBashToolDefinition(this.cwd, options);
+				audited.execute = async (id, input, signal, onUpdate, ctx) => {
+					signal?.throwIfAborted();
+					const fd = openSync(this.shellOutputFile(id)!, "a", 0o600);
+					const bash = createBashToolDefinition(this.cwd, { ...options, operations: {
+						exec: (command, cwd, execution) => backend.exec(command, cwd, { ...execution,
+							onData: (chunk) => { writeSync(fd, chunk); execution.onData(chunk); } }),
+					} });
+					try { return await bash.execute(id, input, signal, onUpdate, ctx); }
+					finally { closeSync(fd); }
+				};
+				pi.registerTool(audited);
+			}
+			pi.on("tool_call", async (event, ctx) => {
+				ctx.signal?.throwIfAborted();
+				const input = event.toolName === "submit_result" ? Object.fromEntries(Object.entries(event.input).filter(([key]) => key !== "handoff")) : event.input;
+				await this.audit?.(event.toolName, { toolCallId: event.toolCallId, arguments: input,
+					...(event.toolName === "bash" ? { outputPath: this.shellOutputFile(event.toolCallId) } : {}) }, ctx.signal);
+				ctx.signal?.throwIfAborted();
+			});
+			pi.on("before_provider_request", async (_event, ctx) => {
+				ctx.signal?.throwIfAborted();
+				await this.audit?.("model_request", { provider: ctx.model?.provider, model: ctx.model?.id }, ctx.signal);
+				ctx.signal?.throwIfAborted();
+				this.onProgress?.({ time: new Date().toISOString(), kind: "status", text: "等待模型响应", event: "model_request" });
+			});
 			pi.on("context", (event, ctx) => {
 				const tokens = Math.max(ctx.getContextUsage()?.tokens ?? 0, this.context!.estimateContextTokens());
 				this.state.handoffRequired ||= this.context!.needsHandoff(tokens);
@@ -464,17 +501,7 @@ export class AgentWorker {
 			pi.on("session_compact", async (event) => {
 				this.context?.didCompact();
 				this.state.handoffRequired = false;
-				if (this.historySnapshot) {
-					this.history!.captureCompaction(this.historySnapshot, event.compactionEntry, sessionManager.getBranch());
-					return;
-				}
-				try {
-					await fs.writeFile(this.memoryPath, event.compactionEntry.summary, "utf8");
-				} catch (error) {
-					const warning = `failed to write worker memory: ${String(error)}`;
-					this.maintenanceWarnings.push(warning);
-					this.log(warning);
-				}
+				this.history.captureCompaction(this.historySnapshot!, event.compactionEntry, sessionManager.getBranch());
 			});
 		};
 
@@ -520,7 +547,6 @@ export class AgentWorker {
 			customTools.push(createServiceTool(this.tool, this.supervisor));
 		}
 		customTools.push(...this.extraTools);
-
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
 			agentDir: this.agentDir,
@@ -539,40 +565,49 @@ export class AgentWorker {
 			}
 			this.emitProgress(event);
 		});
+		this.onProgress?.({ time: new Date().toISOString(), kind: "status", text: "worker 会话已建立", internal: true, sessionFile: session.sessionFile, sessionId: session.sessionId });
 		return session;
+	}
+
+	private shellOutputFile(callId: string): string | undefined {
+		const directory = process.env.PI_TOOL_JOB_DIRECTORY;
+		return directory ? path.join(directory, `bash-${createHash("sha256").update(callId).digest("hex")}.log`) : undefined;
 	}
 
 	private emitProgress(event: { type: string; [key: string]: unknown }): void {
 		if (!this.onProgress) return;
 		const time = new Date().toISOString();
 		try {
-			if (event.type === "message_end") {
-				const message = event.message as { role?: string; content?: unknown } | undefined;
-				if (!message || message.role !== "assistant") return;
-				const blocks = Array.isArray(message.content) ? message.content : [];
-				for (const block of blocks) {
-					const part = block as { type?: string; thinking?: string; text?: string; name?: string; arguments?: unknown };
-					if (part.type === "thinking" && part.thinking) {
-						this.onProgress({ time, kind: "thinking", text: progressText(part.thinking, 4000) });
-					} else if (part.type === "text" && part.text) {
-						this.onProgress({ time, kind: "text", text: progressText(part.text, 4000) });
-					} else if (part.type === "toolCall" && part.name) {
-						const args = part.arguments as Record<string, unknown> | undefined;
-						const publicArgs = part.name === "submit_result" && args
-							? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "handoff"))
-							: args;
-						this.onProgress({ time, kind: "tool", tool: part.name, text: progressText(publicArgs ?? {}, 500) });
-					}
-				}
-				return;
+			if (event.type === "tool_execution_update") {
+				const partial = event.partialResult as { content?: Array<{ text?: string }> } | undefined;
+				const output = (partial?.content ?? []).map((part) => part.text ?? "").join("\n").replace(/\r\n?/g, "\n");
+				const callId = String(event.toolCallId);
+				const prior = this.toolOutput.get(callId);
+				if (!output || output === prior?.previous) return;
+				const appended = prior && output.startsWith(prior.previous);
+				const current = (appended ? prior.pending : "") + (appended ? output.slice(prior.previous.length) : output);
+				const preview = current.replace(/\s+/g, " ").trim().slice(-400);
+				this.toolOutput.set(callId, { previous: output, pending: current.slice(current.lastIndexOf("\n") + 1), preview: preview || prior?.preview || "" });
+				if (preview && preview !== prior?.preview) this.onProgress({ time, kind: "update", tool: String(event.toolName), callId, text: preview });
 			}
+			if (event.type === "tool_execution_start") {
+				const args = event.args as Record<string, unknown> | undefined;
+				this.onProgress({ time, kind: "tool", tool: String(event.toolName), callId: String(event.toolCallId),
+					text: event.toolName === "submit_result" ? "提交任务结果" : progressText(args, 500), internal: event.toolName === "submit_result" });
+			}
+			if (event.type === "auto_compaction_start") this.onProgress({ time, kind: "status", text: "压缩上下文" });
 			if (event.type === "tool_execution_end") {
+				const streamed = this.toolOutput.has(String(event.toolCallId));
+				const exitCode = (event.result as { structuredContent?: { exit_code?: number } })?.structuredContent?.exit_code;
+				this.toolOutput.delete(String(event.toolCallId));
 				this.onProgress({
 					time,
 					kind: "result",
 					tool: String(event.toolName ?? ""),
+					callId: String(event.toolCallId),
 					isError: Boolean(event.isError),
-					text: summarizeToolResult(event.result),
+					text: streamed && !event.isError ? `执行完成${exitCode !== undefined ? `，退出码 ${exitCode}` : ""}` : summarizeToolResult(event.result),
+					internal: event.toolName === "submit_result",
 				});
 			}
 		} catch (error) {
@@ -590,18 +625,12 @@ export class AgentWorker {
 		this.running = true;
 		try {
 			await this.dispose();
-			this.maintenanceWarnings.length = 0;
+			this.toolOutput.clear();
 			this.state.pending = undefined;
 			this.state.handoff = undefined;
 			this.state.handoffRequired = false;
 			this.state.onSubmitted = undefined;
-			if (this.history) return await this.runJob(job, signal ?? new AbortController().signal);
-			const lock = await acquireWorkerLock(this.sessionDir, signal);
-			try {
-				return await this.runJob(job, lock.signal);
-			} finally {
-				await lock.release();
-			}
+			return await this.runJob(job, signal ?? new AbortController().signal);
 		} finally {
 			this.running = false;
 		}
@@ -615,7 +644,7 @@ export class AgentWorker {
 		const previousEntries = new Set(this.context!.manager.getEntries().map((entry) => entry.id));
 
 		const abortHandler = () => {
-			void session.abort();
+			void session.abort().catch((error) => this.log(`取消 worker 失败: ${String(error)}`));
 		};
 		signal?.addEventListener("abort", abortHandler, { once: true });
 
@@ -632,12 +661,14 @@ export class AgentWorker {
 
 		let promptError: unknown;
 		try {
+			signal.throwIfAborted();
 			let initialError: unknown;
 			try {
 				await session.prompt(payload);
 			} catch (error) {
 				initialError = error;
 			}
+			signal.throwIfAborted();
 			let failed = session.messages.at(-1);
 			const failedMessage = initialError instanceof Error ? initialError.message : initialError !== undefined
 				? String(initialError)
@@ -652,6 +683,7 @@ export class AgentWorker {
 				);
 				if (failedEntry) this.context!.manager.appendContextEdit(failedEntry.id, null);
 				session.setThinkingLevel(this.callerThinkingLevel);
+				signal.throwIfAborted();
 				await session.prompt(`Continue the same job with the caller's model settings. Preserve completed work and finish with submit_result.\n\n${payload}`);
 				failed = session.messages.at(-1);
 			} else if (initialError !== undefined) {
@@ -660,6 +692,7 @@ export class AgentWorker {
 			if (!this.state.pending && failed?.role === "assistant" && failed.stopReason === "error") {
 				throw new Error(failed.errorMessage ?? "Worker model request failed");
 			}
+			signal.throwIfAborted();
 			if (!this.state.pending) {
 				warnings.push("worker finished without calling submit_result; retrying once");
 				await session.prompt(
@@ -672,7 +705,7 @@ export class AgentWorker {
 			signal.removeEventListener("abort", abortHandler);
 		}
 
-		const envelope: ToolEnvelope = promptError
+		const envelope: ToolEnvelope = signal.aborted ? { status: "cancelled", summary: "任务已取消" } : promptError
 			? {
 				status: signal.aborted ? "cancelled" : "failed",
 				summary: promptError instanceof Error ? promptError.message : String(promptError),
@@ -699,9 +732,7 @@ export class AgentWorker {
 				warnings.push(`failed to persist worker handoff; original history retained: ${String(error)}`);
 			}
 		}
-		const history = this.historySnapshot
-			? await this.history!.complete(this.historySnapshot, job, envelope, this.state.handoff)
-			: undefined;
+		const history = await this.history.complete(this.historySnapshot!, job, envelope, signal.aborted ? undefined : this.state.handoff);
 		const usage = {
 			...delta,
 			contextUsage: stats.contextUsage,
@@ -721,7 +752,6 @@ export class AgentWorker {
 				handoffBytes: this.state.handoff ? Buffer.byteLength(JSON.stringify(this.state.handoff), "utf8") : 0,
 			},
 		};
-		warnings.push(...this.maintenanceWarnings);
 		try {
 			this.context!.recordRun(delta, this.contextDecision!, checkpointEntryId);
 		} catch (error) {

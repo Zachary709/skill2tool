@@ -1,0 +1,30 @@
+{
+  "name": "process_command",
+  "version": "1.0.0",
+  "description": "执行指定程序并返回其真实退出状态与输出。",
+  "kind": "direct",
+  "input": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string", "description": "程序路径。" },
+      "args": { "type": "array", "items": { "type": "string" }, "description": "程序参数。" }
+    },
+    "required": ["command"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "exitCode": { "type": ["number", "null"] },
+      "signal": { "type": ["string", "null"], "maxLength": 40 },
+      "stdout": { "type": "string", "maxLength": 4000 },
+      "stderr": { "type": "string", "maxLength": 4000 }
+    },
+    "required": ["exitCode", "signal", "stdout", "stderr"],
+    "additionalProperties": false
+  },
+  "services": {
+    "run": { "type": "script", "command": "node", "args": ["command.mjs"], "protocol": "json-stdin-stdout" }
+  },
+  "execution": { "defaultMode": "sync" }
+}

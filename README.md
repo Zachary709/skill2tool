@@ -11,6 +11,7 @@ The main Pi agent only sees a tool facade: name, description, input schema, and 
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Tool discovery](#tool-discovery)
+- [Tool categories and on-demand loading](#tool-categories-and-on-demand-loading)
 - [Tool package layout](#tool-package-layout)
 - [TOOL.json reference](#tooljson-reference)
 - [Services](#services)
@@ -59,7 +60,70 @@ Tools are discovered from:
 - `~/.pi/agent/tools/`
 - `<project>/.pi/tools/`
 
-Package tools load first and always load. A user or project tool with the same name is skipped with a collision diagnostic. Project tools load only when the project is trusted.
+Package tools register first and always register. A user or project tool with the same name is skipped with a collision diagnostic. Project tools register only when the project is trusted. Registration is separate from model visibility: specialized tools wait for on-demand loading by default.
+
+## Tool categories and on-demand loading
+
+The plugin preserves the existing base tools and provides two permanent entry points, `tool_find` and `tool_use`. `tool_find` uses MiniSearch over tool metadata and returns candidate names, capabilities, and current activation status without changing the active set. `tool_use` describes or invokes one exact tool. The main prompt gains only a short description of each domain; the selected tool's input contract and guidelines are provided through tool results as needed. Discovery adds no inference worker.
+
+The plugin uses distinct tool names and registers alongside the CLI and Pi Web's built-in `tool_search` without changing built-in configuration. The current session uses `tool_find` for discovery. Initialization and reset leave the built-in search inactive; while `tool_find` is active, the built-in search declaration is omitted from model requests. SDK users only need to load this plugin.
+
+Default categories:
+
+| Category | Capabilities | Existing tools |
+| --- | --- | --- |
+| `research` | Information and papers | `web_search`, `paper_reader` |
+| `infrastructure` | Devices and compute | `ssh_manager`, `tailscale_manager`, `adaptive_computation` |
+| `runtime` | Runtime maintenance | `service_keeper`, `tool_add` |
+| `other` | Other capabilities | Tools without category information |
+
+Optional `TOOL.json` metadata:
+
+```json
+{
+  "category": "research/papers",
+  "tags": ["papers", "authors"],
+  "defaultActive": false,
+  "exposure": "deferred"
+}
+```
+
+- `category` assigns one primary category using lowercase letters, digits, and underscores, optionally `domain/subgroup`. Other domains are supported.
+- `tags` adds search terms across categories: up to 16 unique, nonblank strings.
+- Without `category`, the plugin classifies the existing names above, then uses a valid `namespace` other than the generic default for other tools, otherwise `other`. Existing tool files need no migration.
+- Specialized tools start inactive. Legacy `exposure: "direct"` tools also register as `deferred`; `kind` still controls direct execution versus worker execution. Set `defaultActive: true` to keep a tool active by default. Explicit `model-only` tools default to active; `codemode` and `hidden` retain their reachability semantics.
+- When `namespace` is absent or has the legacy default `tool`, the primary domain becomes the namespace.
+
+The main agent uses `tool_find` to search by task, tool name, category, or tag, then chooses one exact tool:
+
+```json
+{"tool":"paper_reader"}
+```
+
+Calling `tool_use` without `input` returns the target's full description, input schema, and guidelines without activating it. Supplying `input` runs the selected tool:
+
+```json
+{"tool":"paper_reader","input":{"request":"Read the specified paper and answer the current question."}}
+```
+
+Calls go through the SDK's `ctx.executeTool()`, preserving the original tool's argument validation, permission hooks, authorization fields, progress, and cancellation. Only a target whose `execute` actually ran is automatically added to this conversation; subsequent calls can use it directly. Calls rejected by schema validation or permission hooks do not activate the tool. Other search candidates stay inactive. Explicitly collapsing, resetting, or disabling a tool during a call prevents completion from adding it back. Business results, errors, and termination hints are forwarded; the SDK aggregates nested usage.
+
+Created, converted, added, and re-enabled tools enter the catalog; `defaultActive` controls their initial activation. Users can still explicitly load a tool or a category.
+
+User commands:
+
+```text
+/tool-catalog                       # List primary categories and loaded counts
+/tool-catalog research              # Browse a domain and its subgroups
+/tool-catalog research/papers       # Browse a subgroup
+/tool-catalog search papers         # Search across categories without loading
+/tool-catalog load paper_reader     # Load one tool
+/tool-catalog load research         # Load a category
+/tool-catalog unload research       # Collapse a category
+/tool-catalog reset                 # Restore the default active set
+```
+
+Loaded tools stay active within the session instead of unloading after each call. Pi can restore the branch's recorded active tools on resume, branch navigation, and reload; use `/tool-catalog reset` to immediately reduce an existing session after upgrading. New sessions start with the compact set. Commands change only tools managed by this plugin, preserving the current selection of base tools and other extensions. Collapsing or resetting does not cancel jobs or stop workers or daemons. Disabled tools are excluded from discovery. Project trust, tool allowlists, input validation, authorization fields, progress, and cancellation remain effective.
 
 ## Tool package layout
 
@@ -141,9 +205,9 @@ tools/repair-shop/
 | `direct` | Runs a declared service synchronously. |
 | `agent` | Creates a persistent worker that can call declared services through `service_call`. |
 
-### In-process handlers
+### Management handlers
 
-A packaged agent tool may declare `"handler": "tool_add"` or `"handler": "service_keeper"`. The runtime then runs its worker in process instead of a detached job, because the action changes live runtime state. Both handlers support only `mode: "sync"`.
+A packaged agent tool may declare `"handler": "tool_add"` or `"handler": "service_keeper"`. Its inference worker runs in an independent process. The private management tools forward operations through IPC to the parent runtime, which owns the live registry and shared services. Both handlers keep their synchronous public interface.
 
 ## Services
 
@@ -198,7 +262,7 @@ For `http-json`, the request body is `{"method":"ping","params":{}}` and the res
 
 Every service starts in the tool directory and keeps its state under `~/.pi/agent/services/<tool>/<service>`. Its daemon key is `user:<tool>:<service>`, so every project shares one handle. When a Unix socket or HTTP endpoint is already reachable, the runtime attaches to it instead of spawning another process.
 
-Each spawn writes `state.json` with the process id, cwd, and start time under the state directory. The same directory receives `PI_SERVICE_STATE_DIR`, and the child environment carries `PI_TOOL_NAME` and `PI_SERVICE_NAME`.
+Daemon spawns write `state.json` with the process id, cwd, and start time under the state directory. The same directory receives `PI_SERVICE_STATE_DIR`, and the child environment carries `PI_TOOL_NAME` and `PI_SERVICE_NAME`.
 
 ### Tool daemon maintenance
 
@@ -208,7 +272,7 @@ Each spawn writes `state.json` with the process id, cwd, and start time under th
 { "request": "检查 adaptive-service，必要时恢复一次。", "allowRepair": true }
 ```
 
-A tool's daemon services start eagerly when the tool is registered. The runtime owns the protocol client, so a restart must run inside the runtime. The `service_keeper` worker therefore runs in process and receives an extra `service_keeper_manage` tool:
+A tool's daemon services start eagerly when the tool is registered. The runtime owns the protocol client, so a restart must run inside the runtime. The independent `service_keeper` worker receives `service_keeper_manage`, an IPC proxy to the parent runtime:
 
 | Action | Arguments | Result |
 | --- | --- | --- |
@@ -220,9 +284,18 @@ A tool's daemon services start eagerly when the tool is registered. The runtime 
 
 ## Worker model
 
-A worker uses the caller's current model and thinking level. When the caller has no session model, the runtime reads `defaultProvider` and `defaultModel` from Pi settings. Tool manifests and agent files do not select another model. Job records store the caller's model and thinking level; usage records include the worker's effective thinking level and any fallback reason.
+A worker uses the model and thinking level configured for agent tools, without switching between jobs. The default model is `lqy-阿里云节省计划/deepseek-v4.1-flash-1017`; the thinking level follows the caller by default. The setting lives in `~/.pi/agent/tool-runtime.json`:
 
-`agent.thinkingLevel` sets a tool's preferred level. `web_search` prefers `low`. If model capabilities exclude that level, it uses the caller's settings immediately. If the API explicitly rejects `low`, the worker continues the same job once with the caller's thinking setting, preserving completed operations. Authentication, network, and unrelated request errors do not trigger this fallback.
+```json
+{
+  "model": "lqy-阿里云节省计划/deepseek-v4.1-flash-1017",
+  "thinkingLevel": "high"
+}
+```
+
+`/tool-model` writes the current session's model and thinking level to the config; `/tool-model <model id>` writes a model id directly and asks for the full name when several providers share it; `/tool-model <provider/model>` takes the full name; `/tool-model reset` removes the setting and returns to the default; `/tool-model show` reports the current model, thinking level, source, and config path. Changes apply to the next job. The `PI_TOOL_MODEL` environment variable takes precedence over the model in the config file. Job records store this model; when it is missing from the model runtime or has no credentials, the job fails instead of selecting another model.
+
+A tool's `agent.thinkingLevel` decides first; `web_search` prefers `low`. When it is unset, the level fixed by `/tool-model` applies, and without that the caller's level applies. If model capabilities exclude a tool's preferred level, the level chosen for that model applies instead. When a level exceeds the model capabilities, Pi lowers it to the nearest supported level. If the API explicitly rejects `low`, the worker continues the same job once with an available thinking level, preserving completed operations. Authentication, network, and unrelated request errors do not trigger this fallback. Usage records include the worker's effective thinking level and any fallback reason.
 
 Workers use the scope names `user` and `project`.
 
@@ -233,7 +306,7 @@ Workers use the scope names `user` and `project`.
 
 The older value `global` is still accepted and reads as `user`, with a deprecation warning.
 
-`agent.concurrency` defaults to `serial`. A tool with `"concurrency": "parallel"` starts each request in an independent session from a snapshot containing completed tasks. An active request does not enter another request's snapshot. Completion immediately appends the task, typed result, source evidence, optional handoff, and archive reference to shared history. Locks cover snapshot creation and publication only; model requests run concurrently. Each request gets its own intermediate directory. Tools that manage live runtime state require serial execution.
+`agent.concurrency` defaults to `serial` and controls queuing within one conversation; `"concurrency": "parallel"` also permits concurrent requests within that conversation. Different conversations always use independent worker sessions and can call the same tool concurrently, including different projects sharing history through `sessionScope: "user"`. Each request starts from a snapshot of completed tasks; active requests remain isolated. Before results return, completion appends the task, typed result, source evidence, optional handoff, and archive reference to shared history in completion order. Locks cover snapshot creation and publication only, leaving model requests and tool execution concurrent. Each request gets its own intermediate directory. Tools managing live runtime state remain serial within their conversation. New conversations use job ownership locks to recognize other runtimes' active tasks without changing their state or waiting for them.
 
 ## Input and result contracts
 
@@ -243,8 +316,8 @@ Both sides are closed by default.
 
 - The facade rejects any key that the manifest does not declare, in addition to JSON Schema validation. A caller can send only the declared fields.
 - `"additionalProperties": false` keeps the contract explicit; the loader warns when it is missing.
-- For natural language `request` and `task` fields, pass a complete user task directly. Add only necessary context the worker cannot obtain, preserving explicit user requirements, paths, and authorization limits. Do not expand the task into an operating guide or invent extra scope, verification, output, or safety requirements. Keep complex user requirements complete.
-- The builder normalizes these parameter descriptions. Registration adds caller `promptGuidelines` that name the tool. Request text is neither truncated nor rewritten, no rewriting model is called, and authorization fields and existing validation remain unchanged.
+- Natural language `request` and `task` fields state the current goal, necessary new conditions, and locating references. Resolve pronouns without copying the user's whole message, worker history, file contents, or fixed parameters. For an existing task, give the fewest task identifiers or file references that uniquely locate it, without enumerating supporting documents and result paths. The worker retains unchanged inputs, configuration, and resource constraints; the caller does not append parameter values or confirmations about keeping them. Usually one sentence stating the goal and necessary new conditions is enough. Do not add unrequested checks, output metrics, or formatting. Preserve essential unavailable facts and current authorization limits.
+- The builder normalizes these parameter descriptions. Registration adds caller `promptGuidelines` that name the tool and include both `whenToUse` and `notFor` selection boundaries. Request text is neither truncated nor rewritten, no rewriting model is called, and authorization fields and existing validation remain unchanged.
 
 A search request can simply be:
 
@@ -252,7 +325,7 @@ A search request can simply be:
 {"request":"查询英雄联盟 S16 当前赛况。"}
 ```
 
-The worker applies its existing search, verification, and result instructions.
+The worker applies its existing search, verification, and result instructions. For a continuation, it reads completed history for the same project and task and the referenced configuration or results. The caller does not copy prior events, source descriptions, or parameter lists.
 
 ### Result
 
@@ -264,7 +337,7 @@ The worker applies its existing search, verification, and result instructions.
 - arrays are limited to 50 items unless `maxItems` says otherwise;
 - `summary` is at most 300 characters and at most three lines.
 
-On violation the worker receives the exact errors and must resubmit a result that conforms to the contract. Worker instructions require conclusions and supporting facts; process narration, thinking, tool transcripts, commands, and logs stay in the worker session and progress records.
+On violation the worker receives the exact errors and must resubmit a result that conforms to the contract. Worker instructions require conclusions and supporting facts. Thinking and full tool transcripts stay in the private worker session; progress records contain status, public text, and tool activity.
 
 An untyped object property is treated as a bag: its keys are not checked, but its string values still pass the size limits. The loader warns about any `type: "object"` output field without `properties`.
 
@@ -314,9 +387,9 @@ Read or wait for that job through the same tool:
 | `result` | Read an existing job's result. |
 | `cancel` | Cancel an existing job. |
 
-`job` is an internal concept. There is no separate public job tool. Every agent-backed tool exposes job operations through its own `mode` and `jobId` fields. The `/tool-runtime` command can list runtime jobs for diagnostics.
+`job` is an internal concept. There is no separate public job tool. Only tools configured for background execution expose `mode` and `jobId`. Every invocation, including direct tools and management tools, has an internal job record and can be controlled with user commands.
 
-Jobs run in detached worker processes. The job store survives a Pi restart. On restart, queued jobs are re-enqueued; running jobs with a dead worker are marked `lost`.
+Each invocation records the caller session, run, toolCallId, and jobId. One task controller owns its cancellation signal, state, progress, operations, and process cleanup. The parent runtime is the sole writer of job state. The store survives a Pi restart; unfinished records are marked `lost` when ownership has been lost, without replaying queued work or signalling historical PIDs.
 
 When a started job finishes and the requesting agent is idle, the runtime sends a short completion message. The full result stays in the job store.
 
@@ -326,7 +399,25 @@ Job files live in `<project>/.pi/jobs/<jobId>/`:
 job.json
 result.json
 events.jsonl
+progress.jsonl
+processes.jsonl
+stdout.log
+stderr.log
+intermediate/    # Runtime temporary files and Bash output
 ```
+
+### Cancellation
+
+```text
+/tool-cancel <job id, short id, or index>
+/tool-cancel all
+```
+
+These commands execute directly, including while the model is busy. A single cancellation leaves sibling tasks running. Stopping the caller aborts its current child tasks and ends the outer wait promptly. Business request fields stay unchanged. Every model request and tool execution requires approval and an operation record from the parent task. Cancellation prevents new approvals and model retries, and the current run cannot restart a tool that the user cancelled.
+
+The state remains `cancelling` while cleanup is pending. A dedicated supervisor first requests cancellation, then allows a bounded grace period before forcing owned processes to stop. On Linux it uses a child subreaper and stable pidfd handles to cover descendants, including detached commands, avoid PID reuse, and reap exited children. `cancelled` is committed only after cleanup is confirmed; a later successful worker result cannot overwrite cancellation. Shared daemons remain owned by the parent runtime and are excluded from task process cleanup.
+
+Task execution requires Linux x64/arm64 with glibc and kernel support for pidfd and child subreapers. Unsupported environments fail before inference starts. Runtime shutdown cancels its owned jobs. Cancelling never rolls back completed file changes, service restarts, or remote submissions. `events.jsonl` records requested and completed operations, interrupted operations, worker results, and final state; the archived session records tool arguments and outcomes. Bash output is also written to `intermediate/bash-*.log` and listed in `job.json` under `outputFiles`, retaining received output after forced termination. Runtime temporary files use the job intermediate directory, never `/tmp`. An interrupted operation can have partial effects and requires checking its actual state.
 
 ## Worker agents
 
@@ -377,7 +468,7 @@ Packaged tools use a threshold of 272000 tokens, retaining 4000 recent tokens fo
 
 A completed handoff can compact history without another model request. Reaching the budget triggers compaction regardless of predicted cache reuse. Usage records report the budget, token estimates, compaction usage, effective thinking, and shared-history publication. Once the final result is accepted, the task finishes and publishes history without a trailing summarization request.
 
-Parallel shared history contains completed results and source observation times. Full intermediate transcripts stay in independent run archives. A summary can replace only the shared prefix covered by its snapshot; newer completions remain present. A stale summary cannot replace a newer shared compaction. Serial tools continue their existing worker session. Compaction preserves the fixed system prompt, and each job appends a short record to `journal.jsonl`.
+Shared history for every agent tool contains completed results and source observation times. Full intermediate transcripts stay in independent run archives. A summary can replace only the shared prefix covered by its snapshot; newer completions remain present. A stale summary cannot replace a newer shared compaction. Existing serial worker sessions are preserved as shared history when the first snapshot is created. Compaction preserves the fixed system prompt, and each job appends a short record to `journal.jsonl`.
 
 Worker files live under:
 
@@ -385,18 +476,20 @@ Worker files live under:
 ~/.pi/agent/tool-workers/<worker-key>/
 ├── memory.md
 ├── journal.jsonl
-├── shared.jsonl     # completed history for parallel tools
+├── shared.jsonl     # completed history for agent tools
 └── runs/            # independent request archives
 ```
 
 ## Progress display
 
-The worker writes one compact JSON line per step to `<project>/.pi/jobs/<jobId>/progress.jsonl`: thinking, reply text, each tool call, and each tool result. The facade reads that file and shows it in a TUI widget while a job runs, so the steps stay out of the conversation context.
+See the [Pi Web integration notes](integrations/pi-web/README.md) for immediate results in the original tool cards, reconnect recovery, and service activation.
 
-Three display channels are all fed from the same file:
+Workers send actual tool activity and phase changes through IPC. The task controller persists `progress.jsonl` and chooses the display supported by the interface: independent job widgets in interactive modes, or matching tool updates through `onUpdate` without a UI. Model requests record one waiting state; token streaming, model prose, and raw thinking do not generate progress messages. Repeated output previews are deduplicated while complete command output remains archived.
 
-- the running tool call streams the latest lines as partial output, so the tool block itself shows what the worker is doing;
-- an editor widget repeats the last lines above the editor and clears four seconds after the job reaches a terminal state;
+Live jobs use event subscriptions. File polling is used only without a subscription and does not publish unchanged content. Updates contain only the current activity or state change, without replaying previous history. Elapsed time alone never triggers a progress message; `startedAt` and `finishedAt` let clients maintain their own clocks.
+
+- TUI and RPC interfaces show independent widget and status keys for each job, even when an `onUpdate` callback is present. Progress is not duplicated in tool messages.
+- Print, JSON, and other noninteractive calls receive progress through `onUpdate`. Internal call updates are merged into one history row; widgets clear four seconds after a terminal state. Cancellation completion emits one UI notification.
 - `/tool-progress` pins a snapshot for 30 seconds, then clears it; `/tool-progress off` clears it immediately. A reference that matches no job only prints a warning and does not create a widget.
 
 A job reference never needs the full job id:
@@ -409,20 +502,20 @@ A job reference never needs the full job id:
 | `/tool-progress <short id>` | Selects a job by short id. |
 | `/tool-progress <fragment>` | Accepts an id prefix, suffix, or fragment when it matches exactly one job. |
 
-The widget header and status line show the short id instead of the full job id. Partial output is replaced by the final tool result, so only the result reaches the conversation. Nothing in the progress file is appended to the main conversation or to the worker's own later turns.
+The widget header and status line show the short id. Queue waits, model requests, internal tools, service waits, context compaction, and cancellation have distinct activity entries. `/tool-progress` also includes management tool jobs. Partial output is replaced by the final tool result, so only the result reaches the conversation. Nothing in the progress file is appended to the main conversation or to the worker's own later turns.
 
 ## Bundled tools
 
 `basic-tools/` holds the tools this package needs itself. They are ordinary tool directories, so they also appear in the pi tool list:
 
-- `basic-tools/tool_add/` — agent tool. Its own worker prompt lives in `basic-tools/tool_add/agent/`; `manager.ts`, `plan.ts`, and `artifacts.ts` implement the in-process management action the worker calls. The manifest declares `"handler": "tool_add"`, so the worker runs in process and can register tools in the live registry.
-- `basic-tools/service_keeper/` — agent tool that checks and recovers services registered in the agent directory's `services/registry.json`, and daemons declared by installed tools. It declares `"handler": "service_keeper"`, so its worker runs in process and restarts tool daemons through the runtime.
+- `basic-tools/tool_add/` — agent tool. Its own worker prompt lives in `basic-tools/tool_add/agent/`; `manager.ts`, `plan.ts`, and `artifacts.ts` implement the in-process management action the worker calls. The manifest declares `"handler": "tool_add"`; the independent worker registers tools in the live parent registry through IPC.
+- `basic-tools/service_keeper/` — agent tool that checks and recovers services registered in the agent directory's `services/registry.json`, and daemons declared by installed tools. It declares `"handler": "service_keeper"`; its independent worker accesses daemon management through IPC.
 
 A packaged tool runs with the `package` scope. Its daemons start in the tool directory, its state stays under the agent directory, and it needs no project trust.
 
 ## tool_add
 
-`tool_add` accepts one natural language `request` containing the tool name, source path, requirements, and scope. The worker extracts and executes the internal management action. Scope defaults to `project`; use `user` only when explicitly requested. It runs synchronously in the current process.
+`tool_add` accepts one natural language `request` containing the tool name, source path, requirements, and scope. The worker extracts and executes the internal management action. Scope defaults to `project`; use `user` only when explicitly requested. It returns synchronously while inference runs in a supervised child process.
 
 The worker uses the prompt files in `basic-tools/tool_add/agent/`, and the read-only tools plus `tool_add_manage`. `tool_add_manage` is the in-process action backed by `manager.ts`; the worker is the only caller that supplies a `plan`.
 
@@ -448,9 +541,9 @@ The worker reads the skill and its supporting files, designs one plan from the s
 }
 ```
 
-The caller states the complete requirement in `request`; `tool_add` does not read the chat history. The requirement is the complete brief: what the tool does, the input, the result, and any script, service, or path the tool must use. The worker designs the plan and applies it the same way as a conversion.
+The caller states the current goal, necessary new conditions, and requirement file references in `request`; `tool_add` does not read the main conversation. The worker establishes behavior, input, result, and required scripts, services, or paths from the request, matching completed history, and referenced files. It does not require a copied existing brief. The worker designs the plan and applies it the same way as a conversion.
 
-Creation and conversion keep the public interface small: one short capability sentence and only the inputs the caller must supply or control independently. General workers prefer one natural language `request` or `task` field containing the task and necessary background; a tool that only needs a path can expose `path` directly. Descriptions for `request` and `task` use `直接写用户任务及必要条件，不扩写工具规则。`, and examples state concise goals. Other parameter descriptions stay brief, and necessary validation and authorization fields remain explicit. Procedures, script options, environment configuration, source verification, output conventions, and safety rules belong in the tool's internal `AGENT.md`, `WORKFLOW.md`, and `EXAMPLES.md`. Keep `whenToUse` to necessary selection situations and use `notFor` only for a real ambiguity or safety boundary.
+Creation and conversion keep the public interface small: one short capability sentence and only the inputs the caller must supply or control independently. General workers prefer one natural language `request` or `task` field containing the current goal, necessary new conditions, and references; a tool that only needs a path can expose `path` directly. Descriptions for `request` and `task` use `本轮目标及新增条件；已有背景和配置只给引用。`, and examples state concise goals. Other parameter descriptions stay brief, and necessary validation and authorization fields remain explicit. Procedures, script options, environment configuration, source verification, output conventions, and safety rules belong in the tool's internal `AGENT.md`, `WORKFLOW.md`, and `EXAMPLES.md`. Keep `whenToUse` to necessary selection situations and use `notFor` only for a real ambiguity or safety boundary.
 
 Newly generated tools run synchronously by default, without `mode`, `timeoutMs`, or `jobId`. When the skill's behavior or the requirement needs background execution, set `execution.asyncByDefault: true` in the plan and let the runtime add the job control parameters.
 

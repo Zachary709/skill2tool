@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
+import jsonlines from "jsonlines";
+import type { JobRecord } from "../types.ts";
 import type { WorkerProgressEntry } from "../agents/worker.ts";
 
 export type ProgressWidgetPlacement = "aboveEditor" | "belowEditor";
@@ -7,6 +9,7 @@ export type ProgressWidgetPlacement = "aboveEditor" | "belowEditor";
 export interface ProgressUi {
 	setWidget?: (key: string, content: string[] | undefined, options?: { placement?: ProgressWidgetPlacement }) => void;
 	setStatus?: (key: string, text: string | undefined) => void;
+	notify?: (message: string, type?: "info" | "warning" | "error") => void;
 }
 
 export interface ProgressSnapshot {
@@ -17,6 +20,10 @@ export interface ProgressSnapshot {
 	entries: WorkerProgressEntry[];
 	lines: string[];
 	updatedAt?: string;
+	phase?: string;
+	startedAt?: string;
+	finishedAt?: string;
+	latestEntry?: WorkerProgressEntry;
 	error?: string;
 }
 
@@ -36,7 +43,7 @@ const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled", "timed_out"
 
 export function shortJobRef(jobId: string): string {
 	const parts = jobId.split("_").filter(Boolean);
-	return parts.length > 0 ? parts[parts.length - 1] : jobId;
+	return parts.length > 0 ? parts[parts.length - 1].slice(0, 8) : jobId;
 }
 
 export const PROGRESS_WIDGET_KEY = "tool-progress";
@@ -49,10 +56,14 @@ function marker(entry: WorkerProgressEntry): string {
 	switch (entry.kind) {
 		case "thinking":
 			return "思考";
+		case "status":
+			return "状态";
 		case "text":
 			return "说明";
 		case "tool":
 			return "调用";
+		case "update":
+			return "进展";
 		case "result":
 			return entry.isError ? "失败" : "结果";
 		default:
@@ -64,8 +75,30 @@ export function formatProgressEntry(entry: WorkerProgressEntry): string {
 	const clock = entry.time?.slice(11, 19) ?? "--:--:--";
 	const tool = entry.tool ? ` ${entry.tool}` : "";
 	const text = (entry.text ?? "").replace(/\s+/g, " ").trim();
-	const line = text.length > 160 ? `${text.slice(0, 160)}…` : text;
+	const line = text.length > 160 ? entry.kind === "update" ? `…${text.slice(-160)}` : `${text.slice(0, 160)}…` : text;
 	return `${clock} [${marker(entry)}]${tool} ${line}`;
+}
+
+function entryKey(entry: WorkerProgressEntry | undefined): string {
+	return entry ? JSON.stringify([entry.kind, entry.tool, entry.callId, entry.isError ?? false, formatProgressEntry({ ...entry, time: "" })]) : "";
+}
+
+function compactEntries(entries: WorkerProgressEntry[]): WorkerProgressEntry[] {
+	const rows: WorkerProgressEntry[] = [];
+	const calls = new Map<string, number>();
+	for (const entry of entries) {
+		if (entryKey(rows.at(-1)) === entryKey(entry)) continue;
+		const action = entry.callId && ["tool", "update", "result"].includes(entry.kind) ? entry.callId : undefined;
+		const index = action ? calls.get(action) : undefined;
+		if (index !== undefined) {
+			if (entryKey(rows[index]) !== entryKey(entry)) rows[index] = entry;
+		} else {
+			if (action) calls.set(action, rows.length);
+			rows.push(entry);
+		}
+		if (action && entry.kind === "result") calls.delete(action);
+	}
+	return rows;
 }
 
 export async function readProgressEntries(filePath: string, limit = 8): Promise<WorkerProgressEntry[]> {
@@ -75,27 +108,28 @@ export async function readProgressEntries(filePath: string, limit = 8): Promise<
 	} catch {
 		return [];
 	}
-	const lines = text.split("\n").filter((line) => line.trim());
 	const entries: WorkerProgressEntry[] = [];
-	for (const line of lines.slice(-MAX_ENTRIES)) {
-		try {
-			entries.push(JSON.parse(line) as WorkerProgressEntry);
-		} catch {
-			// a partially written trailing line is skipped
-		}
-	}
+	const parser = jsonlines.parse({ emitInvalidLines: true });
+	parser.on("data", (entry: WorkerProgressEntry) => {
+		entries.push(entry);
+		if (entries.length > MAX_ENTRIES) entries.shift();
+	});
+	await new Promise<void>((resolve, reject) => { parser.on("error", reject); parser.on("end", resolve); parser.end(text); });
 	return entries.slice(-limit);
 }
 
-async function readJobState(jobPath: string): Promise<{ state?: string; tool?: string; createdAt?: string; jobId?: string }> {
+async function readJobState(jobPath: string): Promise<{ state?: JobRecord["state"]; tool?: string; createdAt?: string; jobId?: string; phase?: string; startedAt?: string; finishedAt?: string }> {
 	try {
 		const raw = JSON.parse(await fs.readFile(jobPath, "utf8")) as {
-			state?: string;
+			state?: JobRecord["state"];
 			tool?: string;
 			createdAt?: string;
 			id?: string;
+			phase?: string;
+			startedAt?: string;
+			finishedAt?: string;
 		};
-		return { state: raw.state, tool: raw.tool, createdAt: raw.createdAt, jobId: raw.id };
+		return { state: raw.state, tool: raw.tool, createdAt: raw.createdAt, jobId: raw.id, phase: raw.phase, startedAt: raw.startedAt, finishedAt: raw.finishedAt };
 	} catch {
 		return {};
 	}
@@ -178,18 +212,25 @@ export async function snapshotProgress(options: {
 	if (!jobId) return { entries: [], lines: [], error };
 	const dir = path.join(options.jobsRoot, jobId);
 	const info = await readJobState(path.join(dir, "job.json"));
-	const entries = await readProgressEntries(path.join(dir, "progress.jsonl"), limit);
+	const entries = await readProgressEntries(path.join(dir, "progress.jsonl"), MAX_ENTRIES);
+	return snapshotFromRecord({ ...info, id: jobId }, entries, limit);
+}
+
+export function snapshotFromRecord(info: Partial<JobRecord> & { id: string }, entries: WorkerProgressEntry[], limit = 8): ProgressSnapshot {
+	const jobId = info.id;
 	const shortId = shortJobRef(jobId);
-	const header = `${info.tool ?? "tool"} · ${info.state ?? "unknown"} · ${shortId}`;
+	const state = info.state === "cancelling" ? "取消中" : info.state === "cancelled" ? "已取消" : info.state ?? "unknown";
+	const header = `${info.tool ?? "tool"} · ${state} · ${shortId}`;
+	const publicEntries = entries.filter((entry) => !entry.internal);
+	const latestEntry = publicEntries.at(-1);
+	const phase = info.phase ?? (latestEntry?.kind === "status" ? latestEntry.text : undefined);
+	const visible = compactEntries(publicEntries).slice(-limit);
+	const elapsed = info.startedAt ? Math.max(0, Math.floor(((info.finishedAt ? Date.parse(info.finishedAt) : Date.now()) - Date.parse(info.startedAt)) / 1000)) : undefined;
 	return {
-		jobId,
-		shortId,
-		state: info.state,
-		tool: info.tool,
-		entries,
-		lines: entries.length > 0 ? [header, ...entries.map(formatProgressEntry)] : [header, "（尚无进展记录）"],
-		updatedAt: entries[entries.length - 1]?.time,
-		error,
+		jobId, shortId, state: info.state, tool: info.tool, entries: visible, phase,
+		startedAt: info.startedAt, finishedAt: info.finishedAt, latestEntry,
+		lines: [header, ...(phase ? [`${phase}${elapsed !== undefined ? ` · 已运行 ${elapsed} 秒` : ""}`] : []), ...visible.filter((entry) => entry.kind !== "status").map(formatProgressEntry)],
+		updatedAt: latestEntry?.time ?? info.heartbeatAt,
 	};
 }
 
@@ -205,6 +246,7 @@ export class InlineProgress {
 	private readonly limit: number;
 	private flushTimer?: NodeJS.Timeout;
 	private closed = false;
+	private readonly key = `${PROGRESS_WIDGET_KEY}:${crypto.randomUUID()}`;
 
 	constructor(options: { ui: ProgressUi; title: string; limit?: number }) {
 		this.ui = options.ui;
@@ -228,8 +270,8 @@ export class InlineProgress {
 
 	private render(): void {
 		if (this.closed) return;
-		this.ui.setWidget?.(PROGRESS_WIDGET_KEY, [this.title, ...this.entries], { placement: "aboveEditor" });
-		this.ui.setStatus?.(PROGRESS_STATUS_KEY, this.title);
+		this.ui.setWidget?.(this.key, [this.title, ...this.entries], { placement: "aboveEditor" });
+		this.ui.setStatus?.(this.key, this.title);
 	}
 
 	stop(): void {
@@ -237,8 +279,8 @@ export class InlineProgress {
 		this.closed = true;
 		if (this.flushTimer) clearTimeout(this.flushTimer);
 		this.flushTimer = undefined;
-		this.ui.setWidget?.(PROGRESS_WIDGET_KEY, undefined);
-		this.ui.setStatus?.(PROGRESS_STATUS_KEY, undefined);
+		this.ui.setWidget?.(this.key, undefined);
+		this.ui.setStatus?.(this.key, undefined);
 	}
 }
 
@@ -250,6 +292,11 @@ export class ProgressWatcher {
 	private readonly log: (message: string) => void;
 	private readonly limit: number;
 	private readonly onUpdate?: ProgressUpdateSink;
+	private key = "";
+	private generation = 0;
+	private unsubscribe?: () => void;
+	private readonly snapshot?: (jobId: string) => Promise<ProgressSnapshot>;
+	private readonly subscribe?: (jobId: string, refresh: () => void) => () => void;
 
 	constructor(options: {
 		jobsRoot: string;
@@ -257,58 +304,90 @@ export class ProgressWatcher {
 		log?: (message: string) => void;
 		limit?: number;
 		onUpdate?: ProgressUpdateSink;
+		snapshot?: (jobId: string) => Promise<ProgressSnapshot>;
+		subscribe?: (jobId: string, refresh: () => void) => () => void;
 	}) {
 		this.jobsRoot = options.jobsRoot;
 		this.ui = options.ui;
 		this.log = options.log ?? (() => {});
 		this.limit = options.limit ?? 8;
 		this.onUpdate = options.onUpdate;
+		this.snapshot = options.snapshot;
+		this.subscribe = options.subscribe;
 	}
 
 	start(jobId: string): void {
-		this.stop();
+		if (this.key) this.stopAll(); else this.stop();
+		const generation = ++this.generation;
+		const key = this.key = `${PROGRESS_WIDGET_KEY}:${jobId}`;
+		let completed = false;
+		let running = false;
+		let pending = false;
+		let previous = "";
+		let previousEntry = "";
+		let previousState: string | undefined;
 		const render = async () => {
-			const snapshot = await snapshotProgress({ jobsRoot: this.jobsRoot, jobId, limit: this.limit });
-			if (!snapshot.state) {
-				this.stopAll();
-				return;
-			}
-			if (snapshot.lines.length === 0) return;
-			this.ui.setWidget?.(PROGRESS_WIDGET_KEY, snapshot.lines, { placement: "aboveEditor" });
-			this.onUpdate?.({
-				content: [{ type: "text", text: snapshot.lines.join("\n") }],
-				details: {
-					jobId: snapshot.jobId,
-					shortId: snapshot.shortId,
-					state: snapshot.state,
-					tool: snapshot.tool,
-				},
-			});
-			this.ui.setStatus?.(
-				PROGRESS_STATUS_KEY,
-				`${snapshot.tool ?? "tool"} ${snapshot.state ?? ""} ${snapshot.shortId ?? ""}`.trim(),
-			);
-			if (snapshot.state && TERMINAL_STATES.has(snapshot.state)) {
-				this.stopTimer();
-				this.clearTimer = setTimeout(() => {
-					this.ui.setWidget?.(PROGRESS_WIDGET_KEY, undefined);
-					this.ui.setStatus?.(PROGRESS_STATUS_KEY, undefined);
-				}, 4000);
+			while (pending && generation === this.generation && !completed) {
+				pending = false;
+				const snapshot = this.snapshot ? await this.snapshot(jobId) : await snapshotProgress({ jobsRoot: this.jobsRoot, jobId, limit: this.limit });
+				if (generation !== this.generation) return;
+				if (!snapshot.state) { this.stopAll(); return; }
+				const entry = snapshot.latestEntry ?? snapshot.entries.at(-1);
+				const activity = snapshot.state === "cancelling" || TERMINAL_STATES.has(snapshot.state) ? "" : entryKey(entry);
+				const signature = JSON.stringify([snapshot.jobId, snapshot.tool, snapshot.state, snapshot.phase, activity]);
+				if (signature === previous) continue;
+				const terminal = TERMINAL_STATES.has(snapshot.state);
+				const stateChange = previousState !== snapshot.state;
+				const text = entry && activity !== previousEntry && !terminal && snapshot.state !== "cancelling"
+					? formatProgressEntry(entry)
+					: snapshot.phase && snapshot.phase !== snapshot.state ? snapshot.phase : snapshot.lines[0];
+				previous = signature; previousEntry = activity; previousState = snapshot.state;
+				if (this.ui.setWidget) {
+					this.ui.setWidget(key, snapshot.lines, { placement: "aboveEditor" });
+					if (stateChange) this.ui.setStatus?.(key, `${snapshot.tool ?? "tool"} ${snapshot.state} ${snapshot.shortId ?? ""}`.trim());
+				} else {
+					this.onUpdate?.({ content: [{ type: "text", text }], details: {
+						jobId: snapshot.jobId, shortId: snapshot.shortId, state: snapshot.state, tool: snapshot.tool,
+						phase: snapshot.phase, startedAt: snapshot.startedAt, finishedAt: snapshot.finishedAt,
+					} });
+				}
+				if (terminal) {
+					completed = true;
+					if (snapshot.state === "cancelled") this.ui.notify?.(`${snapshot.tool} ${snapshot.shortId} 已取消，任务子进程已回收。`, "info");
+					this.stopTimer();
+					if (this.ui.setWidget) this.clearTimer = setTimeout(() => {
+						if (generation !== this.generation) return;
+						this.ui.setWidget?.(key, undefined); this.ui.setStatus?.(key, undefined);
+					}, 4000);
+				}
 			}
 		};
-		void render();
-		this.timer = setInterval(() => {
-			void render().catch((error) => this.log(`progress render failed: ${String(error)}`));
-		}, 1000);
-		this.timer.unref?.();
+		const refresh = () => {
+			if (generation !== this.generation || completed) return;
+			pending = true;
+			if (running) return;
+			running = true;
+			void render().catch((error) => this.log(`progress render failed: ${String(error)}`)).finally(() => {
+				running = false;
+				if (pending) refresh();
+			});
+		};
+		this.unsubscribe = this.subscribe?.(jobId, refresh);
+		if (!this.subscribe) {
+			this.timer = setInterval(refresh, 1000);
+			this.timer.unref?.();
+		}
+		refresh();
 	}
 
 	private stopTimer(): void {
+		this.unsubscribe?.(); this.unsubscribe = undefined;
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
 	}
 
 	stop(): void {
+		this.generation++;
 		this.stopTimer();
 		if (this.clearTimer) clearTimeout(this.clearTimer);
 		this.clearTimer = undefined;
@@ -316,7 +395,9 @@ export class ProgressWatcher {
 
 	stopAll(): void {
 		this.stop();
-		this.ui.setWidget?.(PROGRESS_WIDGET_KEY, undefined);
-		this.ui.setStatus?.(PROGRESS_STATUS_KEY, undefined);
+		if (this.ui.setWidget) {
+			this.ui.setWidget(this.key, undefined);
+			this.ui.setStatus?.(this.key, undefined);
+		}
 	}
 }

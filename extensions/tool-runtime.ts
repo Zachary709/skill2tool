@@ -2,14 +2,36 @@ import * as path from "node:path";
 import {
 	getAgentDir,
 	ModelRuntime,
+	truncateHead,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { ToolRuntime } from "../src/runtime/tool-runtime.ts";
+import { parseToolModel, readToolModel, writeToolModel } from "../src/agents/tool-model.ts";
+import { ToolDiscovery } from "../src/discovery/tools.ts";
 import { formatJobRow } from "../src/observability/progress.ts";
 
 const PROGRESS_WIDGET_KEY = "tool-progress";
 const PROGRESS_STATUS_KEY = "tool-progress";
 const PIN_DURATION_MS = 30_000;
+
+function resolveRequestedModel(modelRuntime: ModelRuntime, target: string) {
+	if (target.includes("/")) {
+		const parsed = parseToolModel(target);
+		const model = modelRuntime.getModel(parsed.provider, parsed.id);
+		if (!model) throw new Error(`模型运行时中没有 ${parsed.model}`);
+		return model;
+	}
+	const all = modelRuntime.getModels().filter((model) => model.id === target);
+	const availableIds = new Set(modelRuntime.getAvailableSnapshot().map((model) => `${model.provider}\0${model.id}`));
+	const available = all.filter((model) => availableIds.has(`${model.provider}\0${model.id}`));
+	const matches = available.length > 0 ? available : all;
+	if (matches.length === 0) throw new Error(`模型运行时中没有 id 为 ${target} 的模型`);
+	if (matches.length > 1) {
+		const choices = matches.map((model) => `${model.provider}/${model.id}`).join("、");
+		throw new Error(`模型 id ${target} 对应多个模型：${choices}。请写成完整名称。`);
+	}
+	return matches[0];
+}
 
 interface ProgressUiContext {
 	ui: {
@@ -19,6 +41,8 @@ interface ProgressUiContext {
 }
 
 export default function toolRuntimeExtension(pi: ExtensionAPI) {
+	const discovery = new ToolDiscovery(pi);
+	discovery.register();
 	let runtime: ToolRuntime | undefined;
 	let modelRuntime: ModelRuntime | undefined;
 	let pinTimer: NodeJS.Timeout | undefined;
@@ -47,7 +71,7 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("tool-progress", {
-		description: "Show worker thinking and tool steps: /tool-progress [list|<index>|<short id>|off]",
+		description: "Show tool progress: /tool-progress [list|<index>|<short id>|off]",
 		handler: async (args, ctx) => {
 			const active = await waitForRuntime();
 			if (!active) {
@@ -90,6 +114,37 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("tool-cancel", {
+		description: "取消一个工具任务或本会话全部活动任务：/tool-cancel <任务编号|all>",
+		handler: async (args, ctx) => {
+			const active = await waitForRuntime();
+			if (!active) { ctx.ui.notify("工具运行时尚未就绪", "warning"); return; }
+			const reference = args.trim();
+			if (!reference) { ctx.ui.notify("用法：/tool-cancel <任务编号|all>，任务编号见 /tool-progress list", "info"); return; }
+			try {
+				const jobs = await active.cancelTasks(reference, ctx.sessionManager.getSessionId());
+				ctx.ui.notify(jobs.length ? `已请求取消 ${jobs.length} 个任务；清理状态见进展。` : "没有活动任务", "info");
+			} catch (error) { ctx.ui.notify(String(error), "warning"); }
+		},
+	});
+
+	pi.on("agent_start", (_event, ctx) => runtime?.beginRun(ctx.sessionManager.getSessionId()));
+	pi.on("agent_settled", (event, ctx) => runtime?.endRun(ctx.sessionManager.getSessionId(), event.aborted));
+
+	pi.registerCommand("tool-catalog", {
+		description: "分类浏览与加载工具：/tool-catalog [分类|search 关键词|load 目标|unload 目标|reset]",
+		handler: async (args, ctx) => {
+			const active = await waitForRuntime();
+			if (!active) { ctx.ui.notify("工具运行时尚未就绪", "warning"); return; }
+			try {
+				const output = truncateHead(active.catalogCommand(args));
+				ctx.ui.notify(output.content + (output.truncated ? "\n目录显示已截断，请按分类或关键词缩小范围。" : ""), "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			}
+		},
+	});
+
 	pi.registerCommand("tool-runtime", {
 		description: "Show pi-tool-runtime status: /tool-runtime [list|diagnostics]",
 		handler: async (args, ctx) => {
@@ -113,6 +168,57 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("tool-model", {
+		description: "切换 agent tool 的模型和 thinking level：/tool-model [provider/model|模型 id|reset|show]",
+		handler: async (args, ctx) => {
+			const agentDir = getAgentDir();
+			const target = args.trim();
+			try {
+				if (target === "show") {
+					const selection = await readToolModel(agentDir);
+					const source = selection.source === "env"
+						? "环境变量 PI_TOOL_MODEL"
+						: selection.source === "config" ? selection.path : `默认值（${selection.path}）`;
+					const rows = [
+						`Agent tool 模型：${selection.model}`,
+						`thinking level：${selection.thinkingLevel ?? "跟随调用方"}`,
+						`来源：${source}`,
+						"用法：/tool-model 切换到当前会话的模型和 thinking level；/tool-model <provider/model|模型 id> 指定模型；/tool-model reset 恢复默认；/tool-model show 查询。",
+					];
+					const parsed = parseToolModel(selection.model);
+					if (modelRuntime && !modelRuntime.getModel(parsed.provider, parsed.id)) {
+						rows.push("警告：模型运行时中没有这个模型，任务会失败。");
+					}
+					ctx.ui.notify(rows.join("\n"), "info");
+					return;
+				}
+				if (target === "reset") {
+					const restored = await writeToolModel(agentDir, undefined);
+					ctx.ui.notify(`Agent tool 设置已恢复默认：模型 ${restored.model}，thinking level 跟随调用方。新任务生效。`, "info");
+					return;
+				}
+				if (!modelRuntime) throw new Error("模型运行时尚未就绪");
+				if (!target && !ctx.model) throw new Error("当前会话没有模型，无法切换");
+				const selected = target
+					? resolveRequestedModel(modelRuntime, target)
+					: ctx.model!;
+				if (!(await modelRuntime.checkAuth(selected.provider))) throw new Error(`${selected.provider} 没有可用的凭据`);
+				const thinkingLevel = target ? undefined : ctx.thinkingLevel ?? pi.getThinkingLevel?.();
+				const choice = await writeToolModel(agentDir, { model: `${selected.provider}/${selected.id}`, thinkingLevel });
+				const env = process.env.PI_TOOL_MODEL?.trim();
+				ctx.ui.notify(
+					[
+						`Agent tool 已切换：模型 ${choice.model}，thinking level ${choice.thinkingLevel ?? "跟随调用方"}。新任务生效。`,
+						env ? `注意：环境变量 PI_TOOL_MODEL=${env} 优先于此设置。` : "",
+					].filter(Boolean).join("\n"),
+					"info",
+				);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+			}
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		clearPinnedProgress(ctx);
 		startup = (async () => {
@@ -130,6 +236,7 @@ export default function toolRuntimeExtension(pi: ExtensionAPI) {
 				agentDir,
 				projectTrusted: ctx.isProjectTrusted(),
 				modelRuntime,
+				discovery,
 				log: (message) => {
 					if (ctx.mode === "tui" || ctx.mode === "rpc") {
 						ctx.ui.notify(message, "warning");

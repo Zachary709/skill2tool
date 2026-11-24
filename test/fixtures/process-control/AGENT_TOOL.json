@@ -1,0 +1,31 @@
+{
+  "name": "process_command_agent",
+  "version": "1.0.0",
+  "description": "通过独立 agent 执行明确指定的程序并返回真实结果。",
+  "kind": "agent",
+  "input": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string", "description": "程序路径。" },
+      "args": { "type": "array", "items": { "type": "string" }, "description": "程序参数。" }
+    },
+    "required": ["command"],
+    "additionalProperties": false
+  },
+  "output": {
+    "type": "object",
+    "properties": {
+      "exitCode": { "type": ["number", "null"] },
+      "signal": { "type": ["string", "null"], "maxLength": 40 },
+      "stdout": { "type": "string", "maxLength": 4000 },
+      "stderr": { "type": "string", "maxLength": 4000 }
+    },
+    "required": ["exitCode", "signal", "stdout", "stderr"],
+    "additionalProperties": false
+  },
+  "agent": { "instructions": "AGENT.md", "workflow": "WORKFLOW.md", "tools": ["read"] },
+  "services": {
+    "run": { "type": "script", "command": "node", "args": ["command.mjs"], "protocol": "json-stdin-stdout" }
+  },
+  "execution": { "defaultMode": "start", "asyncByDefault": true }
+}

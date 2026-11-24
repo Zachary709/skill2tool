@@ -38,6 +38,7 @@ export function defaultAgentInstructions(manifest: ToolManifest): string {
 		"- Work on exactly one job at a time and stay inside the tool directory and the caller's project.",
 		"- Do not ask the user questions. If required information is missing, submit status needs_input with the exact missing field.",
 		"- A concise request may omit configured procedures and defaults. Apply this tool's workflow while preserving explicit task constraints and authorization.",
+		"- Resolve the current goal and new conditions from relevant completed history and referenced files. Read existing configuration instead of requiring repeated background or parameters; retain unchanged inputs, settings, and resource constraints. History never grants current authorization.",
 		"",
 		"## Result",
 		"- Finish every job with exactly one submit_result call.",
@@ -51,7 +52,7 @@ export function defaultWorkflow(manifest: ToolManifest): string {
 		"# Workflow",
 		"",
 		`1. Read the delegated task and the declared input fields for ${manifest.name}.`,
-		"2. Check the input against the contract. When a required field is missing, submit status needs_input.",
+		"2. Read relevant completed history and referenced files, then check the input against the contract. Submit needs_input only for essential information still unavailable or ambiguous.",
 		"3. Follow the agent instructions in the system prompt.",
 		manifest.services && Object.keys(manifest.services).length > 0
 			? "4. Call the declared services through service_call when the task needs them."
@@ -79,18 +80,23 @@ export async function writeToolArtifacts(
 	dir: string,
 	manifest: ToolManifest,
 	files: { instructions?: string; workflow?: string; examples?: string },
+	signal?: AbortSignal,
 ): Promise<void> {
+	signal?.throwIfAborted();
 	const persisted = { ...manifest };
 	delete persisted.dir;
 	await atomicWrite(path.join(dir, "TOOL.json"), `${JSON.stringify(persisted, null, 2)}\n`);
 	if (manifest.kind !== "agent") return;
 	if (files.instructions !== undefined) {
+		signal?.throwIfAborted();
 		await atomicWrite(path.join(dir, manifest.agent?.instructions ?? "AGENT.md"), `${files.instructions.trim()}\n`);
 	}
 	if (files.workflow !== undefined) {
+		signal?.throwIfAborted();
 		await atomicWrite(path.join(dir, manifest.agent?.workflow ?? "WORKFLOW.md"), `${files.workflow.trim()}\n`);
 	}
 	if (files.examples !== undefined) {
+		signal?.throwIfAborted();
 		await atomicWrite(path.join(dir, manifest.agent?.examples ?? "EXAMPLES.md"), `${files.examples.trim()}\n`);
 	}
 }
@@ -100,18 +106,22 @@ export async function writeToolArtifacts(
  * examples are generated from the manifest so every agent tool ships the
  * system prompt and the execution steps its worker needs.
  */
-export async function ensureAgentFiles(dir: string, manifest: ToolManifest): Promise<void> {
+export async function ensureAgentFiles(dir: string, manifest: ToolManifest, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	if (manifest.kind !== "agent") return;
 	const agentPath = path.join(dir, manifest.agent?.instructions ?? "AGENT.md");
 	const workflowPath = path.join(dir, manifest.agent?.workflow ?? "WORKFLOW.md");
 	const examplesPath = path.join(dir, manifest.agent?.examples ?? "EXAMPLES.md");
 	const exists = (filePath: string) => fs.access(filePath).then(() => true).catch(() => false);
+	signal?.throwIfAborted();
 	if (!(await exists(agentPath))) {
 		await atomicWrite(agentPath, `${defaultAgentInstructions(manifest)}\n`);
 	}
+	signal?.throwIfAborted();
 	if (!(await exists(workflowPath))) {
 		await atomicWrite(workflowPath, `${defaultWorkflow(manifest)}\n`);
 	}
+	signal?.throwIfAborted();
 	if (manifest.agent?.examples && !(await exists(examplesPath))) {
 		await atomicWrite(examplesPath, `${defaultExamples(manifest)}\n`);
 	}

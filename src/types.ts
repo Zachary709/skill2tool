@@ -5,6 +5,7 @@ export type AgentSource = "user" | "project" | "created-project" | "embedded";
 export type JobState =
 	| "queued"
 	| "running"
+	| "cancelling"
 	| "succeeded"
 	| "failed"
 	| "cancelled"
@@ -103,8 +104,13 @@ export interface ToolManifest {
 		jobIdleTimeoutMs?: number;
 	};
 	execution?: ExecutionConfig;
+	/** 主要能力分类，可包含一个子分类。 */
+	category?: string;
+	tags?: string[];
+	/** 注册后是否常驻主 agent 的工具列表。 */
+	defaultActive?: boolean;
 	exposure?: ToolExposure;
-	/** In-process handler for a package tool that must run inside the runtime. */
+	/** 由父进程通过 IPC 提供管理操作的随包工具。 */
 	handler?: "tool_add" | "service_keeper";
 	annotations?: ToolAnnotations;
 	namespace?: string;
@@ -153,7 +159,7 @@ export interface JobRecord {
 	mode: ToolMode;
 	state: JobState;
 	createdAt: string;
-	/** 调用方当前使用的 provider/model；没有会话模型时使用配置默认值。 */
+	/** agent tool 配置的 provider/model。 */
 	model?: string;
 	thinkingLevel?: AgentConfig["thinkingLevel"];
 	concurrency?: AgentConfig["concurrency"];
@@ -168,8 +174,21 @@ export interface JobRecord {
 	result?: ToolEnvelope;
 	error?: string;
 	artifacts?: Array<{ path: string; kind: string; description?: string }>;
+	cancelRequestedAt?: string;
+	phase?: string;
+	ownedPids?: number[];
+	cleanupError?: string;
+	auditError?: string;
+	forcedTermination?: boolean;
+	modelRequests?: number;
+	outputEvents?: number;
+	outputFiles?: string[];
+	managementTools?: import("./jobs/ipc.ts").RemoteTool[];
+	toolScope?: ToolManifest["scope"];
 	requester?: {
 		sessionId?: string;
+		runId?: string;
+		toolCallId?: string;
 		idle?: boolean;
 	};
 	usage?: Record<string, unknown>;

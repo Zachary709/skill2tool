@@ -1,6 +1,6 @@
 # Workflow
 
-1. Read `request` and extract one requested `action` and its necessary fields. Default the scope to `project`. Missing or ambiguous required information: submit `needs_input`.
+1. Read the current goal, new conditions, and references in `request`. Use relevant completed history and named files to extract one requested `action` and its necessary fields; do not require repeated background or configuration. Default the scope to `project`. Essential information still unavailable or ambiguous: submit `needs_input`.
 2. For `list`, `inspect`, `validate`, `add`, `enable`, or `disable`:
    - for `validate`, read the named TOOL.json and extract its manifest object;
    - call `tool_add_manage` with the action and the extracted fields;
@@ -12,14 +12,14 @@
    - declare a service for each existing script or server that speaks a runtime protocol, and grant `bash` for bundled command line tools that do not;
    - inspect the parent repository for services the skill depends on but does not contain. A referenced `service/` or `services/` deployment unit is bundled next to `skill/`, so use `service/...` paths; add its systemd user unit to `externalServices` with health and readiness URLs when known;
    - design one complete plan from the skill's actual behavior, following the compact caller interface rules in the system prompt;
-   - shorten the capability description and parameter descriptions; describe request/task as the goal and necessary conditions, keep configured procedures in worker instructions, and preserve explicit business and authorization requirements; remove redundant selection text and input fields; keep execution synchronous unless the skill needs background execution;
+   - shorten the capability description and parameter descriptions; request/task contains the current goal, necessary new conditions, and references without repeating history or configuration; keep configured procedures in worker instructions and preserve explicit new requirements and authorization; remove redundant selection text and input fields; keep execution synchronous unless the skill needs background execution;
    - call `tool_add_manage` with `action: "convert_skill"`, the source path, the scope, and `plan`;
    - on a plan validation failure, correct the reported fields and call it again.
 4. For `create_tool`:
-   - extract `name` and the complete `requirements` from `request`;
+   - extract `name` and the necessary `requirements` from `request`, relevant completed history, and named requirement files;
    - read project files only when the requirements name a script, a service, or a path that must be grounded;
    - design one complete plan that matches the stated requirement, following the compact caller interface rules in the system prompt;
-   - prefer one `request` or `task` field containing the goal and necessary conditions; retain explicit business requirements, background, paths, and authorization controls; put configured procedures in worker instructions and keep descriptions short; keep execution synchronous unless background execution is needed;
+   - prefer one `request` or `task` field containing the current goal, necessary new conditions, and references; read existing details from history and files, retain essential unshared facts and authorization controls, and keep configured procedures in worker instructions; keep execution synchronous unless background execution is needed;
    - call `tool_add_manage` with `action: "create_tool"`, the name and requirements, the scope, and `plan`;
    - on a plan validation failure, correct the reported fields and call it again.
 5. Check the manage result:

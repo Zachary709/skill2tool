@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { after, before, test } from "node:test";
+import pidtree from "pidtree";
 import { validateEnvelope, validateManifest, validateResultShape, validateSummary } from "../src/contracts/schema.ts";
 import { readManifestFile } from "../src/discovery/manifest.ts";
 import { resolveServicePlacement, ServiceSupervisor } from "../src/services/supervisor.ts";
@@ -15,6 +16,7 @@ import {
 	resolveJobReference,
 	shortJobRef,
 	snapshotProgress,
+	snapshotFromRecord,
 } from "../src/observability/progress.ts";
 import { JobManager } from "../src/jobs/manager.ts";
 import { writeJobRecord } from "../src/jobs/store.ts";
@@ -425,38 +427,44 @@ test("progress job reference resolves an index, a short id, and reports ambiguit
 	assert.ok(formatJobRow({ jobId: "job_echo_aaa_alpha1", tool: "echo", state: "running" }, 2).startsWith("2. alpha1"));
 });
 
-test("progress watcher streams widget lines and partial updates", async () => {
+test("real task progress only publishes changes through subscriptions and file polling", { timeout: 30000 }, async () => {
 	const root = path.join(tempRoot, "jobs-watch");
-	const dir = path.join(root, "job_watch");
-	await fs.mkdir(dir, { recursive: true });
-	await fs.writeFile(
-		path.join(dir, "job.json"),
-		JSON.stringify({ id: "job_watch", tool: "demo", state: "running", createdAt: "2026-01-03T00:00:00Z" }),
-	);
-	await fs.writeFile(
-		path.join(dir, "progress.jsonl"),
-		`${JSON.stringify({ time: "2026-01-03T00:00:01Z", kind: "thinking", text: "look at the manifest" })}\n`,
-	);
-
-	const widgets: string[][] = [];
-	const updates: Array<{ content: Array<{ type: string; text: string }> }> = [];
-	const watcher = new ProgressWatcher({
-		jobsRoot: root,
-		ui: {
-			setWidget: (_key, content) => {
-				if (content) widgets.push(content);
-			},
-		},
-		onUpdate: (partial) => updates.push(partial as never),
-	});
-	watcher.start("job_watch");
-	await new Promise((resolve) => setTimeout(resolve, 1200));
-	watcher.stopAll();
-
-	assert.ok(widgets.length >= 1, "expected at least one widget render");
-	assert.ok(widgets[widgets.length - 1][0].includes("watch"));
-	assert.ok(updates.length >= 1, "expected at least one partial update");
-	assert.ok(updates[updates.length - 1].content[0].text.includes("[思考]"));
+	const loaded = await readManifestFile("test/fixtures/process-control/TOOL.json");
+	assert.ok(loaded.manifest);
+	const manager = new JobManager({ root, agentDir: path.join(root, "agent"), notify: () => {}, log: console.error });
+	const updates: Array<Array<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }>> = [[], []];
+	const waitFor = async (condition: () => Promise<boolean>) => {
+		const deadline = Date.now() + 20000;
+		while (!await condition()) {
+			assert.ok(Date.now() < deadline, "等待真实进展超时");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+	};
+	const watchers = [
+		new ProgressWatcher({ jobsRoot: root, ui: {}, onUpdate: (partial) => updates[0].push(partial),
+			subscribe: (id, refresh) => manager.subscribe(id, refresh), snapshot: async (id) => {
+				const record = await manager.get(id);
+				return record ? snapshotFromRecord(record, manager.recent(id) ?? []) : { entries: [], lines: [] };
+			} }),
+		new ProgressWatcher({ jobsRoot: root, ui: {}, onUpdate: (partial) => updates[1].push(partial) }),
+	];
+	try {
+		const job = await manager.create({ manifest: loaded.manifest, input: { command: "sleep", args: ["120"] },
+			mode: "sync", cwd: process.cwd(), projectTrusted: true });
+		await waitFor(async () => (await manager.get(job.id))?.phase === "调用服务 run" && Boolean(job.pid) && (await pidtree(job.pid!)).length >= 3);
+		for (const watcher of watchers) watcher.start(job.id);
+		await waitFor(async () => updates.every((messages) => messages.length > 0));
+		const counts = updates.map((messages) => messages.length);
+		await new Promise((resolve) => setTimeout(resolve, 1200));
+		assert.deepEqual(updates.map((messages) => messages.length), counts, "仅计时变化不能重发进展");
+		manager.cancel(job.id);
+		await waitFor(async () => updates.every((messages) => messages.at(-1)?.details.state === "cancelled"));
+		for (const messages of updates) {
+			assert.equal(messages.filter((message) => message.details.state === "cancelled").length, 1);
+			assert.equal(messages.at(-1)?.details.jobId, job.id);
+			assert.ok(messages.at(-1)?.details.finishedAt);
+		}
+	} finally { for (const watcher of watchers) watcher.stopAll(); await manager.close(); }
 });
 
 test("inline progress writes a widget and clears it without notifications", async () => {
@@ -776,84 +784,75 @@ test("adding an agent tool writes AGENT.md and WORKFLOW.md", async () => {
 	assert.equal(loaded.manifest?.name, "added_agent");
 });
 
-test("runtime registers compact packaged tools and keeps management actions internal", async () => {
+test("runtime registers compact packaged tools in the real SDK and keeps management actions internal", async () => {
 	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
+	const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 	const cwd = path.join(tempRoot, "integration");
-	await fs.mkdir(cwd, { recursive: true });
-	const registered = new Map<
-		string,
-		{ name: string; execute: Function; description: string; parameters: { properties?: Record<string, unknown> } }
-	>();
-	let active: string[] = [];
-	const pi = {
-		registerTool: (definition: {
-			name: string;
-			execute: Function;
-			description: string;
-			parameters: { properties?: Record<string, unknown> };
-		}) => {
-			registered.set(definition.name, definition);
-		},
-		getActiveTools: () => [...active],
-		setActiveTools: (names: string[]) => {
-			active = [...names];
-		},
-		sendMessage: () => {},
-	};
-	const runtime = new ToolRuntime({
-		pi: pi as never,
-		cwd,
-		agentDir: path.join(cwd, "agent"),
-		projectTrusted: true,
-		modelRuntime: {} as never,
-		log: () => {},
-	});
+	const agentDir = path.join(cwd, "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json") });
+	let runtime: InstanceType<typeof ToolRuntime> | undefined;
+	const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, noSkills: true,
+		noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi) => {
+			pi.on("session_start", async () => {
+				runtime = new ToolRuntime({ pi, cwd, agentDir, projectTrusted: true, modelRuntime, log: console.error });
+				await runtime.initialize();
+			});
+		}] });
+	await loader.reload();
+	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime, resourceLoader: loader,
+		sessionManager: SessionManager.inMemory(cwd), settingsManager: SettingsManager.inMemory({ cacheWarming: "off" }) });
+	await session.bindExtensions({ mode: "print" });
 	try {
-		await runtime.initialize();
+		assert.ok(runtime);
 		assert.deepEqual(runtime.diagnostics, []);
-		assert.deepEqual([...registered.keys()].sort(), ["service_keeper", "tool_add"]);
-		const toolAdd = registered.get("tool_add");
-		assert.ok(toolAdd);
-		const keeper = registered.get("service_keeper");
-		assert.ok(keeper);
-		assert.equal(toolAdd!.parameters.properties?.mode, undefined);
-		assert.equal(toolAdd!.parameters.properties?.jobId, undefined);
-		assert.equal(keeper!.parameters.properties?.mode, undefined);
-		assert.equal(keeper!.parameters.properties?.jobId, undefined);
-		assert.deepEqual(Object.keys(toolAdd!.parameters.properties ?? {}), ["request"]);
-		assert.deepEqual(Object.keys(keeper!.parameters.properties ?? {}), ["request", "allowRepair"]);
-		assert.ok(!toolAdd!.description.includes("mode=sync"));
-		assert.ok(!keeper!.description.includes("mode=sync"));
-		const manage = (runtime as unknown as {
-			toolAddManageTool(cwd: string): { execute: Function };
-		}).toolAddManageTool(cwd);
+		const initial = session.getActiveToolNames();
+		assert.ok(initial.includes("tool_find") && initial.includes("tool_use"));
+		assert.ok(!initial.includes("tool_add") && !initial.includes("service_keeper"));
+		assert.equal(session.systemPrompt.includes("tool_add 的 request"), false);
+		assert.equal(session.getToolDefinition("tool_add")?.exposure, "deferred");
+		assert.equal(session.getToolDefinition("tool_add")?.namespace?.name, "runtime");
+		assert.deepEqual(runtime.catalogEntries().map((entry) => entry.category), ["runtime", "runtime"]);
+		assert.ok(runtime.catalogCommand("").includes("运行维护"));
+		assert.ok(runtime.catalogCommand("search 技能").includes("tool_add"));
+		const search = session.agent.state.tools.find((tool) => tool.name === "tool_find");
+		assert.ok(search);
+		const discovered = await search.execute("call-discover", { query: "runtime" }, new AbortController().signal);
+		assert.deepEqual((discovered.details as { candidates: Array<{ name: string }> }).candidates.map((tool) => tool.name).sort(), ["service_keeper", "tool_add"]);
+		assert.deepEqual(session.getActiveToolNames(), initial);
+		const use = session.agent.state.tools.find((tool) => tool.name === "tool_use");
+		assert.ok(use);
+		const inspected = await use.execute("call-inspect", { tool: "tool_add" }, new AbortController().signal);
+		assert.deepEqual(Object.keys((inspected.details as any).contract.input.properties), ["request"]);
+		assert.deepEqual(session.getActiveToolNames(), initial);
+		assert.equal(session.systemPrompt.includes("tool_add 的 request"), false);
+		const toolAdd = session.getToolDefinition("tool_add");
+		const keeper = session.getToolDefinition("service_keeper");
+		assert.ok(toolAdd && keeper);
+		assert.deepEqual(Object.keys((toolAdd.parameters as any).properties), ["request"]);
+		assert.deepEqual(Object.keys((keeper.parameters as any).properties), ["request", "allowRepair"]);
+		assert.equal(session.getToolDefinition("tool_add_manage"), undefined);
+		assert.equal(session.getToolDefinition("service_keeper_manage"), undefined);
+		const manage = (runtime as unknown as { toolAddManageTool(cwd: string): { execute: Function } }).toolAddManageTool(cwd);
 		const managed = await manage.execute("call-manage", { action: "list" });
 		assert.equal(managed.details.status, "ok");
-		assert.deepEqual(
-			managed.details.result.tools.map((tool: { name: string }) => tool.name).sort(),
-			["service_keeper", "tool_add"],
-		);
-		const startResponse = (await toolAdd!.execute(
-			"call-start",
-			{ request: "列出已注册的工具。", mode: "start" },
-			undefined,
-			undefined,
-			{ isIdle: () => true, cwd, hasUI: false },
-		)) as { structuredContent: { status: string; summary: string } };
-		assert.equal(startResponse.structuredContent.status, "failed");
-		assert.ok(startResponse.structuredContent.summary.includes("does not match"));
-		const syncResponse = (await toolAdd!.execute(
-			"call-sync",
-			{ request: "列出已注册的工具。" },
-			undefined,
-			undefined,
-			{ isIdle: () => true, cwd, hasUI: false },
-		)) as { structuredContent: { status: string; summary: string } };
-		assert.equal(syncResponse.structuredContent.status, "failed");
-		assert.ok(syncResponse.structuredContent.summary.includes("tool_add worker failed"));
-	} finally {
-		await runtime.close();
-	}
+		assert.deepEqual(managed.details.result.tools.map((tool: { name: string }) => tool.name).sort(), ["service_keeper", "tool_add"]);
+		runtime.catalogCommand("load tool_add");
+		const facade = session.agent.state.tools.find((tool) => tool.name === "tool_add");
+		assert.ok(facade);
+		const rejected = await facade.execute("call-start", { request: "列出已注册的工具。", mode: "start" }, new AbortController().signal);
+		assert.equal((rejected.structuredContent as any).status, "failed");
+		assert.ok((rejected.structuredContent as any).summary.includes("does not match"));
+		runtime.catalogCommand("load runtime");
+		assert.ok(session.getActiveToolNames().includes("service_keeper"));
+		runtime.catalogCommand("unload runtime");
+		assert.equal(session.systemPrompt.includes("tool_add 的 request"), false);
+		assert.deepEqual(session.getActiveToolNames(), initial);
+		assert.throws(() => runtime!.catalogCommand("load missing_tool"), /没有可用/);
+		runtime.catalogCommand("load tool_add");
+		runtime.catalogCommand("reset");
+		assert.deepEqual(session.getActiveToolNames(), initial);
+	} finally { await runtime?.close(); session.dispose(); }
 });
 
 test("create_tool validates the name and requirements before calling the builder", async () => {
@@ -1144,74 +1143,47 @@ test("supervisor reports and restarts a tool daemon", async () => {
 	}
 });
 
-test("job-control calls do not require the task fields", async () => {
+test("job-control calls do not require the task fields in the real SDK", async () => {
 	const { ToolRuntime } = await import("../src/runtime/tool-runtime.ts");
+	const { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } = await import("@earendil-works/pi-coding-agent");
 	const cwd = path.join(tempRoot, "facade-job");
-	await fs.mkdir(cwd, { recursive: true });
-	const registered = new Map<string, { execute: Function }>();
-	const pi = {
-		registerTool: (definition: { name: string; execute: Function }) => registered.set(definition.name, definition),
-		getActiveTools: () => [],
-		setActiveTools: () => {},
-		sendMessage: () => {},
-	};
-	const runtime = new ToolRuntime({
-		pi: pi as never,
-		cwd,
-		agentDir: path.join(cwd, "agent"),
-		projectTrusted: true,
-		modelRuntime: {} as never,
-		log: () => {},
-	});
+	const agentDir = path.join(cwd, "agent");
+	await fs.mkdir(agentDir, { recursive: true });
+	const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json") });
+	let runtime: InstanceType<typeof ToolRuntime> | undefined;
+	const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, noSkills: true,
+		noPromptTemplates: true, noThemes: true, noContextFiles: true, extensionFactories: [(pi) => {
+			pi.on("session_start", async () => {
+				runtime = new ToolRuntime({ pi, cwd, agentDir, projectTrusted: true, modelRuntime, log: console.error });
+				await runtime.initialize();
+			});
+		}] });
+	await loader.reload();
+	const { session } = await createAgentSession({ cwd, agentDir, modelRuntime, resourceLoader: loader,
+		sessionManager: SessionManager.inMemory(cwd), settingsManager: SettingsManager.inMemory({ cacheWarming: "off" }) });
+	await session.bindExtensions({ mode: "print" });
 	try {
-		runtime.register(
-			{
-				name: "job_contract_test",
-				version: "1.0.0",
-				description: "A tool used to check the job-control contract.",
-				whenToUse: ["需要验证作业控制参数"],
-				kind: "agent",
-				input: {
-					type: "object",
-					properties: { task: { type: "string", description: "Task text." } },
-					required: ["task"],
-					additionalProperties: false,
-				},
-				output: {
-					type: "object",
-					properties: { value: { type: "string", maxLength: 100, description: "Value." } },
-					required: ["value"],
-					additionalProperties: false,
-				},
-				agent: {
-					instructions: "You run the task and return the value.",
-					workflow: "1. Read the task.\n2. Return the value.\n3. Call submit_result.",
-					tools: ["read"],
-				},
-				execution: { defaultMode: "start", asyncByDefault: true },
-			},
-			false,
-		);
-		const facade = registered.get("job_contract_test");
+		assert.ok(runtime);
+		const loaded = await readManifestFile("test/fixtures/process-control/AGENT_TOOL.json");
+		assert.deepEqual(loaded.errors, []);
+		assert.ok(loaded.manifest);
+		runtime.register(loaded.manifest);
+		assert.ok(!session.getActiveToolNames().includes(loaded.manifest.name));
+		const search = session.agent.state.tools.find((tool) => tool.name === "tool_find");
+		assert.ok(search);
+		await search.execute("call-discover", { query: loaded.manifest.name, limit: 1 }, new AbortController().signal);
+		assert.ok(!session.getActiveToolNames().includes(loaded.manifest.name));
+		runtime.catalogCommand(`load ${loaded.manifest.name}`);
+		const facade = session.agent.state.tools.find((tool) => tool.name === loaded.manifest!.name);
 		assert.ok(facade);
-		const waitResponse = (await facade!.execute(
-			"call-wait",
-			{ mode: "wait", jobId: "job_missing" },
-			undefined,
-			undefined,
-			{ isIdle: () => true, cwd, hasUI: false },
-		)) as { structuredContent: { summary: string } };
-		assert.ok(waitResponse.structuredContent.summary.includes("Unknown job"));
-		const startResponse = (await facade!.execute(
-			"call-start",
-			{ mode: "start" },
-			undefined,
-			undefined,
-			{ isIdle: () => true, cwd, hasUI: false },
-		)) as { structuredContent: { summary: string; warnings?: string[] } };
-		assert.ok(startResponse.structuredContent.summary.includes("Input does not match"));
-		assert.ok(startResponse.structuredContent.warnings?.some((warning) => warning.includes("task")));
-	} finally {
-		await runtime.close();
-	}
+		const wait = await facade.execute("call-wait", { mode: "wait", jobId: "job_missing" }, new AbortController().signal);
+		assert.equal((wait.structuredContent as any).status, "failed");
+		assert.ok((wait.structuredContent as any).summary.includes("任务不存在"));
+		const start = await facade.execute("call-start", { mode: "start" }, new AbortController().signal);
+		assert.ok((start.structuredContent as any).summary.includes("Input does not match"));
+		assert.ok((start.structuredContent as any).warnings.some((warning: string) => warning.includes("command")));
+		const cancel = await facade.execute("call-cancel", { mode: "cancel" }, new AbortController().signal);
+		assert.equal((cancel.structuredContent as any).status, "failed");
+		assert.ok((cancel.structuredContent as any).summary.includes("jobId"));
+	} finally { await runtime?.close(); session.dispose(); }
 });

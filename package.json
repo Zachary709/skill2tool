@@ -36,10 +36,15 @@
     "typebox": "*"
   },
   "dependencies": {
+    "jsonlines": "^0.1.1",
+    "koffi": "^3.3.7",
+    "minisearch": "7.2.0",
+    "pidtree": "^1.0.0",
     "proper-lockfile": "4.1.2",
     "undici": "8.12.3"
   },
   "devDependencies": {
+    "@types/jsonlines": "^0.1.5",
     "@types/node": "^22.10.0",
     "@types/proper-lockfile": "4.1.4",
     "typescript": "^5.7.0"

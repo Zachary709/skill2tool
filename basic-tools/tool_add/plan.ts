@@ -1,11 +1,14 @@
 import type { AgentConfig, AgentContextConfig, JsonSchema, ServiceDefinition } from "../../src/types.ts";
 import { AGENT_CONTEXT_SCHEMA } from "../../src/agents/policy.ts";
+import { TOOL_CATEGORY_SCHEMA, TOOL_TAGS_SCHEMA } from "../../src/discovery/catalog.ts";
 
 export interface ToolPlan {
 	name: string;
 	description: string;
 	whenToUse: string[];
 	notFor?: string[];
+	category?: string;
+	tags?: string[];
 	input: JsonSchema;
 	output: JsonSchema;
 	execution?: { asyncByDefault?: boolean };
@@ -54,9 +57,11 @@ export const TOOL_PLAN_SCHEMA: JsonSchema = {
 			description: "Only the brief situations needed to select this tool; avoid repeating the description.",
 		},
 		notFor: { type: "array", items: { type: "string" }, description: "Only necessary exclusions." },
+		category: TOOL_CATEGORY_SCHEMA,
+		tags: TOOL_TAGS_SCHEMA,
 		input: {
 			type: "object",
-			description: "Closed JSON Schema; request/task describes the goal and necessary conditions. Keep configured procedures in worker instructions and preserve explicit requirements and authorization.",
+			description: "Closed JSON Schema; request/task states the current goal, necessary new conditions, and references without repeating history or configuration. Workers read existing details themselves; preserve essential unshared facts and authorization.",
 		},
 		output: { type: "object", description: "Closed JSON Schema for only the business result the caller needs." },
 		execution: {

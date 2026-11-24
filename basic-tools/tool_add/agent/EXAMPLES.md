@@ -4,30 +4,44 @@
 
 For a general management worker, follow the existing `ssh_manager` shape:
 
-- Description: `按自然语言查询和维护 SSH 配置中的设备。`
+- Description: `查询 SSH 连接配置，对明确指定的远程 SSH 主机检查连接、执行命令或传输文件。`
+- Selection: SSH connection configuration queries or operations on an explicitly identified remote SSH host. Ordinary local device queries and local commands use the caller's local tools; state this boundary in `notFor`.
 - Input:
 
 ```json
 {
   "type": "object",
   "properties": {
-    "request": { "type": "string", "maxLength": 4000, "description": "直接写用户任务及必要条件，不扩写工具规则。" }
+    "request": { "type": "string", "maxLength": 4000, "description": "本轮目标及新增条件；已有背景和配置只给引用。" }
   },
   "required": ["request"],
   "additionalProperties": false
 }
 ```
 
-A complete user task can be passed directly as the request. Add only necessary
-context the worker cannot obtain, preserving explicit user constraints, paths,
-and authorization limits. Do not invent extra scope or turn the task into an
-operating guide. The worker reads its
-configuration and follows its existing procedures, verification, output, and
-safety rules without requiring the caller to repeat them. Keep genuine business
-requirements complete. A search request can simply say `查询英雄联盟 S16 当前赛况。`.
+State the current goal, necessary new conditions, and locating references.
+Resolve pronouns without copying the user's whole message, prior outcomes,
+implementation descriptions, or fixed parameters. Use task identifiers and file
+paths only as needed to uniquely identify existing information; do not enumerate
+supporting documents and result paths or add unrequested output metrics. The
+worker reads matching completed history, configuration, source documents, and results. Include essential facts unavailable
+from those sources and preserve current authorization limits. A search request
+can simply say `查询英雄联盟 S16 当前赛况。`.
 Execution defaults to synchronous; no job control fields are exposed. Enable
 `execution.asyncByDefault` only for a tool that needs background execution.
 A focused tool can use a single typed value such as `path` instead.
+
+## Continue an existing task
+
+When this worker has already identified the modified manifest, pass the new
+operation without repeating the manifest contents or the previous validation:
+
+```json
+{"request":"重新校验上次修改的 TOOL.json。"}
+```
+
+The worker resolves the same target from completed history and reads the current
+file. If history does not identify one target, the caller supplies its path.
 
 ## Convert a skill
 

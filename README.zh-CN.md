@@ -11,6 +11,7 @@
 - [快速开始](#快速开始)
 - [工作原理](#工作原理)
 - [工具发现](#工具发现)
+- [工具分类与按需加载](#工具分类与按需加载)
 - [工具包目录结构](#工具包目录结构)
 - [TOOL.json 参考](#tooljson-参考)
 - [服务](#服务)
@@ -59,7 +60,70 @@ pi --no-skills -e .
 - `~/.pi/agent/tools/`
 - `<project>/.pi/tools/`
 
-包内工具先加载，并且始终加载。用户级或项目级工具同名时会被跳过，并给出一条冲突诊断。项目级工具只在项目受信任时加载。
+包内工具先注册，并且始终注册。用户级或项目级工具同名时会被跳过，并给出一条冲突诊断。项目级工具只在项目受信任时注册。注册与向模型展示分开处理：专门工具默认等待按需加载。
+
+## 工具分类与按需加载
+
+插件保留已有基础工具，并提供 `tool_find`、`tool_use` 两个常驻入口。`tool_find` 使用 MiniSearch 检索工具元数据，只返回候选名称、能力说明和当前加载状态，不改变活动工具列表。`tool_use` 负责查看确切工具的契约或实际调用。主提示词只增加领域的一句话说明，选中工具的输入契约和调用规则通过工具结果按需提供。发现流程不增加推理 worker。
+
+插件使用独立的工具名称，与 CLI、Pi Web 的内置 `tool_search` 同时注册，不修改内置扩展配置。当前会话以 `tool_find` 为发现入口，初始化和重置时不激活内置搜索；`tool_find` 活动期间，内置搜索的声明不进入模型请求。SDK 只需加载本插件。
+
+默认分类：
+
+| 分类 | 能力 | 已有工具 |
+| --- | --- | --- |
+| `research` | 检索与研究 | `web_search`、`paper_reader` |
+| `infrastructure` | 设备与计算 | `ssh_manager`、`tailscale_manager`、`adaptive_computation` |
+| `runtime` | 运行维护 | `service_keeper`、`tool_add` |
+| `other` | 其他工具 | 没有分类信息的其他工具 |
+
+`TOOL.json` 支持以下可选元数据：
+
+```json
+{
+  "category": "research/papers",
+  "tags": ["论文", "作者"],
+  "defaultActive": false,
+  "exposure": "deferred"
+}
+```
+
+- `category` 指定唯一的主要分类，使用小写字母、数字和下划线，支持 `领域/子分类`。可以声明其他领域。
+- `tags` 提供跨分类检索的关键词，最多 16 个不重复的非空字符串。
+- 缺少 `category` 时，插件为表中的已有工具补充分类；其他工具采用有效的非通用 `namespace`，其余归入 `other`。旧工具文件无需修改。
+- 专门工具默认不激活。旧清单中的 `exposure: "direct"` 同样以 `deferred` 注册；工具仍按 `kind` 决定直接执行或通过 worker 执行。`defaultActive: true` 让工具默认常驻。显式 `model-only` 默认常驻，`codemode` 和 `hidden` 保留原有可达性语义。
+- 没有自定义 `namespace` 或其值为旧默认值 `tool` 时，插件使用主要领域作为命名空间。
+
+主 agent 使用 `tool_find` 按任务、工具名、分类或标签搜索。搜索后由主 agent 选择确切工具：
+
+```json
+{"tool":"paper_reader"}
+```
+
+通过 `tool_use` 省略 `input` 时，只读取目标工具的完整说明、输入 schema 和调用规则，不激活工具。提供 `input` 时执行一次真实调用：
+
+```json
+{"tool":"paper_reader","input":{"request":"阅读指定论文并回答当前问题。"}}
+```
+
+调用经由 SDK 的 `ctx.executeTool()`，保留原工具的参数校验、权限拦截、授权字段、进度和取消规则。只有目标 `execute` 实际运行后，该工具才自动加入当前对话列表，之后可以直接调用；参数 schema 校验失败或被权限拦截的调用不会加入。搜索中的其他候选保持未加载。调用期间显式收起、重置或停用工具后，任务完成不会再次将它加入列表。业务结果、错误和终止标志原样转交，嵌套用量由 SDK 汇总。
+
+新建、转换、添加和重新启用的工具进入目录，是否默认激活由 `defaultActive` 决定。用户仍可显式加载一个工具或整个分类。
+
+用户命令：
+
+```text
+/tool-catalog                       # 查看主要分类和加载数量
+/tool-catalog research              # 查看一个领域及其子分类
+/tool-catalog research/papers       # 查看子分类
+/tool-catalog search 论文            # 跨分类按关键词查找，不自动加载
+/tool-catalog load paper_reader     # 加载一个工具
+/tool-catalog load research         # 加载整个分类
+/tool-catalog unload research       # 收起整个分类
+/tool-catalog reset                 # 恢复默认常驻列表
+```
+
+会话内保留已加载工具，不在每次调用后自动收起。Pi 的会话恢复、分支和重载可以恢复该分支记录的活动工具；升级后需要立即精简已有会话时，执行 `/tool-catalog reset`。新会话默认使用精简列表。命令仅调整本插件管理的工具，保留其他扩展及基础工具的现有选择。收起和重置不取消任务、不终止 worker 或 daemon；停用的工具不参与发现。项目可信检查、工具允许列表、输入校验、授权字段、进度和取消行为保持有效。
 
 ## 工具包目录结构
 
@@ -141,9 +205,9 @@ tools/repair-shop/
 | `direct` | 同步执行一个已声明的服务。 |
 | `agent` | 创建一个常驻 worker，worker 可以通过 `service_call` 调用已声明的服务。 |
 
-### 进程内 handler
+### 管理动作 handler
 
-包内的 agent 工具可以声明 `"handler": "tool_add"` 或 `"handler": "service_keeper"`。因为这类动作会改动正在运行的运行时状态，运行时会把它的 worker 放在当前进程里执行，不创建独立任务。这两个 handler 都只支持 `mode: "sync"`。
+包内的 agent 工具可以声明 `"handler": "tool_add"` 或 `"handler": "service_keeper"`。推理 worker 在独立进程中运行，私有管理工具通过 IPC 请求父进程操作正在使用的注册表与共享服务。这两个 handler 保持同步返回的公开接口。
 
 ## 服务
 
@@ -198,7 +262,7 @@ Daemon 持续运行。省略 `lifecycle` 和 `start` 时，默认值分别是 `p
 
 每个服务都在工具目录中启动，状态保存在 `~/.pi/agent/services/<tool>/<service>` 下。它的 daemon 键是 `user:<tool>:<service>`，因此每个项目共用同一个句柄。如果 Unix socket 或 HTTP 端点已经可以访问，运行时会接入这个端点，不再启动新的进程。
 
-每次启动进程都会在状态目录下写入 `state.json`，记录进程号、工作目录和启动时间。同一个目录会收到 `PI_SERVICE_STATE_DIR`，子进程环境里带有 `PI_TOOL_NAME` 和 `PI_SERVICE_NAME`。
+运行时启动 daemon 时会在状态目录下写入 `state.json`，记录进程号、工作目录和启动时间。同一个目录会收到 `PI_SERVICE_STATE_DIR`，子进程环境里带有 `PI_TOOL_NAME` 和 `PI_SERVICE_NAME`。
 
 ### 工具 daemon 维护
 
@@ -208,7 +272,7 @@ Daemon 持续运行。省略 `lifecycle` 和 `start` 时，默认值分别是 `p
 { "request": "检查 adaptive-service，必要时恢复一次。", "allowRepair": true }
 ```
 
-工具注册时，它的 daemon 服务会立即启动。协议客户端由运行时持有，因此重启必须在运行时内部完成。`service_keeper` 的 worker 因此在当前进程里运行，并额外获得一个 `service_keeper_manage` 工具：
+工具注册时，它的 daemon 服务会立即启动。协议客户端由运行时持有，因此重启必须在运行时内部完成。独立的 `service_keeper` worker 额外获得 `service_keeper_manage`，由它通过 IPC 请求父进程执行管理动作：
 
 | 动作 | 参数 | 结果 |
 | --- | --- | --- |
@@ -220,9 +284,18 @@ Daemon 持续运行。省略 `lifecycle` 和 `start` 时，默认值分别是 `p
 
 ## Worker 模型
 
-Worker 使用调用方当前的模型和 thinking level。调用方没有会话模型时，运行时读取 Pi 设置中的 `defaultProvider` 和 `defaultModel`。工具清单和 agent 文件不另选模型。任务记录保存调用方的模型和 thinking level；用量记录保存 worker 实际采用的级别及回退原因。
+Worker 使用 agent tool 统一配置的模型和 thinking level，任务之间不再切换。默认模型是 `lqy-阿里云节省计划/deepseek-v4.1-flash-1017`，thinking level 默认跟随调用方。配置写在 `~/.pi/agent/tool-runtime.json`：
 
-`agent.thinkingLevel` 指定工具优先使用的级别，`web_search` 配置为 `low`。模型能力声明不支持该级别时，直接采用调用方设置；接口明确拒绝 `low` 时，保留已经完成的操作，使用调用方的 thinking level 继续同一任务一次。身份验证、网络和其他请求错误不会触发这项回退。
+```json
+{
+  "model": "lqy-阿里云节省计划/deepseek-v4.1-flash-1017",
+  "thinkingLevel": "high"
+}
+```
+
+`/tool-model` 把当前会话的模型和 thinking level 写入配置；`/tool-model <模型 id>` 直接写模型 id，id 对应多个 provider 时会要求写成完整名称；`/tool-model <provider/model>` 指定完整名称；`/tool-model reset` 删除配置并回到默认值；`/tool-model show` 查询当前模型、thinking level、来源和配置文件路径。修改在下一个任务生效。环境变量 `PI_TOOL_MODEL` 的优先级高于配置文件中的模型。任务记录保存该模型；模型不在模型运行时中或缺少凭据时，任务直接失败，不会改选其他模型。
+
+thinking level 由工具清单的 `agent.thinkingLevel` 优先决定，`web_search` 配置为 `low`；未配置时使用 `/tool-model` 固定下来的级别，也没有固定时跟随调用方。模型能力声明不支持工具指定的级别时，直接采用面向该模型的级别；级别超出模型能力时，Pi 下调到最近的受支持级别。接口明确拒绝 `low` 时，保留已经完成的操作，使用可用的 thinking level 继续同一任务一次。身份验证、网络和其他请求错误不会触发这项回退。用量记录保存 worker 实际采用的级别及回退原因。
 
 Worker 使用的作用域名称是 `user` 和 `project`。
 
@@ -233,7 +306,7 @@ Worker 使用的作用域名称是 `user` 和 `project`。
 
 旧值 `global` 仍然可用，会按 `user` 处理，并给出弃用提示。
 
-`agent.concurrency` 默认为 `serial`。配置 `"concurrency": "parallel"` 后，每个请求从包含已完成任务的历史快照创建独立会话。正在进行的请求不会进入其他请求的快照。任务完成后，立即向共享历史追加任务要求、类型明确的结果、来源证据、可选的交接信息和完整会话的保存位置。锁只保护快照创建和历史发布，模型请求并行执行。每个请求使用独立的中间目录。管理当前运行时状态的工具必须串行执行。
+`agent.concurrency` 默认为 `serial`，控制同一对话内的请求排队；配置 `"concurrency": "parallel"` 后，同一对话内的请求也可并行执行。不同对话调用同一个工具始终使用独立 worker 会话，可以并行执行，包括使用 `sessionScope: "user"` 共享历史的不同项目。每个请求从已完成任务的历史快照开始，正在执行的请求不会进入其他请求的快照。结果返回前，按完成顺序向共享历史追加任务要求、类型明确的结果、来源证据、可选的交接信息和完整会话的保存位置。锁只保护快照创建和历史发布，不覆盖模型请求及工具执行。每个请求使用独立的中间目录。管理当前运行时状态的工具在各自对话内保持串行执行。新对话初始化时，通过任务所有权锁识别其他运行时的活动任务，不修改其状态，也不等待其完成。
 
 ## 输入与结果契约
 
@@ -243,8 +316,8 @@ Worker 使用的作用域名称是 `user` 和 `project`。
 
 - 除了 JSON Schema 校验之外，工具封装还会拒绝清单未声明的任何字段。调用方只能发送已声明的字段。
 - `"additionalProperties": false` 让契约保持明确；缺少这个字段时加载器会给出警告。
-- Agent 工具的自然语言 `request`、`task` 在用户任务完整时直接使用任务原句，仅补 worker 无法自行取得的必要背景，保留用户明确要求、路径和授权限制。禁止扩写为操作指南，不新增任务范围、核实、输出或安全要求。复杂的用户需求保留完整。
-- 生成器统一此类参数的简短说明；注册时通过带工具名称的 `promptGuidelines` 提醒调用方。输入文本不被截断或改写，不增加改写模型调用，授权字段与既有校验保持不变。
+- Agent 工具的自然语言 `request`、`task` 只写本轮目标、必要新增条件和定位引用。消解“继续”“测试一下”等指代，不照抄整段用户消息，不复述 worker 已知历史、文件内容或固定参数。已有任务只给足以唯一定位的最少任务标识或文件引用，不罗列相关文档和结果路径；其余由 worker 自行读取，未变更的输入、配置和资源约束自动继承，不附加“沿用”或“保持参数”的确认句。通常一句目标加必要新增条件即可，不添加用户未要求的检查、输出指标或格式；保留无法从历史或引用取得的关键事实和本轮授权限制。
+- 生成器统一此类参数的简短说明；注册时通过带工具名称的 `promptGuidelines` 提醒调用方，同时包含 `whenToUse` 和 `notFor` 的选择边界。输入文本不被截断或改写，不增加改写模型调用，授权字段与既有校验保持不变。
 
 例如搜索赛况可以直接传入：
 
@@ -252,7 +325,7 @@ Worker 使用的作用域名称是 `user` 和 `project`。
 {"request":"查询英雄联盟 S16 当前赛况。"}
 ```
 
-Worker 根据已有指令完成检索、来源核实和结果整理，无需调用方重复说明。
+Worker 根据已有指令完成检索、来源核实和结果整理，无需调用方重复说明。延续任务时，worker 从同一项目、任务的已完成历史和引用文件获取已有配置与结果；调用方不复制上轮经过、源码说明或参数清单。
 
 ### 结果
 
@@ -264,7 +337,7 @@ Worker 根据已有指令完成检索、来源核实和结果整理，无需调�
 - 数组默认限制为 50 项，除非 `maxItems` 另有说明；
 - `summary` 最多 300 个字符、最多三行。
 
-违反限制时，worker 会收到具体的错误信息，必须重新提交符合契约的结果。worker 指令要求结果只包含结论和支持事实；过程叙述、思考、工具记录、命令和日志保留在 worker 会话及进度记录中。
+违反限制时，worker 会收到具体的错误信息，必须重新提交符合契约的结果。worker 指令要求结果只包含结论和支持事实；思考和完整工具记录保留在私有 worker 会话中，进度记录只包含状态、公开文本和工具活动。
 
 没有声明类型的对象属性按容器处理：它的键不做检查，但字符串值仍然受长度限制约束。输出字段写成 `type: "object"` 却没有 `properties` 时，加载器会给出警告。
 
@@ -314,9 +387,9 @@ Agent 工具支持异步任务。
 | `result` | 读取已有任务的结果。 |
 | `cancel` | 取消已有任务。 |
 
-`job` 是内部概念，没有单独对外的任务工具。每个 agent 工具都通过自己的 `mode` 和 `jobId` 字段提供任务操作。`/tool-runtime` 命令可以列出运行时任务，用于诊断。
+`job` 是内部概念，没有单独对外的任务工具。只有配置为后台执行的工具公开 `mode` 和 `jobId`。每次调用都生成内部任务记录，包括确定性工具及两个管理工具，并可通过用户命令控制。
 
-任务在独立的 worker 进程中运行。任务存储可以在 Pi 重启后继续使用。重启时，排队中的任务会重新入队；正在运行但 worker 已退出的任务会被标记为 `lost`。
+每次调用关联父会话、本轮运行、toolCallId 和 jobId。任务管理对象统一维护取消信号、状态、进展、操作及进程清理，父进程是任务状态的唯一写入者。任务存储在 Pi 重启后保留；丢失所有权的未完成任务标记为 `lost`，不重新执行排队请求，也不凭历史 PID 终止进程。
 
 启动的任务完成时，如果发起请求的 agent 处于空闲状态，运行时会发送一条简短完成消息。完整结果仍然保存在任务存储里。
 
@@ -326,7 +399,25 @@ Agent 工具支持异步任务。
 job.json
 result.json
 events.jsonl
+progress.jsonl
+processes.jsonl
+stdout.log
+stderr.log
+intermediate/    # 运行时临时文件和 Bash 输出
 ```
+
+### 取消任务
+
+```text
+/tool-cancel <完整 id、短 id 或序号>
+/tool-cancel all
+```
+
+命令直接执行，模型忙碌时也不等待模型回复。单项取消不影响其他并行任务；停止外层 agent 会取消它本轮调用的子任务，并及时结束外层等待。业务 request 不增加管理字段。每次模型请求和工具执行都先由父任务确认并写入操作记录；取消后不再批准新操作，不重试模型请求，本轮运行也不能重新启动用户已经取消的工具。
+
+清理期间状态保持为 `cancelling`，界面显示“取消中”。独立监督进程先请求正常取消，在有界时间内等待退出，必要时强制终止任务拥有的进程。Linux 下使用 child subreaper 收养派生进程，并通过稳定的 pidfd 句柄操作进程，覆盖脱离进程组的命令、避免 PID 复用误伤并回收退出的子进程。确认清理完成后才提交 `cancelled`，后来到达的成功结果不能覆盖取消。共享 daemon 由父进程持有，不属于任务进程清理范围。
+
+任务执行要求 Linux x64/arm64、glibc，以及支持 pidfd 和 child subreaper 的内核；不满足条件时在推理开始前报告错误。运行时关闭会取消它持有的任务。取消不会撤销已经发生的文件修改、服务重启或远程提交。`events.jsonl` 保存已请求、已完成和被中断的操作、worker 结果及最终状态；归档会话保存工具参数和结果。Bash 的标准输出和错误输出另外合并写入任务 `intermediate/bash-*.log`，路径登记在 `job.json` 的 `outputFiles`；被强制终止后仍保留已接收的输出。运行时临时文件使用该任务中间目录，不使用 `/tmp`。被中断的操作可能已经部分完成，需要检查实际状态。
 
 ## Worker agent
 
@@ -377,7 +468,7 @@ Worker 使用 Pi 的自动压缩，并支持按工具配置预算：
 
 已完成任务的交接信息可以直接用于压缩历史，无需额外请求模型。达到预算时会触发压缩，缓存复用预测不阻止压缩。用量记录包含预算、上下文估计、压缩用量、实际 thinking level 和共享历史发布信息。最终结果被接受后，任务立即完成并发布历史，不再追加摘要请求。
 
-并行工具的共享历史只保存已完成结果及来源观察时间，完整中间记录保存在独立请求的会话文件中。摘要只能替换快照实际覆盖的共享历史前缀，后续完成的任务继续保留。旧快照的摘要不能替换更新的共享压缩结果。串行工具继续使用原有 worker 会话。压缩保留固定系统提示词，每个任务向 `journal.jsonl` 追加一条简短记录。
+所有 agent 工具的共享历史只保存已完成结果及来源观察时间，完整中间记录保存在独立请求的会话文件中。摘要只能替换快照实际覆盖的共享历史前缀，后续完成的任务继续保留。旧快照的摘要不能替换更新的共享压缩结果。已有串行 worker 会话在首次创建快照时保留为共享历史。压缩保留固定系统提示词，每个任务向 `journal.jsonl` 追加一条简短记录。
 
 Worker 文件位于：
 
@@ -385,18 +476,20 @@ Worker 文件位于：
 ~/.pi/agent/tool-workers/<worker-key>/
 ├── memory.md
 ├── journal.jsonl
-├── shared.jsonl     # 并行工具的已完成历史
+├── shared.jsonl     # agent 工具的已完成历史
 └── runs/            # 独立请求的完整会话
 ```
 
 ## 进度显示
 
-Worker 每完成一步，都会向 `<project>/.pi/jobs/<jobId>/progress.jsonl` 写入一行紧凑的 JSON：思考、回复文本、每次工具调用和每次工具结果。工具封装读取这个文件，并在任务运行时显示在 TUI 组件里，因此这些步骤不会进入对话上下文。
+Pi Web 原工具卡片的即时结果显示、刷新恢复及服务启用步骤见 [Pi Web 集成说明](integrations/pi-web/README.md)。
 
-三个显示通道都来自同一个文件：
+Worker 通过 IPC 发送真实工具活动和阶段变化，任务管理对象保存 `progress.jsonl`，并按界面能力显示进度。交互界面使用独立任务窗口，无交互界面时通过 `onUpdate` 更新所属工具调用。每次模型请求只记录一次等待状态，流式 token、模型过程叙述和思考原文不产生进展消息。重复输出预览会去重，完整命令输出仍然归档。
 
-- 运行中的工具调用把最新的若干行作为部分输出流式显示，因此工具块本身就能看出 worker 正在做什么；
-- 编辑器上方的组件重复显示最后若干行，任务进入终止状态四秒后清除；
+活动任务使用事件订阅，只有缺少订阅时才轮询文件，内容未变时不推送。每次只发送当前活动或状态变化，不重复发送已有历史。仅耗时变化不会触发进展消息，`startedAt` 和 `finishedAt` 供客户端自行计时。
+
+- TUI 和 RPC 界面为每个任务显示独立进度窗口与状态键。存在 `onUpdate` 回调时窗口仍然显示，进度不再重复发送到工具消息。
+- Print、JSON 等无交互界面的调用通过 `onUpdate` 接收进度。同一内部调用的连续进展合并成一条历史记录，确认进入终止状态四秒后清除窗口，取消完成时只通知一次。
 - `/tool-progress` 固定显示一个快照 30 秒，然后清除；`/tool-progress off` 立即清除。匹配不到任务的引用只会打印一条警告，不会创建组件。
 
 引用任务时不需要完整任务 id：
@@ -409,20 +502,20 @@ Worker 每完成一步，都会向 `<project>/.pi/jobs/<jobId>/progress.jsonl` �
 | `/tool-progress <short id>` | 按短 id 选择一个任务。 |
 | `/tool-progress <fragment>` | 在只匹配一个任务时，接受 id 的前缀、后缀或片段。 |
 
-组件标题和状态行显示短 id，不显示完整任务 id。部分输出最后会被最终工具结果替换，因此只有结果进入对话。进度文件里的内容不会追加到主对话，也不会进入 worker 后续的回合。
+组件标题和状态行显示短 id。排队、模型请求、内部工具、服务等待、上下文压缩和取消分别记录活动，`/tool-progress` 同样包含两个管理工具。部分输出最后会被最终工具结果替换，因此只有结果进入对话。进度文件里的内容不会追加到主对话，也不会进入 worker 后续的回合。
 
 ## 内置工具
 
 `basic-tools/` 存放这个包自己需要的工具。它们本身就是普通的工具目录，因此也会出现在 pi 的工具列表里：
 
-- `basic-tools/tool_add/` —— agent 工具。它自己的 worker 提示词在 `basic-tools/tool_add/agent/`；`manager.ts`、`plan.ts` 和 `artifacts.ts` 实现 worker 调用的进程内管理动作。清单声明 `"handler": "tool_add"`，因此 worker 在当前进程里运行，可以直接向正在使用的工具注册表注册工具。
-- `basic-tools/service_keeper/` —— agent 工具，检查和恢复 agent 目录 `services/registry.json` 中登记的服务，以及已安装工具声明的 daemon。它声明 `"handler": "service_keeper"`，因此 worker 在当前进程里运行，并通过运行时重启工具 daemon。
+- `basic-tools/tool_add/` —— agent 工具。它自己的 worker 提示词在 `basic-tools/tool_add/agent/`；`manager.ts`、`plan.ts` 和 `artifacts.ts` 实现 worker 调用的进程内管理动作。清单声明 `"handler": "tool_add"`，独立 worker 通过 IPC 请求父进程向正在使用的工具注册表注册工具。
+- `basic-tools/service_keeper/` —— agent 工具，检查和恢复 agent 目录 `services/registry.json` 中登记的服务，以及已安装工具声明的 daemon。它声明 `"handler": "service_keeper"`，独立 worker 通过 IPC 请求运行时管理工具 daemon。
 
 包内工具以 `package` 作用域运行。它的 daemon 在工具目录中启动，状态保存在 agent 目录下，不需要项目受信任。
 
 ## tool_add
 
-`tool_add` 只接收一个自然语言 `request` 参数，工具名称、来源路径、需求和作用域都写在请求中。Worker 提取内部管理动作并执行，作用域默认 `project`，请求明确指定时使用 `user`。它在当前进程里同步运行。
+`tool_add` 只接收一个自然语言 `request` 参数，工具名称、来源路径、需求和作用域都写在请求中。Worker 提取内部管理动作并执行，作用域默认 `project`，请求明确指定时使用 `user`。它同步返回结果，推理在受监督的独立子进程中运行。
 
 Worker 使用 `basic-tools/tool_add/agent/` 中的提示词文件，以及只读工具和 `tool_add_manage`。`tool_add_manage` 是由 `manager.ts` 实现的进程内动作；只有 worker 会提供 `plan` 调用它。
 
@@ -448,9 +541,9 @@ Worker 读取技能和它的附属文件，根据技能的实际行为设计一�
 }
 ```
 
-调用方在 `request` 中给出完整需求；`tool_add` 不读取聊天记录。需求就是完整说明：工具做什么、输入是什么、结果是什么，以及工具必须使用的脚本、服务或路径。Worker 设计方案，并按与转换相同的方式应用。
+调用方在 `request` 中给出本轮目标、必要新增条件和需求文件引用；`tool_add` 不读取主对话。Worker 从请求、同目标的已完成历史和所引文件确认工具功能、输入、结果以及必须使用的脚本、服务或路径，不要求调用方复制已有需求说明。Worker 设计方案，并按与转换相同的方式应用。
 
-创建和转换工具时，描述使用一句简短的能力说明，参数只保留调用方必须提供或独立控制的信息。通用 worker 优先使用一个自然语言 `request` 或 `task` 参数，任务和必要背景一起传入；只需要路径的工具可以直接使用 `path`。`request`、`task` 的说明统一为“直接写用户任务及必要条件，不扩写工具规则。”，并用简短目标展示调用示例。其他参数说明保持简短，必要的校验和授权字段保留。操作步骤、脚本选项、环境配置、来源核实、输出与安全规则写入工具内部的 `AGENT.md`、`WORKFLOW.md`、`EXAMPLES.md`。`whenToUse` 只保留必要的选择场景，`notFor` 只说明实际的歧义或安全边界。
+创建和转换工具时，描述使用一句简短的能力说明，参数只保留调用方必须提供或独立控制的信息。通用 worker 优先使用一个自然语言 `request` 或 `task` 参数，传入本轮目标、必要新增条件和引用；只需要路径的工具可以直接使用 `path`。`request`、`task` 的说明统一为“本轮目标及新增条件；已有背景和配置只给引用。”，并用简短目标展示调用示例。其他参数说明保持简短，必要的校验和授权字段保留。操作步骤、脚本选项、环境配置、来源核实、输出与安全规则写入工具内部的 `AGENT.md`、`WORKFLOW.md`、`EXAMPLES.md`。`whenToUse` 只保留必要的选择场景，`notFor` 只说明实际的歧义或安全边界。
 
 新生成的工具默认同步执行，不附加 `mode`、`timeoutMs` 和 `jobId`。技能行为或需求确实需要后台执行时，在方案中设置 `execution.asyncByDefault: true`，由运行时添加任务控制参数。
 

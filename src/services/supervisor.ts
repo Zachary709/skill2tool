@@ -3,12 +3,15 @@ import { promises as fs } from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
+import { abortable } from "../jobs/abort.ts";
+import { CLEANUP_GRACE_MS, signalProcess } from "../jobs/processes.ts";
 import type { ServiceDefinition, ToolManifest } from "../types.ts";
 
 interface PendingRequest {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
+	cleanup(): void;
 }
 
 interface DaemonHandle {
@@ -16,7 +19,7 @@ interface DaemonHandle {
 	closed: boolean;
 	stderr: string;
 	stateDir?: string;
-	request: (method: string | undefined, params: Record<string, unknown>, timeoutMs: number) => Promise<unknown>;
+	request: (method: string | undefined, params: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal) => Promise<unknown>;
 	close: () => void;
 }
 
@@ -100,20 +103,25 @@ function makeJsonLineClient(options: {
 		child: options.child,
 		closed: false,
 		stderr: "",
-		request: (method, params, timeoutMs) => {
+		request: (method, params, timeoutMs, signal) => {
+			signal?.throwIfAborted();
 			if (handle.closed) return Promise.reject(new Error("daemon is closed"));
 			const id = String(nextId++);
 			return new Promise<unknown>((resolve, reject) => {
 				const timer = setTimeout(() => {
 					pending.delete(id);
+					cleanup();
 					reject(new Error(`daemon request timed out after ${timeoutMs}ms`));
 				}, timeoutMs);
-				pending.set(id, { resolve, reject, timer });
+				const abort = () => { pending.delete(id); cleanup(); reject(new Error("服务请求已取消；服务端已执行的操作不会撤销")); };
+				const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); };
+				signal?.addEventListener("abort", abort, { once: true });
+				pending.set(id, { resolve, reject, timer, cleanup });
 				try {
 					options.write(`${JSON.stringify({ id, method, params })}\n`);
 				} catch (error) {
 					pending.delete(id);
-					clearTimeout(timer);
+					cleanup();
 					reject(error instanceof Error ? error : new Error(String(error)));
 				}
 			});
@@ -121,7 +129,7 @@ function makeJsonLineClient(options: {
 		close: () => {
 			handle.closed = true;
 			for (const request of pending.values()) {
-				clearTimeout(request.timer);
+				request.cleanup();
 				request.reject(new Error("daemon closed"));
 			}
 			pending.clear();
@@ -142,7 +150,7 @@ function makeJsonLineClient(options: {
 		const request = pending.get(message.id);
 		if (!request) return;
 		pending.delete(message.id);
-		clearTimeout(request.timer);
+		request.cleanup();
 		if (message.status === "ok") request.resolve(message.result);
 		else request.reject(new Error(message.error ?? "daemon request failed"));
 	});
@@ -195,29 +203,35 @@ async function waitForSocket(socketPath: string, timeoutMs = 10_000): Promise<vo
 	throw new Error(`timed out waiting for socket: ${socketPath}`);
 }
 
-async function canConnect(socketPath: string, timeoutMs = 500): Promise<boolean> {
-	return new Promise((resolve) => {
+async function canConnect(socketPath: string, timeoutMs = 500, signal?: AbortSignal): Promise<boolean> {
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
 		let settled = false;
-		const finish = (value: boolean) => {
+		const socket = net.createConnection(socketPath);
+		const abort = () => finish(false, signal?.reason ?? new Error("连接检查已取消"));
+		const timer = setTimeout(() => finish(false), timeoutMs);
+		const finish = (value: boolean, error?: unknown) => {
 			if (settled) return;
 			settled = true;
-			socket.destroy();
-			resolve(value);
+			clearTimeout(timer); signal?.removeEventListener("abort", abort); socket.destroy();
+			if (error !== undefined) reject(error); else resolve(value);
 		};
-		const socket = net.createConnection(socketPath);
 		socket.once("connect", () => finish(true));
 		socket.once("error", () => finish(false));
-		setTimeout(() => finish(false), timeoutMs);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
 	});
 }
 
-async function httpReachable(url: string, timeoutMs = 2_000): Promise<boolean> {
+async function httpReachable(url: string, timeoutMs = 2_000, signal?: AbortSignal): Promise<boolean> {
+	signal?.throwIfAborted();
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const response = await fetch(url, { method: "GET", signal: controller.signal });
+		const response = await fetch(url, { method: "GET", signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal });
 		return response.status < 500;
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		return false;
 	} finally {
 		clearTimeout(timer);
@@ -329,7 +343,8 @@ async function createHttpClient(options: {
 		child,
 		closed: false,
 		stderr: "",
-		request: async (method, params, timeoutMs) => {
+		request: async (method, params, timeoutMs, signal) => {
+			signal?.throwIfAborted();
 			if (closed) throw new Error("daemon is closed");
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -338,7 +353,7 @@ async function createHttpClient(options: {
 					method: service.method ?? "POST",
 					headers: { "content-type": "application/json", ...(service.headers ?? {}) },
 					body: JSON.stringify({ method, params }),
-					signal: controller.signal,
+					signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
 				});
 				const text = await response.text();
 				if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
@@ -398,6 +413,7 @@ function isProcessAlive(pid: number): boolean {
 export class ServiceSupervisor {
 	private daemons = new Map<string, DaemonHandle>();
 	private persistentKeys = new Map<string, string>();
+	private readonly starting = new Map<string, Promise<DaemonHandle>>();
 	private readonly log: (message: string) => void;
 	private readonly projectCwd: string;
 	private readonly agentDir: string;
@@ -432,16 +448,18 @@ export class ServiceSupervisor {
 		tool: ToolManifest,
 		serviceName: string,
 		params: Record<string, unknown>,
+		signal?: AbortSignal,
 	): Promise<ServiceResult> {
+		signal?.throwIfAborted();
 		const service = tool.services?.[serviceName];
 		if (!service) {
 			return { ok: false, error: `unknown service "${serviceName}"` };
 		}
 		if (service.type === "script") {
-			return this.runScript(tool, serviceName, service, params);
+			return this.runScript(tool, serviceName, service, params, signal);
 		}
 		try {
-			const result = await this.callDaemon(tool, serviceName, service, params);
+			const result = await this.callDaemon(tool, serviceName, service, params, signal);
 			return { ok: true, result };
 		} catch (error) {
 			return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -453,18 +471,32 @@ export class ServiceSupervisor {
 		name: string,
 		service: ServiceDefinition,
 		params: Record<string, unknown>,
+		signal?: AbortSignal,
 	): Promise<ServiceResult> {
+		signal?.throwIfAborted();
 		if (!service.command) return { ok: false, error: "script service has no command" };
 		const placement = this.placement(tool, name, service);
 		const timeoutMs = service.timeoutMs ?? 60_000;
 		await fs.mkdir(placement.stateDir, { recursive: true }).catch(() => {});
 
+		signal?.throwIfAborted();
 		return new Promise<ServiceResult>((resolve) => {
 			const child = spawn(service.command!, service.args ?? [], {
 				cwd: placement.cwd,
 				env: { ...process.env, ...placement.env, ...(service.env ?? {}) },
 				stdio: ["pipe", "pipe", "pipe"],
+				detached: process.platform !== "win32",
 			});
+			let escalation: NodeJS.Timeout | undefined;
+			let stopped = false;
+			const stop = () => {
+				if (stopped) return;
+				stopped = true;
+				if (child.pid) signalProcess(child.pid, "SIGTERM", true);
+				escalation = setTimeout(() => { if (child.pid) signalProcess(child.pid, "SIGKILL", true); }, CLEANUP_GRACE_MS);
+			};
+			signal?.addEventListener("abort", stop, { once: true });
+			if (signal?.aborted) stop();
 			let stdout = "";
 			let stderr = "";
 			let settled = false;
@@ -472,11 +504,12 @@ export class ServiceSupervisor {
 				if (settled) return;
 				settled = true;
 				clearTimeout(timer);
+				if (escalation) clearTimeout(escalation);
+				signal?.removeEventListener("abort", stop);
 				resolve(result);
 			};
 			const timer = setTimeout(() => {
-				child.kill("SIGTERM");
-				finish({ ok: false, error: `script timed out after ${timeoutMs}ms`, stdout, stderr });
+				stop();
 			}, timeoutMs);
 
 			child.stdout.on("data", (chunk) => {
@@ -487,6 +520,9 @@ export class ServiceSupervisor {
 			});
 			child.on("error", (error) => finish({ ok: false, error: error.message, stdout, stderr }));
 			child.on("close", (code) => {
+				if (stopped) {
+					finish({ ok: false, error: signal?.aborted ? "脚本已取消" : `script timed out after ${timeoutMs}ms`, stdout, stderr, exitCode: code }); return;
+				}
 				if (code !== 0) {
 					finish({ ok: false, error: `script exited with code ${code}`, stdout, stderr, exitCode: code });
 					return;
@@ -503,12 +539,25 @@ export class ServiceSupervisor {
 				}
 			});
 
+			child.stdin.on("error", (error) => { if (!stopped) finish({ ok: false, error: error.message, stdout, stderr }); });
 			child.stdin.write(JSON.stringify(params) ?? "{}");
 			child.stdin.end();
 		});
 	}
 
-	private async ensureDaemon(tool: ToolManifest, name: string, service: ServiceDefinition): Promise<DaemonHandle> {
+	private ensureDaemon(tool: ToolManifest, name: string, service: ServiceDefinition): Promise<DaemonHandle> {
+		const key = this.placement(tool, name, service).key;
+		const existing = this.daemons.get(key);
+		if (existing && !existing.closed) return Promise.resolve(existing);
+		let pending = this.starting.get(key);
+		if (!pending) {
+			pending = this.startDaemon(tool, name, service).finally(() => this.starting.delete(key));
+			this.starting.set(key, pending);
+		}
+		return pending;
+	}
+
+	private async startDaemon(tool: ToolManifest, name: string, service: ServiceDefinition): Promise<DaemonHandle> {
 		const placement = this.placement(tool, name, service);
 		const key = placement.key;
 		const existing = this.daemons.get(key);
@@ -570,13 +619,16 @@ export class ServiceSupervisor {
 		name: string,
 		service: ServiceDefinition,
 		params: Record<string, unknown>,
+		signal?: AbortSignal,
 	): Promise<unknown> {
-		const handle = await this.ensureDaemon(tool, name, service);
+		const handle = await abortable(this.ensureDaemon(tool, name, service), signal);
+		signal?.throwIfAborted();
 		const timeoutMs = service.timeoutMs ?? 60_000;
-		return handle.request(typeof params.method === "string" ? params.method : undefined, params.params as Record<string, unknown> ?? {}, timeoutMs);
+		return handle.request(typeof params.method === "string" ? params.method : undefined, params.params as Record<string, unknown> ?? {}, timeoutMs, signal);
 	}
 
-	async daemonStatus(tool: ToolManifest, name: string): Promise<DaemonStatus> {
+	async daemonStatus(tool: ToolManifest, name: string, signal?: AbortSignal): Promise<DaemonStatus> {
+		signal?.throwIfAborted();
 		const service = tool.services?.[name];
 		if (!service || service.type !== "daemon") {
 			throw new Error(`tool "${tool.name}" has no daemon service "${name}"`);
@@ -592,6 +644,7 @@ export class ServiceSupervisor {
 		} catch {
 			// the state file is advisory
 		}
+		signal?.throwIfAborted();
 		const handle = this.daemons.get(placement.key);
 		const alive = pid !== undefined ? isProcessAlive(pid) : Boolean(handle && !handle.closed);
 		let reachable = alive;
@@ -600,9 +653,9 @@ export class ServiceSupervisor {
 				placement.cwd,
 				service.socket ?? path.join(placement.stateDir, "service.sock"),
 			);
-			reachable = await canConnect(socketPath);
+			reachable = await canConnect(socketPath, 500, signal);
 		} else if (protocol === "http-json" && service.url) {
-			reachable = await httpReachable(service.url);
+			reachable = await httpReachable(service.url, 2_000, signal);
 		}
 		return {
 			tool: tool.name,
@@ -620,7 +673,8 @@ export class ServiceSupervisor {
 	 * ensure path. The runtime owns the protocol client, so a restart must run
 	 * here and not in a separate process.
 	 */
-	async restartDaemon(tool: ToolManifest, name: string): Promise<DaemonStatus> {
+	async restartDaemon(tool: ToolManifest, name: string, signal?: AbortSignal): Promise<DaemonStatus> {
+		signal?.throwIfAborted();
 		const service = tool.services?.[name];
 		if (!service || service.type !== "daemon") {
 			throw new Error(`tool "${tool.name}" has no daemon service "${name}"`);
@@ -643,6 +697,7 @@ export class ServiceSupervisor {
 					`recorded pid ${pid} for ${tool.name}/${name} does not match the declared command; refusing to restart it`,
 				);
 			}
+			signal?.throwIfAborted();
 			try {
 				process.kill(pid, "SIGTERM");
 			} catch {
@@ -650,8 +705,10 @@ export class ServiceSupervisor {
 			}
 			const deadline = Date.now() + 3_000;
 			while (Date.now() < deadline && isProcessAlive(pid)) {
+				signal?.throwIfAborted();
 				await new Promise((resolve) => setTimeout(resolve, 100));
 			}
+			signal?.throwIfAborted();
 			if (isProcessAlive(pid)) {
 				try {
 					process.kill(pid, "SIGKILL");
@@ -660,6 +717,7 @@ export class ServiceSupervisor {
 				}
 			}
 		}
+		signal?.throwIfAborted();
 		const handle = this.daemons.get(key);
 		handle?.close();
 		this.daemons.delete(key);
@@ -668,17 +726,19 @@ export class ServiceSupervisor {
 		// Wait briefly for the old listener to disappear before spawning a new one.
 		const deadline = Date.now() + 5_000;
 		while (Date.now() < deadline) {
+			signal?.throwIfAborted();
 			const reachable =
 				protocol === "unix-jsonl"
 					? await canConnect(
 							path.resolve(placement.cwd, service.socket ?? path.join(placement.stateDir, "service.sock")),
 						)
 					: protocol === "http-json" && service.url
-						? await httpReachable(service.url)
+						? await httpReachable(service.url, 2_000, signal)
 						: false;
 			if (!reachable) break;
 			await new Promise((resolve) => setTimeout(resolve, 200));
 		}
+		signal?.throwIfAborted();
 		if (protocol === "unix-jsonl") {
 			// A killed server can leave its socket path behind; a new bind needs
 			// the path gone so readiness reflects the new listener.
@@ -688,11 +748,13 @@ export class ServiceSupervisor {
 			);
 		}
 
-		await this.ensureDaemon(tool, name, service);
-		return this.daemonStatus(tool, name);
+		signal?.throwIfAborted();
+		await abortable(this.ensureDaemon(tool, name, service), signal);
+		return this.daemonStatus(tool, name, signal);
 	}
 
 	async close(): Promise<void> {
+		await Promise.allSettled([...this.starting.values()]);
 		for (const [key, handle] of this.daemons) {
 			const protocol = this.persistentKeys.get(key);
 			if (protocol && protocol !== "jsonl-stdio") {

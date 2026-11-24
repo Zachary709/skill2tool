@@ -17,7 +17,7 @@
       "request": {
         "type": "string",
         "maxLength": 8000,
-        "description": "直接写用户任务及必要条件，不扩写工具规则。"
+        "description": "本轮目标及新增条件；已有背景和配置只给引用。"
       },
       "allowRepair": {
         "type": "boolean",
@@ -123,7 +123,9 @@
     "notifyOnIdle": false,
     "asyncByDefault": false
   },
-  "exposure": "direct",
-  "namespace": "tool",
+  "category": "runtime",
+  "tags": ["本地服务", "daemon", "日志"],
+  "exposure": "deferred",
+  "namespace": "runtime",
   "handler": "service_keeper"
 }
